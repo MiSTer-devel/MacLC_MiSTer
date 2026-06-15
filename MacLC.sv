@@ -145,8 +145,9 @@ module emu
 	///////////////////////////////////////////////////
 
 	localparam SCSI_DEVS = 2;          // SCSI block devices -> hps_io slots 0,1
-	localparam VD_PRAM   = 2;          // PRAM NVRAM save image -> hps_io slot 2
-	localparam VDNUM     = 3;          // total hps_io block devices
+	localparam VD_PRAM    = 2;         // PRAM NVRAM save image -> hps_io slot 2
+	localparam VD_TOOLBOX = 3;         // BlueSCSI Toolbox shared folder -> hps_io slot 3
+	localparam VDNUM      = 4;         // total hps_io block devices
 
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
@@ -176,6 +177,20 @@ module emu
 	assign sd_wr[1:0]     = scsi_wr;
 	assign sd_buff_din[0] = scsi_buff_din[0];
 	assign sd_buff_din[1] = scsi_buff_din[1];
+
+	// BlueSCSI Toolbox dedicated slot (3): isolated block device driven by the
+	// primary SCSI target through dataController. Inert until the HPS mounts a
+	// shared folder there (tb_mounted) and the Main handler answers — see
+	// docs/BLUESCSI_CORE_HPS_CONTRACT.md §4a (graceful degradation).
+	wire [31:0] tb_lba;
+	wire        tb_rd, tb_wr;
+	wire [15:0] tb_buff_din;
+	assign sd_lba[VD_TOOLBOX]      = tb_lba;
+	assign sd_rd [VD_TOOLBOX]      = tb_rd;
+	assign sd_wr [VD_TOOLBOX]      = tb_wr;
+	assign sd_buff_din[VD_TOOLBOX] = tb_buff_din;
+	wire        tb_ack     = sd_ack[VD_TOOLBOX];
+	wire        tb_mounted = img_mounted[VD_TOOLBOX];
 	wire        ioctl_write;
 	reg         ioctl_wait = 0;
 	wire [10:0] ps2_key;
@@ -1237,6 +1252,14 @@ module emu
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),
+
+		// BlueSCSI Toolbox dedicated transport (slot VD_TOOLBOX).
+		.tb_mounted(tb_mounted),
+		.tb_lba(tb_lba),
+		.tb_rd(tb_rd),
+		.tb_wr(tb_wr),
+		.tb_ack(tb_ack),
+		.tb_buff_din(tb_buff_din),
 
 		// PRAM persistence (NVRAM) — driven by the FSM above
 		.pram_load_wr(pram_load_wr),

@@ -80,6 +80,14 @@ module ncr5380
 	output      [15:0] sd_buff_din[DEVS],
 	input              sd_buff_wr,
 
+	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 6) --
+	input         tb_mounted,
+	output [31:0] tb_lba,
+	output        tb_rd,
+	output        tb_wr,
+	input         tb_ack,
+	output [15:0] tb_buff_din,
+
 	// JTAG debug: selection/arbitration state for the hardware hang
 	output      [15:0] dbg_scsi,
 	// JTAG debug: post-selection phase + HPS disk handshake
@@ -526,6 +534,12 @@ module ncr5380
 	wire      [7:0] target_dout[DEVS];
 	wire     [15:0] target_dout_pair[DEVS];
 	wire     [15:0] target_dout_pair_next[DEVS];
+
+	// BlueSCSI Toolbox per-target transport wires; only index 0 (the primary
+	// ID-6 target, TOOLBOX_ENABLE) drives real values — others tie off to 0.
+	wire     [31:0] tb_lba_g[DEVS];
+	wire [DEVS-1:0] tb_rd_g, tb_wr_g;
+	wire     [15:0] tb_buff_din_g[DEVS];
 	reg      [15:0] din_pair;
 	reg      [15:0] din_pair_next;
 
@@ -566,7 +580,7 @@ module ncr5380
 		genvar i;
 		for (i = 0; i < DEVS; i = i + 1) begin : target
 			// connect a target
-			scsi #(.ID(3'd6 - i[2:0])) target
+			scsi #(.ID(3'd6 - i[2:0]), .TOOLBOX_ENABLE(i == 0)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
@@ -605,6 +619,15 @@ module ncr5380
 				.sd_buff_dout( sd_buff_dout ),
 				.sd_buff_din( sd_buff_din[i] ),
 				.sd_buff_wr( sd_buff_wr & target_bsy[i] ),
+
+				// Toolbox transport: only target 0 (ID 6) is wired to the slot.
+				.tb_mounted ( (i == 0) ? tb_mounted : 1'b0 ),
+				.tb_lba     ( tb_lba_g[i] ),
+				.tb_rd      ( tb_rd_g[i] ),
+				.tb_wr      ( tb_wr_g[i] ),
+				.tb_ack     ( (i == 0) ? tb_ack : 1'b0 ),
+				.tb_buff_din( tb_buff_din_g[i] ),
+
 				.dbg_mounted( target_mounted[i] ),
 				.dbg_phase( target_phase[i] ),
 				.dbg_hs( target_hs[i] ),
@@ -619,6 +642,12 @@ module ncr5380
 			);
 		end
 	endgenerate
+
+	// BlueSCSI Toolbox: surface the primary target's transport to the module port.
+	assign tb_lba      = tb_lba_g[0];
+	assign tb_rd       = tb_rd_g[0];
+	assign tb_wr       = tb_wr_g[0];
+	assign tb_buff_din = tb_buff_din_g[0];
 
 	// JTAG debug: capture the selection/arbitration handshake state.
 	//  [15]    out_en       (initiator driving the data bus?)

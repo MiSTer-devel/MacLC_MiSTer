@@ -64,11 +64,28 @@ module scsi
 	// block-flush handshake, the double-buffer select, and tlen.
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen[5:0] [31]=req
-	output [31:0] dbg_wrstall
+	output [31:0] dbg_wrstall,
+
+	// ===== BlueSCSI Toolbox dedicated block interface (TOOLBOX_ENABLE only) ====
+	// Isolated from the disk block interface above so the disk read/write path is
+	// untouched (docs/BLUESCSI_CORE_HPS_CONTRACT.md). Inert when TOOLBOX_ENABLE=0.
+	// The round-trip FSM that drives tb_rd/tb_wr is M1 stage 2; stage 1 wires the
+	// slot end-to-end and ties the outputs off (fs ops 0xD0-D5 already CHECK, as
+	// they are not in cmd_ok).
+	input         tb_mounted,    // img_mounted[VD_TOOLBOX]: shared folder ready
+	output [31:0] tb_lba,
+	output        tb_rd,
+	output        tb_wr,
+	input         tb_ack,
+	output [15:0] tb_buff_din
 );
 
 // SCSI device id
 parameter [2:0] ID = 0;
+// Set on the PRIMARY target only (ID 6). Gates the BlueSCSI Toolbox so just one
+// target presents as a Toolbox device and owns the dedicated tb_* transport.
+// docs/BLUESCSI_CORE_HPS_CONTRACT.md
+parameter TOOLBOX_ENABLE = 0;
 
 // Read-prefetch ring depth (number of 512-byte sectors held in the buffer).
 // The read path keeps this many blocks fetched AHEAD of the Mac so the per-block
@@ -91,6 +108,15 @@ localparam RING_BLOCKS = 1 << RING_LOG; // sectors buffered for reads
 localparam BUF_AW      = 8 + RING_LOG;  // dpram word-address width (256 words/sector)
 
 assign dbg_mounted = mounted;
+
+// BlueSCSI Toolbox transport — stage-1 tie-offs (the round-trip FSM is stage 2).
+// The slot is wired end-to-end but inert; fs ops (0xD0-D5) already CHECK because
+// they are not in cmd_ok. tb_mounted/tb_ack feed the stage-2 FSM.
+// BlueSCSI Toolbox transport outputs — driven by the round-trip FSM below
+// (search "Toolbox transport"). tb_buff_din is driven there (buffer read-back).
+assign tb_lba = tb_lba_r;
+assign tb_rd  = tb_rd_r;
+assign tb_wr  = tb_wr_r;
 assign dbg_phase = phase;
 
 localparam PHASE_IDLE        = 3'd0;
@@ -99,6 +125,7 @@ localparam PHASE_DATA_OUT    = 3'd2;
 localparam PHASE_DATA_IN     = 3'd3;
 localparam PHASE_STATUS_OUT  = 3'd4;
 localparam PHASE_MESSAGE_OUT = 3'd5;
+localparam PHASE_TB          = 3'd6;  // BlueSCSI Toolbox HPS round-trip
 reg [2:0]  phase;
 
 // ------------ sector buffer IO controller read/write -----------------------
@@ -281,7 +308,7 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_b
 	// loop seen on the FPGA (but not on real HW or MAME). Drop the !sel gate;
 	// `phase != PHASE_IDLE` already prevents REQ during the IDLE->selection
 	// sampling window, so REQ now comes up on selection like the references.
-	assign req = (phase != PHASE_IDLE) && !ack && !io_busy && !data_phase_complete;
+	assign req = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !io_busy && !data_phase_complete;
 
 	// Bus-VISIBLE REQ (CSR bit 5 / BSR DRQ): stays asserted across the HPS
 	// 512-byte block-boundary fetches in the data phases. Real drives never
@@ -296,7 +323,7 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_b
 	// Non-data phases keep the io_busy suppression (status byte must not
 	// be offered while a flush/fetch is still in flight).
 	// (LBMacTwo 5adc2e1, HW-validated with 2d025c5 in round 6.)
-	assign req_bus = (phase != PHASE_IDLE) && !ack && !data_phase_complete &&
+	assign req_bus = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !data_phase_complete &&
 	                 ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN) || !io_busy);
 
 assign bsy = (phase != PHASE_IDLE);
@@ -321,6 +348,9 @@ wire [7:0] cmd_dout =
 		cmd_read_capacity?read_capacity_dout:
 		cmd_mode_sense?mode_sense_dout:
 		cmd_request_sense?request_sense_dout:
+		cmd_tb_devinfo?tb_devinfo_dout:
+		cmd_tb_debug?tb_debug_dout:
+		cmd_tb_fs_in?tb_serve:
 		8'h00;
 wire [15:0] cmd_dout_pair =
 		cmd_read?(data_cnt[0] ? {buffer1_dout, buffer0_dout_next} : {buffer0_dout, buffer1_dout}):
@@ -328,6 +358,9 @@ wire [15:0] cmd_dout_pair =
 		cmd_read_capacity?{read_capacity_dout, read_capacity_dout_next}:
 		cmd_mode_sense?{mode_sense_dout, mode_sense_dout_next}:
 		cmd_request_sense?{request_sense_dout, request_sense_dout_next}:
+		cmd_tb_devinfo?{tb_devinfo_dout, tb_devinfo_dout_next}:
+		cmd_tb_debug?{tb_debug_dout, tb_debug_dout_next}:
+		cmd_tb_fs_in?tb_serve_pair:
 		16'h0000;
 wire [15:0] cmd_dout_pair_next =
 		cmd_read?(data_cnt[0] ? {buffer1_dout_next, buffer0_dout_next2} : {buffer0_dout_next, buffer1_dout_next}):
@@ -335,6 +368,9 @@ wire [15:0] cmd_dout_pair_next =
 		cmd_read_capacity?{read_capacity_dout_next2, read_capacity_dout_next3}:
 		cmd_mode_sense?{mode_sense_dout_next2, mode_sense_dout_next3}:
 		cmd_request_sense?{request_sense_dout_next2, request_sense_dout_next3}:
+		cmd_tb_devinfo?{tb_devinfo_dout_next2, tb_devinfo_dout_next3}:
+		cmd_tb_debug?{tb_debug_dout_next2, tb_debug_dout_next3}:
+		cmd_tb_fs_in?tb_serve_pair_next:
 		16'h0000;
 
 // REQUEST SENSE response: minimal fixed-format sense, "NO SENSE".
@@ -344,6 +380,15 @@ wire [7:0] request_sense_dout       = (data_cnt       == 32'd0)?8'h70:(data_cnt 
 wire [7:0] request_sense_dout_next  = (data_cnt_next  == 32'd0)?8'h70:(data_cnt_next  == 32'd7)?8'h0a:8'h00;
 wire [7:0] request_sense_dout_next2 = (data_cnt_next2 == 32'd0)?8'h70:(data_cnt_next2 == 32'd7)?8'h0a:8'h00;
 wire [7:0] request_sense_dout_next3 = (data_cnt_next3 == 32'd0)?8'h70:(data_cnt_next3 == 32'd7)?8'h0a:8'h00;
+
+// INQUIRY vendor id (8 bytes, space-padded). The value is SCSI_VENDOR_STRING,
+// defined in the included rtl/scsi_vendor.vh (committed default "MiSTer  "). A
+// throwaway build (e.g. BlueSCSI Toolbox co-testing) overrides the vendor by
+// editing that one file — no build-specific vendor string ever lives here, and
+// the edit is kept out of commits with:
+//   git update-index --skip-worktree rtl/scsi_vendor.vh   (undo: --no-skip-worktree)
+`include "scsi_vendor.vh"
+localparam [63:0] SCSI_VENDOR_ID = `SCSI_VENDOR_STRING;
 
 // output of inquiry command, identify as "MiSTer  VIRTUAL DISKx" (x = SCSI ID)
 //   vendor  (bytes  8-15): "MiSTer  "        (8 chars, space-padded)
@@ -359,10 +404,11 @@ function [7:0] inquiry_byte;
 		inquiry_byte =
 			(cnt == 32'd4 )?8'd31:  // additional length
 
-			(cnt == 32'd8 )?"M":(cnt == 32'd9 )?"i":
-			(cnt == 32'd10)?"S":(cnt == 32'd11)?"T":
-			(cnt == 32'd12)?"e":(cnt == 32'd13)?"r":
-			(cnt == 32'd14)?" ":(cnt == 32'd15)?" ":
+			// vendor id (bytes 8-15) from the SCSI_VENDOR_ID parameter. A string's
+			// first char is its most-significant byte, so byte (cnt-8) sits at
+			// SCSI_VENDOR_ID[(15-cnt)*8 +: 8]. Default "MiSTer  "; build-time
+			// override lives in the gitignored rtl/scsi_vendor_local.vh (see above).
+			((cnt >= 32'd8) && (cnt <= 32'd15)) ? SCSI_VENDOR_ID[(15 - cnt)*8 +: 8] :
 
 			(cnt == 32'd16)?"V":(cnt == 32'd17)?"I":
 			(cnt == 32'd18)?"R":(cnt == 32'd19)?"T":
@@ -434,7 +480,49 @@ wire [7:0] read_capacity_dout_next3 =
 // the length field reads exactly what we serve (it was 0, which told
 // length-honoring drivers "nothing follows the header" while we kept
 // serving — REQ-held wedge class).
-wire [7:0] mode_sense_dout =
+// BlueSCSI Toolbox detection page (docs/BLUESCSI_HANDOFF.md §2): when the
+// client requests vendor page 0x31 (CDB[2][5:0]==0x31) serve a 56-byte response
+// carrying the magic string it matches on, instead of the 12-byte default.
+// Page select is combinational on the latched CDB, stable through the data
+// phase; data_len switches 12<->56 on the same select. Other pages unchanged.
+wire       mode_sense_p31 = TOOLBOX_ENABLE && cmd_mode_sense && (cmd[2][5:0] == 6'h31);
+
+// 56-byte page-0x31 response (self-contained; block-descriptor #blocks=0 per the
+// spec example -- the client only validates the page string). 4 header + 8 block
+// descriptor + 2 page header + 42 string. DBD ignored (descriptor always
+// present, length byte = 8), matching the default response.
+function [7:0] mode_sense_p31_byte;
+	input [31:0] cnt;
+	begin
+		mode_sense_p31_byte =
+			(cnt == 32'd0 )?8'd55:   // mode data length = 56 - 1
+			(cnt == 32'd3 )?8'd8:    // block descriptor length
+			(cnt == 32'd10)?8'd2:    // block length 0x000200 (512); #blocks = 0
+			(cnt == 32'd12)?8'h31:   // page code 0x31
+			(cnt == 32'd13)?8'h2a:   // page length = 42
+			(cnt == 32'd14)?"B":(cnt == 32'd15)?"l":(cnt == 32'd16)?"u":(cnt == 32'd17)?"e":
+			(cnt == 32'd18)?"S":(cnt == 32'd19)?"C":(cnt == 32'd20)?"S":(cnt == 32'd21)?"I":
+			(cnt == 32'd22)?" ":(cnt == 32'd23)?"i":(cnt == 32'd24)?"s":(cnt == 32'd25)?" ":
+			(cnt == 32'd26)?"t":(cnt == 32'd27)?"h":(cnt == 32'd28)?"e":(cnt == 32'd29)?" ":
+			(cnt == 32'd30)?"B":(cnt == 32'd31)?"E":(cnt == 32'd32)?"S":(cnt == 32'd33)?"T":
+			(cnt == 32'd34)?" ":(cnt == 32'd35)?"S":(cnt == 32'd36)?"T":(cnt == 32'd37)?"O":
+			(cnt == 32'd38)?"L":(cnt == 32'd39)?"E":(cnt == 32'd40)?"N":(cnt == 32'd41)?" ":
+			(cnt == 32'd42)?"F":(cnt == 32'd43)?"R":(cnt == 32'd44)?"O":(cnt == 32'd45)?"M":
+			(cnt == 32'd46)?" ":(cnt == 32'd47)?"B":(cnt == 32'd48)?"L":(cnt == 32'd49)?"U":
+			(cnt == 32'd50)?"E":(cnt == 32'd51)?"S":(cnt == 32'd52)?"C":(cnt == 32'd53)?"S":
+			(cnt == 32'd54)?"I":     // byte 55 = NUL (falls through); rest = 0
+			8'h00;
+	end
+endfunction
+
+// Page select: 0x31 detection page vs. the unchanged default below.
+wire [7:0] mode_sense_dout       = mode_sense_p31 ? mode_sense_p31_byte(data_cnt)       : mode_sense_def_dout;
+wire [7:0] mode_sense_dout_next  = mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next)  : mode_sense_def_dout_next;
+wire [7:0] mode_sense_dout_next2 = mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next2) : mode_sense_def_dout_next2;
+wire [7:0] mode_sense_dout_next3 = mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next3) : mode_sense_def_dout_next3;
+
+// Default MODE SENSE(6) response (unchanged; served for every page except 0x31).
+wire [7:0] mode_sense_def_dout =
 		(data_cnt == 32'd0 )?8'd11:
 		(data_cnt == 32'd3 )?8'd8:
 		(data_cnt == 32'd5 )?capacity[23:16]:
@@ -442,7 +530,7 @@ wire [7:0] mode_sense_dout =
 		(data_cnt == 32'd7 )?capacity[7:0]:
 		(data_cnt == 32'd10 )?8'd2:
 		8'h00;
-wire [7:0] mode_sense_dout_next =
+wire [7:0] mode_sense_def_dout_next =
 		(data_cnt_next == 32'd0 )?8'd11:
 		(data_cnt_next == 32'd3 )?8'd8:
 		(data_cnt_next == 32'd5 )?capacity[23:16]:
@@ -450,7 +538,7 @@ wire [7:0] mode_sense_dout_next =
 		(data_cnt_next == 32'd7 )?capacity[7:0]:
 		(data_cnt_next == 32'd10 )?8'd2:
 		8'h00;
-wire [7:0] mode_sense_dout_next2 =
+wire [7:0] mode_sense_def_dout_next2 =
 		(data_cnt_next2 == 32'd0 )?8'd11:
 		(data_cnt_next2 == 32'd3 )?8'd8:
 		(data_cnt_next2 == 32'd5 )?capacity[23:16]:
@@ -458,7 +546,7 @@ wire [7:0] mode_sense_dout_next2 =
 		(data_cnt_next2 == 32'd7 )?capacity[7:0]:
 		(data_cnt_next2 == 32'd10 )?8'd2:
 		8'h00;
-wire [7:0] mode_sense_dout_next3 =
+wire [7:0] mode_sense_def_dout_next3 =
 		(data_cnt_next3 == 32'd0 )?8'd11:
 		(data_cnt_next3 == 32'd3 )?8'd8:
 		(data_cnt_next3 == 32'd5 )?capacity[23:16]:
@@ -470,6 +558,133 @@ wire [7:0] mode_sense_dout_next3 =
 // buffer to store incoming commands
 reg [3:0]  cmd_cnt;
 reg [7:0]  cmd [9:0];
+
+// ========================================================================
+// BlueSCSI Toolbox transport (TOOLBOX_ENABLE) — dedicated-slot HPS round-trip
+// for the DataIn filesystem ops 0xD0 LIST / 0xD1 GET / 0xD2 COUNT.
+// docs/BLUESCSI_CORE_HPS_CONTRACT.md. The disk read/write path is untouched.
+//
+//   load CDB into tb buffer -> tb_wr @LBA0 (HPS runs the handler) ->
+//   tb_rd @LBA0 (status + 0xB5 signature + length) ->
+//   tb_rd @LBA1 (one 512-byte data block) -> serve via PHASE_DATA_OUT.
+//
+// FIRST CUT (pending HW + Main co-test): the round-trip handshake, the buffer
+// byte-lane order and the status-latch settle are modelled on the proven disk
+// path but cannot be functionally validated until the Main handler exists; the
+// SERVE reuses the disk buffer machinery verbatim so its timing is inherited.
+// Single 512-byte response this stage; GET >512 (sequential fetch) and SEND
+// upload (0xD3-D5, needs a 2nd buffer sector) are the remaining stages.
+// ========================================================================
+localparam TBS_IDLE=3'd0, TBS_LOAD=3'd1, TBS_REQ=3'd2, TBS_STAT=3'd3,
+           TBS_LATCH=3'd4, TBS_DATA=3'd5, TBS_RDY=3'd6;
+reg [2:0]  tb_state = TBS_IDLE;
+reg        tb_rd_r, tb_wr_r;
+reg [31:0] tb_lba_r;
+reg [7:0]  tb_status;
+reg [15:0] tb_len;
+reg [3:0]  tb_load_w;
+reg [1:0]  tb_settle;
+reg        old_tb_ack;
+
+// Shared-folder availability: latches when the HPS mounts the Toolbox slot.
+// Until then (incl. a stock Main with no handler) fs ops return CHECK (§4a).
+reg tb_ready = 1'b0;
+always @(posedge clk) if (TOOLBOX_ENABLE && tb_mounted) tb_ready <= 1'b1;
+
+// Toolbox buffer: one 512-byte sector, byte-split (even->buf0, odd->buf1) with
+// the SAME HPS lane mapping as the disk buffer so bytes arrive in order.
+wire [7:0] tb_buf0_qa, tb_buf1_qa;     // HPS read-back (the CDB, during request)
+`ifdef VERILATOR
+wire [7:0] tb_buf0_da = sd_buff_dout[15:8];
+wire [7:0] tb_buf1_da = sd_buff_dout[7:0];
+assign tb_buff_din = {tb_buf0_qa, tb_buf1_qa};
+`else
+wire [7:0] tb_buf0_da = sd_buff_dout[7:0];
+wire [7:0] tb_buf1_da = sd_buff_dout[15:8];
+assign tb_buff_din = {tb_buf1_qa, tb_buf0_qa};
+`endif
+
+wire       tb_hps_wr  = sd_buff_wr & tb_ack;            // HPS fills the slot
+wire [7:0] tb_b_addr  = (tb_state == TBS_LOAD) ? {4'd0, tb_load_w} : data_cnt[8:1];
+wire       tb_b_wr    = (tb_state == TBS_LOAD);
+wire [7:0] tb_load_b0 = cmd[{tb_load_w[2:0], 1'b0}];   // even CDB byte
+wire [7:0] tb_load_b1 = cmd[{tb_load_w[2:0], 1'b1}];   // odd  CDB byte
+
+wire [7:0] tb0_dout, tb0_dout_next, tb0_dout_next2;
+wire [7:0] tb1_dout, tb1_dout_next, tb1_dout_next2;
+scsi_dpram #(.ADDRWIDTH(8)) tb_buf0 (
+	.clock(clk),
+	.address_a(sd_buff_addr), .data_a(tb_buf0_da), .wren_a(tb_hps_wr), .q_a(tb_buf0_qa),
+	.address_b(tb_b_addr), .data_b(tb_load_b0), .wren_b(tb_b_wr), .q_b(tb0_dout),
+	.address_c(tb_b_addr + 1'b1), .q_c(tb0_dout_next),
+	.address_d(tb_b_addr + 2'd2), .q_d(tb0_dout_next2)
+);
+scsi_dpram #(.ADDRWIDTH(8)) tb_buf1 (
+	.clock(clk),
+	.address_a(sd_buff_addr), .data_a(tb_buf1_da), .wren_a(tb_hps_wr), .q_a(tb_buf1_qa),
+	.address_b(tb_b_addr), .data_b(tb_load_b1), .wren_b(tb_b_wr), .q_b(tb1_dout),
+	.address_c(tb_b_addr + 1'b1), .q_c(tb1_dout_next),
+	.address_d(tb_b_addr + 2'd2), .q_d(tb1_dout_next2)
+);
+
+// Serve sources (mirror the disk read: even byte from buf0, odd from buf1).
+wire  [7:0] tb_serve           = data_cnt[0] ? tb1_dout : tb0_dout;
+wire [15:0] tb_serve_pair      = data_cnt[0] ? {tb1_dout, tb0_dout_next} : {tb0_dout, tb1_dout};
+wire [15:0] tb_serve_pair_next = data_cnt[0] ? {tb1_dout_next, tb0_dout_next2} : {tb0_dout_next, tb1_dout_next};
+
+// Round-trip FSM. Drives tb_state / tb_rd / tb_wr / tb_lba; the MAIN phase FSM
+// moves `phase` (CMD_IN -> PHASE_TB -> DATA_OUT/STATUS_OUT) by watching tb_state.
+always @(posedge clk) begin
+	old_tb_ack <= tb_ack;
+	if (rst) begin
+		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
+		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 2'd0;
+	end else if (TOOLBOX_ENABLE) begin
+		case (tb_state)
+		TBS_IDLE: begin
+			tb_load_w <= 4'd0;
+			if (phase == PHASE_TB) tb_state <= TBS_LOAD;
+		end
+		// write the 10-byte CDB as 5 words (0..4) into the tb buffer
+		TBS_LOAD:
+			if (tb_load_w == 4'd4) begin
+				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
+			end else tb_load_w <= tb_load_w + 1'b1;
+		// request: HPS reads the CDB and runs the handler
+		TBS_REQ: begin
+			if (tb_ack) tb_wr_r <= 1'b0;
+			if (old_tb_ack & ~tb_ack) begin
+				tb_rd_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_STAT;
+			end
+		end
+		// status: HPS returns {status, 0xB5, len_hi, len_lo} at buffer words 0/1
+		TBS_STAT: begin
+			if (tb_ack) tb_rd_r <= 1'b0;
+			if (old_tb_ack & ~tb_ack) begin tb_settle <= 2'd2; tb_state <= TBS_LATCH; end
+		end
+		// let the registered buffer reads (addr 0/1, data_cnt=0) settle, then latch
+		TBS_LATCH:
+			if (tb_settle != 2'd0) tb_settle <= tb_settle - 1'b1;
+			else if (tb1_dout == 8'hb5) begin            // signature ok (byte 1)
+				tb_status <= tb0_dout;                       // byte 0 = SCSI status
+				tb_len    <= {tb0_dout_next, tb1_dout_next}; // bytes 2,3 = length
+				if ({tb0_dout_next, tb1_dout_next} != 16'd0) begin
+					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_state <= TBS_DATA;
+				end else tb_state <= TBS_RDY;                // status-only
+			end else begin                               // no real handler -> CHECK
+				tb_status <= 8'h02; tb_len <= 16'd0; tb_state <= TBS_RDY;
+			end
+		// data: HPS returns one 512-byte block at words 0..255
+		TBS_DATA: begin
+			if (tb_ack) tb_rd_r <= 1'b0;
+			if (old_tb_ack & ~tb_ack) tb_state <= TBS_RDY;
+		end
+		// round-trip done; the main FSM consumes tb_status/tb_len and leaves
+		TBS_RDY: if (phase != PHASE_TB) tb_state <= TBS_IDLE;
+		default: tb_state <= TBS_IDLE;
+		endcase
+	end
+end
 
 /* ----------------------- request data from/to io controller ----------------------- */
 
@@ -596,8 +811,12 @@ wire [31:0] data_len =
 		 cmd_read?{ 7'd0, tlen, 9'd0 }:   // read command length is in 512 bytes blocks
 		 cmd_write?{ 7'd0, tlen, 9'd0 }:  // write command length is in 512 bytes blocks
 		 cmd_inquiry?((alloc_len < 32'd36) ? alloc_len : 32'd36):
-		 cmd_mode_sense?((alloc_len < 32'd12) ? alloc_len : 32'd12):
+		 cmd_mode_sense?(mode_sense_p31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
+		                                : ((alloc_len < 32'd12) ? alloc_len : 32'd12)):
 		 cmd_request_sense?((sense_len < 32'd18) ? sense_len : 32'd18):
+		 cmd_tb_devinfo?tb_devinfo_len:                       // 0xD9 DEVICE INFO
+		 cmd_tb_debug_get?32'd1:                              // 0xD6 get = one flag byte
+		 cmd_tb_fs_in?{16'd0, tb_len}:                        // 0xD0/D1/D2 toolbox DataIn (HPS length)
 		 { 16'd0, tlen };                 // mode select etc have length in bytes
 
 always @(posedge clk) begin
@@ -700,7 +919,13 @@ wire [2:0] cmd_group = op_code[7:5];
 // check if a complete command has been received
 wire       cmd_cpl = cmd6_cpl || cmd10_cpl;
 wire       cmd6_cpl = (cmd_group == 3'b000) && (cmd_cnt == 6);
-wire       cmd10_cpl = ((cmd_group == 3'b010) || (cmd_group == 3'b001)) && (cmd_cnt == 10);
+// BlueSCSI Toolbox vendor commands (0xD0-0xD9, group 110) are 10-byte CDBs.
+// Decode ONLY this exact range as 10-byte (not the whole vendor group 110) so
+// other group-110 opcodes aren't mis-lengthed (0xC0 EJECT is a 6-byte CDB).
+// docs/BLUESCSI_MISTER_MAIN_PLAN.md, docs/BLUESCSI_HANDOFF.md §1.
+wire       cmd_toolbox_op = (op_code >= 8'hd0) && (op_code <= 8'hd9);
+wire       cmd10_cpl = (((cmd_group == 3'b010) || (cmd_group == 3'b001)) && (cmd_cnt == 10))
+                       || (cmd_toolbox_op && (cmd_cnt == 10));
 
 // https://en.wikipedia.org/wiki/SCSI_command
 wire       cmd_read = cmd_read6 || cmd_read10;
@@ -726,11 +951,57 @@ wire       cmd_verify10 = (op_code == 8'h2f); // fake
 // wedged.  Support it and return a clean "NO SENSE" block.
 wire       cmd_request_sense = (op_code == 8'h03);
 
+// ----- BlueSCSI Toolbox vendor commands (0xD0-0xD9) ----------------------
+// M0 = the RTL-serviceable subset that needs NO host filesystem, so the Mac
+// "BlueSCSI SD Transfer" client can DETECT the device:
+//   * 0xD9 DEVICE INFO  - static device-list / capabilities (like INQUIRY)
+//   * 0xD6 TOGGLE DEBUG - a stored flag (get/set), no side effects
+// Detection itself is MODE SENSE page 0x31 (mode_sense_p31) + normal INQUIRY.
+// The filesystem opcodes (0xD0/D1/D2/D3/D4/D5) need the HPS round trip and are
+// NOT in cmd_ok yet -> they return CHECK CONDITION, which the client tolerates
+// as "no shared folder" (empty listing). M1+ wires them to Main_MiSTer.
+// docs/BLUESCSI_MISTER_MAIN_PLAN.md
+wire       cmd_tb_devinfo   = TOOLBOX_ENABLE && (op_code == 8'hd9);
+wire       cmd_tb_fs_in     = TOOLBOX_ENABLE && (op_code == 8'hd0 || op_code == 8'hd1 || op_code == 8'hd2); // LIST/GET/COUNT (HPS round-trip)                  // DEVICE INFO
+wire       cmd_tb_debug     = TOOLBOX_ENABLE && (op_code == 8'hd6);                  // TOGGLE DEBUG
+wire       cmd_tb_debug_get = cmd_tb_debug && (cmd[1] != 8'd0);    // CDB[1]!=0 -> read flag
+wire       tb_devinfo_caps  = cmd_tb_devinfo && (cmd[1] == 8'h01); // subcmd 1 = capabilities
+// 0xD9 allocation length is CDB[8] (0 -> 8 bytes; otherwise min(CDB[8],8)).
+wire [31:0] tb_devinfo_alloc = (cmd[8] == 8'd0) ? 32'd8 : {24'd0, cmd[8]};
+wire [31:0] tb_devinfo_len   = (tb_devinfo_alloc < 32'd8) ? tb_devinfo_alloc : 32'd8;
+
+// DEVICE INFO data (docs/BLUESCSI_HANDOFF.md §4.8): subcmd 0x00 LIST DEVICES ->
+// 8 bytes; this target's own ID = 0x00 (fixed disk present), every other ID =
+// 0xFF (absent). subcmd 0x01 GET CAPABILITIES -> API version 0 + cap flags; M0
+// has no host transfer path so advertise 0x00 (force v0 paths) -> all zero.
+// Bump caps when the HPS round trip lands (M2/M3).
+wire [7:0] tb_devinfo_dout       = tb_devinfo_caps ? 8'h00 : (data_cnt       == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next  = tb_devinfo_caps ? 8'h00 : (data_cnt_next  == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next2 = tb_devinfo_caps ? 8'h00 : (data_cnt_next2 == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next3 = tb_devinfo_caps ? 8'h00 : (data_cnt_next3 == {29'd0, ID}) ? 8'h00 : 8'hff;
+
+// TOGGLE DEBUG (0xD6): a stored flag with no side effects, so the client's
+// get/set round-trips succeed. get (CDB[1]!=0) returns the flag byte.
+reg        tb_debug_flag;
+wire [7:0] tb_debug_dout       = (data_cnt       == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+wire [7:0] tb_debug_dout_next  = (data_cnt_next  == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+wire [7:0] tb_debug_dout_next2 = (data_cnt_next2 == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+wire [7:0] tb_debug_dout_next3 = (data_cnt_next3 == 32'd0) ? {7'd0, tb_debug_flag} : 8'h00;
+
+// set (CDB[1]==0): latch CDB[2]!=0 at command completion. Single-driver always
+// block (Quartus-clean); the flag is observable only via the 0xD6 get path.
+always @(posedge clk) begin
+	if (rst) tb_debug_flag <= 1'b0;
+	else if (cmd_cpl && (phase == PHASE_CMD_IN) && cmd_tb_debug && (cmd[1] == 8'd0))
+		tb_debug_flag <= (cmd[2] != 8'd0);
+end
+
 // valid command in buffer? TODO: check for valid command parameters
 wire  cmd_ok = cmd_read || cmd_write || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_format || cmd_mode_sense ||
 		  cmd_read_buffer || cmd_write_buffer || cmd_verify6 || cmd_verify10 ||
-		  cmd_request_sense;
+		  cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug ||
+		  (cmd_tb_fs_in && tb_ready);   // fs ops valid only with a shared folder (else CHECK)
 
 // latch parameters once command is complete
 reg [31:0] lba;
@@ -784,7 +1055,8 @@ always @(posedge clk) begin
 					// continue according to command
 
 					// these commands return data
-					if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense) phase <= PHASE_DATA_OUT;
+					if(cmd_tb_fs_in) phase <= PHASE_TB;   // toolbox fs op: HPS round-trip, then serve
+						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get) phase <= PHASE_DATA_OUT;
 					// these commands receive dataa
 					else if(cmd_write || cmd_mode_select || cmd_write_buffer) phase <= PHASE_DATA_IN;
 					// and all other valid commands are just "ok"
@@ -794,6 +1066,14 @@ always @(posedge clk) begin
 					status <= `STATUS_CHECK_CONDITION;
 					phase <= PHASE_STATUS_OUT;
 				end
+			end
+		end
+
+		else if(phase == PHASE_TB) begin
+			// round-trip done: adopt the HPS status, then serve DataIn or finish.
+			if(tb_state == TBS_RDY) begin
+				status <= tb_status;
+				phase  <= (tb_len != 16'd0) ? PHASE_DATA_OUT : PHASE_STATUS_OUT;
 			end
 		end
 
