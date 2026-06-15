@@ -345,3 +345,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/v8_clocks.sv
 # Project timing constraints (read after sys/sys_top.sdc). Contains the TG68
 # kernel multicycle required for reliable timing closure — see MacLC.sdc.
 set_global_assignment -name SDC_FILE MacLC.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg_probes.sv
+set_global_assignment -name VERILOG_FILE rtl/mfm_track_encoder.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vram_bram.sv
