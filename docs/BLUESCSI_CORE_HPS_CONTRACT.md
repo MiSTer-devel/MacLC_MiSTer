@@ -98,15 +98,20 @@ shared folder). Guarantees:
 1. **Disk I/O & boot: unaffected.** The dedicated slot isolates the Toolbox path;
    the disk read/write engine is unchanged. The core boots and runs identically to
    today whether or not the HPS side exists.
-2. **Toolbox path is dormant unless the client pokes it.** The FSM only activates
-   on `0xD0–0xD5`, which only the BlueSCSI client sends. M0 detection is pure RTL
-   and works standalone.
+2. **Toolbox path is fully dormant without the HPS.** *Both* detection (MODE SENSE
+   page 0x31, `0xD9`, `0xD6`) and the transport FSM (`0xD0–0xD5`) are gated on
+   `tb_ready`, so on a stock Main the target advertises nothing Toolbox-specific and
+   looks like a plain disk. **(Correction, field test 2026-06-15:** M0 detection was
+   originally left ungated — "pure RTL, works standalone." But the BlueSCSI client
+   engages on the page-0x31 advert *alone*, then **hangs the app on close** when the
+   file ops return CHECK. So detection must be gated on `tb_ready` too — see point 3.)
 3. **No hang, no garbage — gate on `tb_ready`.** Latch `tb_ready` from
-   `tb_mounted` (`img_mounted[VD_TOOLBOX]`). The round-trip (TB_REQ/TB_STAT) is
-   entered **only if `tb_ready`**; otherwise `0xD0–0xD5` return **CHECK CONDITION
-   immediately** with no `tb_rd`/`tb_wr` issued. With a stock HPS and no shared
-   folder the slot is never mounted → `tb_ready=0` → the client reads "no shared
-   folder / empty" (`BLUESCSI_HANDOFF.md` §5, §8) — the dormant M0 state.
+   `tb_mounted` (`img_mounted[VD_TOOLBOX]`). `mode_sense_p31`, `cmd_tb_devinfo`,
+   `cmd_tb_debug` and the round-trip (TB_REQ/TB_STAT, via `cmd_tb_fs_in`) are all
+   qualified by `tb_ready`. With a stock HPS and no shared folder the slot is never
+   mounted → `tb_ready=0` → page 0x31 returns the **default** mode page and
+   `0xD9`/`0xD6`/`0xD0–0xD5` fall out of `cmd_ok` (CHECK), so the client never
+   detects a Toolbox device at all — no UI, no transfer attempt, no hang.
    - The stock HPS *would* ack slot 3 (its poll loop services slots 0–3, blank-
      block-and-ack for an unmounted image), so the gate isn't strictly required to
      avoid a hang — but it makes degradation **deterministic** instead of relying

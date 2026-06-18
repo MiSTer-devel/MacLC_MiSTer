@@ -485,7 +485,11 @@ wire [7:0] read_capacity_dout_next3 =
 // carrying the magic string it matches on, instead of the 12-byte default.
 // Page select is combinational on the latched CDB, stable through the data
 // phase; data_len switches 12<->56 on the same select. Other pages unchanged.
-wire       mode_sense_p31 = TOOLBOX_ENABLE && cmd_mode_sense && (cmd[2][5:0] == 6'h31);
+// Gated on tb_ready: advertise the Toolbox detection page ONLY once the HPS
+// handler has mounted the slot. On a stock Main (no handler) tb_ready=0, so a
+// page-0x31 request falls through to the default mode page and the target looks
+// like a plain disk -> the Mac client never engages -> no app-close hang (§4a).
+wire       mode_sense_p31 = TOOLBOX_ENABLE && tb_ready && cmd_mode_sense && (cmd[2][5:0] == 6'h31);
 
 // 56-byte page-0x31 response (self-contained; block-descriptor #blocks=0 per the
 // spec example -- the client only validates the page string). 4 header + 8 block
@@ -605,24 +609,37 @@ assign tb_buff_din = {tb_buf1_qa, tb_buf0_qa};
 `endif
 
 wire       tb_hps_wr  = sd_buff_wr & tb_ack;            // HPS fills the slot
-wire [7:0] tb_b_addr  = (tb_state == TBS_LOAD) ? {4'd0, tb_load_w} : data_cnt[8:1];
-wire       tb_b_wr    = (tb_state == TBS_LOAD);
+// SEND (upload) payload collection: during the DataOut phase the Mac's bytes are
+// written into the toolbox buffer at WORD offset 8 (byte 16), leaving words 0..4
+// (bytes 0..9) for the CDB that TBS_LOAD writes -- so one round-trip block carries
+// both (the contract's "payload at buffer[16..]" single-block layout). Even byte
+// -> buf0, odd -> buf1, mirroring the CDB/serve byte split.
+wire       tb_collect = (phase == PHASE_DATA_IN) && cmd_tb_send;
+wire       tb_col_wr0 = tb_collect && stb_ack && ~data_cnt[0];
+wire       tb_col_wr1 = tb_collect && stb_ack &&  data_cnt[0];
+wire [7:0] tb_b_addr  = (tb_state == TBS_LOAD) ? {4'd0, tb_load_w}
+                      : tb_collect            ? (8'd8 + data_cnt[8:1])
+                      :                          data_cnt[8:1];
+wire       tb_b_wr0   = (tb_state == TBS_LOAD) || tb_col_wr0;
+wire       tb_b_wr1   = (tb_state == TBS_LOAD) || tb_col_wr1;
 wire [7:0] tb_load_b0 = cmd[{tb_load_w[2:0], 1'b0}];   // even CDB byte
 wire [7:0] tb_load_b1 = cmd[{tb_load_w[2:0], 1'b1}];   // odd  CDB byte
+wire [7:0] tb_b_d0    = (tb_state == TBS_LOAD) ? tb_load_b0 : din;   // CDB even byte, else payload byte
+wire [7:0] tb_b_d1    = (tb_state == TBS_LOAD) ? tb_load_b1 : din;   // CDB odd  byte, else payload byte
 
 wire [7:0] tb0_dout, tb0_dout_next, tb0_dout_next2;
 wire [7:0] tb1_dout, tb1_dout_next, tb1_dout_next2;
 scsi_dpram #(.ADDRWIDTH(8)) tb_buf0 (
 	.clock(clk),
 	.address_a(sd_buff_addr), .data_a(tb_buf0_da), .wren_a(tb_hps_wr), .q_a(tb_buf0_qa),
-	.address_b(tb_b_addr), .data_b(tb_load_b0), .wren_b(tb_b_wr), .q_b(tb0_dout),
+	.address_b(tb_b_addr), .data_b(tb_b_d0), .wren_b(tb_b_wr0), .q_b(tb0_dout),
 	.address_c(tb_b_addr + 1'b1), .q_c(tb0_dout_next),
 	.address_d(tb_b_addr + 2'd2), .q_d(tb0_dout_next2)
 );
 scsi_dpram #(.ADDRWIDTH(8)) tb_buf1 (
 	.clock(clk),
 	.address_a(sd_buff_addr), .data_a(tb_buf1_da), .wren_a(tb_hps_wr), .q_a(tb_buf1_qa),
-	.address_b(tb_b_addr), .data_b(tb_load_b1), .wren_b(tb_b_wr), .q_b(tb1_dout),
+	.address_b(tb_b_addr), .data_b(tb_b_d1), .wren_b(tb_b_wr1), .q_b(tb1_dout),
 	.address_c(tb_b_addr + 1'b1), .q_c(tb1_dout_next),
 	.address_d(tb_b_addr + 2'd2), .q_d(tb1_dout_next2)
 );
@@ -817,6 +834,9 @@ wire [31:0] data_len =
 		 cmd_tb_devinfo?tb_devinfo_len:                       // 0xD9 DEVICE INFO
 		 cmd_tb_debug_get?32'd1:                              // 0xD6 get = one flag byte
 		 cmd_tb_fs_in?{16'd0, tb_len}:                        // 0xD0/D1/D2 toolbox DataIn (HPS length)
+		 cmd_tb_send_prep?32'd33:                             // 0xD3 SEND PREP: 33-byte filename
+		 cmd_tb_send_data?(cmd[6] ? {15'd0, cmd[6], 9'd0}     // 0xD4 SEND DATA: CDB[6]*512 (block enc),
+		                          : {16'd0, cmd[1], cmd[2]}): //   else legacy u16(CDB[1..2]) byte count
 		 { 16'd0, tlen };                 // mode select etc have length in bytes
 
 always @(posedge clk) begin
@@ -956,14 +976,26 @@ wire       cmd_request_sense = (op_code == 8'h03);
 // "BlueSCSI SD Transfer" client can DETECT the device:
 //   * 0xD9 DEVICE INFO  - static device-list / capabilities (like INQUIRY)
 //   * 0xD6 TOGGLE DEBUG - a stored flag (get/set), no side effects
-// Detection itself is MODE SENSE page 0x31 (mode_sense_p31) + normal INQUIRY.
-// The filesystem opcodes (0xD0/D1/D2/D3/D4/D5) need the HPS round trip and are
-// NOT in cmd_ok yet -> they return CHECK CONDITION, which the client tolerates
-// as "no shared folder" (empty listing). M1+ wires them to Main_MiSTer.
+// Detection (MODE SENSE page 0x31 + 0xD9/0xD6) AND the filesystem opcodes
+// (0xD0/D1/D2) are ALL gated on tb_ready, so the target advertises Toolbox
+// capability only when the HPS handler is present and the slot is mounted. On a
+// stock Main (no handler) tb_ready=0: every Toolbox response degrades to a plain
+// disk, so the Mac client never engages. (The earlier "detection works
+// standalone, fs ops degrade to empty folder" plan hung the client on app-close
+// -- the page-0x31 advert is what makes it engage, so it must be gated too.)
 // docs/BLUESCSI_MISTER_MAIN_PLAN.md
-wire       cmd_tb_devinfo   = TOOLBOX_ENABLE && (op_code == 8'hd9);
-wire       cmd_tb_fs_in     = TOOLBOX_ENABLE && (op_code == 8'hd0 || op_code == 8'hd1 || op_code == 8'hd2); // LIST/GET/COUNT (HPS round-trip)                  // DEVICE INFO
-wire       cmd_tb_debug     = TOOLBOX_ENABLE && (op_code == 8'hd6);                  // TOGGLE DEBUG
+wire       cmd_tb_devinfo   = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd9);      // DEVICE INFO
+wire       cmd_tb_fs_in     = TOOLBOX_ENABLE && (op_code == 8'hd0 || op_code == 8'hd1 || op_code == 8'hd2); // LIST/GET/COUNT (HPS round-trip, DataIn)
+// SEND/upload (Mac -> host), DataOut. FIRST CUT = single-block: the CDB and the
+// payload ride one round-trip block (CDB at [0..9], payload at [16..]), so a
+// chunk is capped at 512-16 = 496 B (fine for the small co-test files; >496 B
+// chunks / CAP_LARGE_SEND are future multi-block work). 0xD5 has no data phase.
+wire       cmd_tb_send_prep = TOOLBOX_ENABLE && (op_code == 8'hd3);   // SEND FILE PREP (33-B name)
+wire       cmd_tb_send_data = TOOLBOX_ENABLE && (op_code == 8'hd4);   // SEND FILE DATA (chunk)
+wire       cmd_tb_send_end  = TOOLBOX_ENABLE && (op_code == 8'hd5);   // SEND FILE END (no payload)
+wire       cmd_tb_send      = cmd_tb_send_prep || cmd_tb_send_data || cmd_tb_send_end;
+wire       cmd_tb_send_pay  = cmd_tb_send_prep || cmd_tb_send_data;   // has a DataOut payload
+wire       cmd_tb_debug     = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd6);      // TOGGLE DEBUG
 wire       cmd_tb_debug_get = cmd_tb_debug && (cmd[1] != 8'd0);    // CDB[1]!=0 -> read flag
 wire       tb_devinfo_caps  = cmd_tb_devinfo && (cmd[1] == 8'h01); // subcmd 1 = capabilities
 // 0xD9 allocation length is CDB[8] (0 -> 8 bytes; otherwise min(CDB[8],8)).
@@ -1001,7 +1033,8 @@ wire  cmd_ok = cmd_read || cmd_write || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_format || cmd_mode_sense ||
 		  cmd_read_buffer || cmd_write_buffer || cmd_verify6 || cmd_verify10 ||
 		  cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug ||
-		  (cmd_tb_fs_in && tb_ready);   // fs ops valid only with a shared folder (else CHECK)
+		  (cmd_tb_fs_in && tb_ready) ||  // fs DataIn ops valid only with a shared folder (else CHECK)
+		  (cmd_tb_send  && tb_ready);    // fs DataOut (upload) ops, likewise
 
 // latch parameters once command is complete
 reg [31:0] lba;
@@ -1055,7 +1088,9 @@ always @(posedge clk) begin
 					// continue according to command
 
 					// these commands return data
-					if(cmd_tb_fs_in) phase <= PHASE_TB;   // toolbox fs op: HPS round-trip, then serve
+					if(cmd_tb_fs_in) phase <= PHASE_TB;   // toolbox DataIn fs op: HPS round-trip, then serve
+						else if(cmd_tb_send_end) phase <= PHASE_TB;       // SEND END: no payload, straight to round-trip
+						else if(cmd_tb_send_pay) phase <= PHASE_DATA_IN;  // SEND PREP/DATA: collect the DataOut payload first
 						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get) phase <= PHASE_DATA_OUT;
 					// these commands receive dataa
 					else if(cmd_write || cmd_mode_select || cmd_write_buffer) phase <= PHASE_DATA_IN;
@@ -1082,7 +1117,10 @@ always @(posedge clk) begin
 		end
 
 		else if(phase == PHASE_DATA_IN) begin
-			if(data_done) phase <= PHASE_STATUS_OUT;
+			// SEND (upload): once the DataOut payload has landed in the toolbox
+			// buffer, run the HPS round-trip (write CDB+payload, read status).
+			// Disk writes still go straight to STATUS.
+			if(data_done) phase <= cmd_tb_send ? PHASE_TB : PHASE_STATUS_OUT;
 		end
 
 		else if(phase == PHASE_STATUS_OUT) begin
