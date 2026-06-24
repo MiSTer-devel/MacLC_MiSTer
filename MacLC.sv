@@ -711,6 +711,41 @@ module emu
 	// value-checking probes ($A4BEB0 reads $FE000010/$1C) see a dead slot
 	// instead of phantom-card garbage, and nothing depends on TG68 berr.
 	wire cpu_berr = (fc7_berr && !_cpuAS) || sdma_berr;
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// SCSI / peripheral read-path fit-stabilization (Layer 1 — the structural fix).
+	//
+	// Peripheral reads ($Exxxxx/$Fxxxxx, cpuAddr[23:21]==111) complete via the
+	// 6800-style VPA cycle — NOT the async-DTACK path RAM/ROM/VRAM use. (Verified:
+	// for this region _cpuDTACK is held DEASSERTED above and _cpuVPA asserted, so the
+	// CPU is paced by VMA/E, never by dtack_en.) The VPA cycle is E-paced (E≈812kHz
+	// ⇒ ~40 clk_sys per E period) and the kernel latches read data LATE: at s_state 6,
+	// only after stalling at s_state 4 for xVma (= eCntr==8, one tick before E-fall —
+	// rtl/tg68k/tg68k.v:107,115,135). So from address/select settle (AS at s_state 1)
+	// to the data sample is ALWAYS ≥5 clk_sys.
+	//
+	// The bit that makes this read fit-sensitive is CSR bit6 / scsi_bsy — the deepest
+	// cone in the whole read mux: scsi.v phase reg → bsy=(phase!=IDLE) → |target_bsy
+	// (cross-module) → wide OR → CSR (ncr5380.sv) → far inter-module route → 7-way
+	// cpuDataOut mux (dataController_top.sv) → CPU din. CSR bit1 / scsi_sel is a local
+	// ICR register bit (shallow) — which is exactly why HW read bit1 right but bit6
+	// wrong, depending on placement → the dice-roll boot.
+	//
+	// Fix: register the peripheral read data one clk_sys stage (periph_din_reg) and
+	// feed the CPU the REGISTERED value on VPA cycles. The ≥5-cycle VPA window absorbs
+	// the +1 latency completely (sampled at s_state 6, settled by ~s_state 3), so no
+	// DTACK/VMA change is needed and the memory (DTACK) read path is left byte-for-byte
+	// unchanged. MacLC.sdc adds a conservative 2× multicycle on `-to periph_din_reg`
+	// so STA reports the real (E-paced) margin instead of over-constraining this read
+	// to a single 30.8 ns period. periph_din_reg is only CONSUMED during VPA reads,
+	// when its combinational input is held stable by the CPU.
+	wire vpa_periph_read = !fc7_iack && !fc7_berr && !slot_space && !_cpuAS &&
+	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
+	reg [15:0] periph_din_reg;
+	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
+	wire [15:0] cpu_din_muxed = slot_space     ? 16'hFFFF :
+	                            vpa_periph_read ? periph_din_reg :
+	                                              dataControllerDataOut;
 `ifdef SIMULATION
 	reg _cpuAS_d;
 	always @(posedge clk_sys) _cpuAS_d <= _cpuAS;
@@ -751,7 +786,7 @@ module emu
 				.bgack_n    ( 1'b1 ),
 				.ipl        ( _cpuIPL ),
 				.berr       ( cpu_berr ),
-				.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
+				.din        ( cpu_din_muxed ),
 				.dout       ( tg68_dout ),
 				.longword   ( tg68_longword ),
 				.addr       ( tg68_a )

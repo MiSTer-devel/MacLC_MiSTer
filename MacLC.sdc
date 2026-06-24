@@ -30,3 +30,24 @@
 # to boot; a wrong multicycle would corrupt/crash it).
 set_multicycle_path -setup -end 2 -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}]
 set_multicycle_path -hold  -end 1 -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}]
+
+# ----------------------------------------------------------------------------
+# Peripheral (VPA) read-data register — SCSI read-path fit-stabilization.
+# ----------------------------------------------------------------------------
+# periph_din_reg (MacLC.sv) captures the peripheral read mux (dataControllerDataOut)
+# one clk_sys stage before the CPU samples it on VPA/6800 cycles. Its deepest input
+# cone is the SCSI CSR's scsi_bsy bit (scsi.v phase -> |target_bsy -> CSR -> far route
+# -> 7-way mux) — historically THE fit-sensitive net that made the SCSI HD read fail
+# on some builds (bit6/scsi_bsy read wrong, bit1/scsi_sel read right).
+#
+# Peripheral reads are E-paced: the kernel stalls at s_state 4 for xVma (near E-fall)
+# and latches read data at s_state 6, ALWAYS >= 5 clk_sys after the address/select
+# settle (rtl/tg68k/tg68k.v:107,115,135). So the cone into periph_din_reg genuinely
+# has multiple clk_sys to resolve, not one. Credit a CONSERVATIVE 2x (61.6 ns @
+# 32.5 MHz) — well inside the >=5-cycle window — so STA reports the real margin
+# instead of over-constraining this E-paced read to a single 30.8 ns period (the
+# "STA passes but HW fails" trap). periph_din_reg is only CONSUMED during VPA reads,
+# when its input is held stable by the CPU; its fan-OUT (-> tg68_din_r, near the CPU)
+# stays a normal single-cycle path and is deliberately NOT relaxed here.
+set_multicycle_path -setup -end 2 -to [get_keepers {*periph_din_reg*}]
+set_multicycle_path -hold  -end 1 -to [get_keepers {*periph_din_reg*}]
