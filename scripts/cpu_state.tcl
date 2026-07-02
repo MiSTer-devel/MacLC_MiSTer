@@ -245,10 +245,10 @@ puts [format "  sd_ack_seen=%d%d io_ack_seen=%d%d live io_rd=%d%d io_wr=%d%d io_
     [expr {($p3>>1)&1}] [expr {($p3>>0)&1}]]
 
 set w [rd PSCW]
-puts [format "PSCW wr-stall   : data_cnt=%d phase=%s done=%d io_wr=%d io_ack=%d io_busy=%d buf_sel=%d cmd_write=%d tlen=%d req=%d" \
-    [expr {$w&0xFFFF}] [lindex $phn [expr {($w>>16)&7}]] \
-    [expr {($w>>19)&1}] [expr {($w>>20)&1}] [expr {($w>>21)&1}] [expr {($w>>22)&1}] \
-    [expr {($w>>23)&1}] [expr {($w>>24)&1}] [expr {($w>>25)&0x3F}] [expr {($w>>31)&1}]]
+puts [format "PSCW busreset   : valid=%d count=%d | at 1st reset: max_phase=%s read_done=%d sel_seen=%d last_op=%02X | live: max_phase=%s read_done=%d" \
+    [expr {($w>>31)&1}] [expr {($w>>19)&0x7F}] \
+    [lindex $phn [expr {($w>>28)&7}]] [expr {($w>>27)&1}] [expr {($w>>26)&1}] [expr {($w>>11)&0xFF}] \
+    [lindex $phn [expr {($w>>8)&7}]] [expr {($w>>7)&1}]]
 
 set n [rd PSNC]
 puts [format "PSNC dma engine : dreq=%d req=%d ack=%d dma_en=%d dma_ack=%d ack_busy=%d holdoff=%d mr_dma=%d pmatch=%d word=%d long=%d tcr=%X dack_beats=%d" \
