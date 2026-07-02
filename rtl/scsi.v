@@ -1228,9 +1228,60 @@ end
 assign dbg_wrsnap = { 4'd0, dbg_b1_seen, dbg_b0_seen, dbg_long_l, dbg_word_l,
                       dbg_low_l, dbg_b1, dbg_b0 };
 
-// Multi-block WRITE stall snapshot (2026-06-10). Live data-transfer state.
-assign dbg_wrstall = { req, tlen[5:0], cmd_write, sd_buff_sel, io_busy,
-                       io_ack, io_wr, data_complete, phase, data_cnt[15:0] };
+// ---- Bus-reset snapshot (PSCW probe, repurposed for selection/reset forensics) ----
+// The read-abort probe returned valid=0 — reads do NOT die mid-transfer; the wedge
+// and the bus resets cluster in the selection/scan path. So capture, at the FIRST
+// SCSI bus reset (rst = the Mac asserting ICR.RST), HOW FAR the transaction that
+// triggered it actually got: the high-water phase this window (IDLE => target never
+// left IDLE = selection never succeeded; CMD_IN => command failed; DATA/STATUS/MSG
+// => transaction progressed), whether a cmd_read COMPLETED, whether SEL was ever
+// asserted, and the last full command opcode. win_* accumulate per window (since the
+// previous reset) and snapshot into the sticky brst_* at the reset edge. brst_*
+// survive rst (initial only). Phase encoding is monotonic with progress (IDLE0 <
+// CMD_IN1 < DATA2/3 < STATUS4 < MSG5), so the numeric max IS the furthest phase.
+reg  [2:0] win_maxphase;   // high-water phase since the last bus reset
+reg        win_read_done;  // a cmd_read DATA_OUT reached data_complete this window
+reg  [7:0] win_lastop;     // last full command opcode assembled
+reg        win_sel_seen;   // SEL asserted this window
+reg        brst_rst_d;
+reg        brst_valid;
+reg  [2:0] brst_maxphase;
+reg        brst_read_done;
+reg        brst_sel_seen;
+reg  [6:0] brst_count;
+reg  [7:0] brst_lastop;
+initial begin
+	win_maxphase = 0; win_read_done = 0; win_lastop = 0; win_sel_seen = 0;
+	brst_rst_d = 0; brst_valid = 0; brst_maxphase = 0; brst_read_done = 0;
+	brst_sel_seen = 0; brst_count = 0; brst_lastop = 0;
+end
+always @(posedge clk) begin
+	brst_rst_d <= rst;
+	// per-window accumulation
+	if (phase > win_maxphase)                                   win_maxphase  <= phase;
+	if (cmd_read && (phase == PHASE_DATA_OUT) && data_complete) win_read_done <= 1'b1;
+	if (cmd_cpl && (phase == PHASE_CMD_IN))                     win_lastop    <= cmd[0];
+	if (sel)                                                    win_sel_seen  <= 1'b1;
+	// bus-reset rising edge: snapshot this window, then clear for the next
+	if (rst && !brst_rst_d) begin
+		if (brst_count != 7'h7F) brst_count <= brst_count + 7'd1;
+		if (!brst_valid) begin
+			brst_valid     <= 1'b1;
+			brst_maxphase  <= win_maxphase;
+			brst_read_done <= win_read_done;
+			brst_sel_seen  <= win_sel_seen;
+			brst_lastop    <= win_lastop;
+		end
+		win_maxphase  <= 3'd0;
+		win_read_done <= 1'b0;
+		win_sel_seen  <= 1'b0;
+	end
+end
+//  PSCW layout: [31]=valid [30:28]=brst_maxphase [27]=read_done [26]=sel_seen
+//               [25:19]=reset_count(7) [18:11]=last_opcode(8)
+//               [10:8]=live win_maxphase [7]=live win_read_done [6:0]=0
+assign dbg_wrstall = { brst_valid, brst_maxphase, brst_read_done, brst_sel_seen,
+                       brst_count, brst_lastop, win_maxphase, win_read_done, 7'd0 };
 
 // ---- Selection/command handshake observability (PSEL probe) -----------
 // Live state {phase,sel,bsy,req,ack} plus sticky high-water/counters that
