@@ -14,6 +14,13 @@ if [ -r scripts/local.env ]; then . scripts/local.env; fi
 : "${MISTER_SSH_KEY:?set MISTER_SSH_KEY in scripts/local.env}"
 : "${MISTER_HTTP_PORT:=8182}"
 : "${RBF_NAME:=MacLC.rbf}"
+# NVRAM/save seeding — overridable from local.env for porting to another core.
+# `=` (not `:=`) so an explicit empty SEED_FILE in local.env disables seeding entirely;
+# an unset one falls back to the current MacLC paths (no behaviour change).
+: "${SEED_FILE=releases/MacLC.nvr}"
+: "${SEED_REMOTE=/media/fat/games/MACLC/MacLC.nvr}"
+: "${SEED_MOUNT_CFG=/media/fat/config/MacLC.s2}"
+: "${SEED_MOUNT_REL=games/MACLC/MacLC.nvr}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -42,12 +49,20 @@ export MSYS_NO_PATHCONV=1
 # PRAM NVRAM lives in games/MACLC/MacLC.nvr, auto-mounted to SD slot 2 via
 # config/MacLC.s2. Both are seeded create-only-if-missing, so a saved PRAM and
 # its mount survive subsequent deploys (only the rbf is always overwritten).
-exec python tools/misterdeploy/launch_unstable_core.py \
-    --host "$MISTER_HOST" --port "$MISTER_HTTP_PORT" \
-    --ssh-key "$MISTER_SSH_KEY" \
-    --core "$RBF_NAME" \
-    --push "output_files/$RBF_NAME" \
-    --seed-file "releases/MacLC.nvr" \
-    --seed-remote "/media/fat/games/MACLC/MacLC.nvr" \
-    --seed-mount-cfg "/media/fat/config/MacLC.s2" \
-    --seed-mount-rel "games/MACLC/MacLC.nvr"
+LAUNCH_ARGS=(
+    --host "$MISTER_HOST" --port "$MISTER_HTTP_PORT"
+    --ssh-key "$MISTER_SSH_KEY"
+    --core "$RBF_NAME"
+    --push "output_files/$RBF_NAME"
+)
+if [ -n "$SEED_FILE" ]; then
+    LAUNCH_ARGS+=(
+        --seed-file "$SEED_FILE"
+        --seed-remote "$SEED_REMOTE"
+        --seed-mount-cfg "$SEED_MOUNT_CFG"
+        --seed-mount-rel "$SEED_MOUNT_REL"
+    )
+else
+    log "SEED_FILE empty — skipping NVRAM seed (push + launch only)"
+fi
+exec python tools/misterdeploy/launch_unstable_core.py "${LAUNCH_ARGS[@]}"
