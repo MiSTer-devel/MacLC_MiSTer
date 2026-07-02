@@ -289,7 +289,12 @@ def verify(host, port, expect):
         print("[osd] MISS: coreRunning empty - still at the menu (selection missed)")
         return False
     exp, r = expect.lower(), running.lower()
-    if exp == r or exp in r or r in exp:
+    # Match exact, or one being the other's LEADING token at a non-alphanumeric
+    # boundary (e.g. "Atari7800" vs "Atari7800_unstable_..."). Must NOT accept a
+    # partial-word overlap like "MACLC" vs "MacLCii" -- the old `r in exp` here
+    # rubber-stamped launching the wrong sibling core.
+    lo, hi = sorted((exp, r), key=len)
+    if exp == r or (hi.startswith(lo) and not hi[len(lo)].isalnum()):
         print(f"[osd] OK: coreRunning='{running}' - {expect} launched")
         return True
     print(f"[osd] MISS: launched coreRunning='{running}', expected '{expect}'")
@@ -371,7 +376,11 @@ def main():
     c_row, c_total, c_updir = plan(args.host, args.port, folder_path, args.core)
     f_steps = f_row + updir_for(f_updir, args.updir_rows)
     c_steps = c_row + updir_for(c_updir, args.updir_rows)
-    keys = (["down"] * f_steps + ["confirm", "sleep:1.2"]
+    # Drive FAST: keep each phase's keystrokes well under the menu's ~5s cursor-nav
+    # timeout, which silently drops keys (a slow run lands one row short, e.g. on
+    # MacLC instead of MacLCii). Do NOT press `osd` at the main menu -- that opens a
+    # settings overlay and the nav then lands on nothing ("still at the menu").
+    keys = (["down"] * f_steps + ["confirm", "sleep:0.6"]
             + ["down"] * c_steps + ["confirm"])
 
     print(f"[osd] {args.folder}: OSD row {f_row}/{f_total} "
