@@ -14,7 +14,7 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 
 ### Working
 
-- Boots **Mac OS 6.0.8**
+- Boots **Mac OS 6.0.8, 7.1, and 7.5.5** from SCSI to the Finder desktop
 - **68020 CPU** via TG68K (with core-specific tweaks), running at the LC's native ~15.67 MHz
 - **SCSI hard disk** on ID 6 (read/write, boot). Multiple drives untested.
 - **Display:** 512×384 (12" RGB) or 640×480 (VGA), **1bpp and 2bpp black & white only**
@@ -28,7 +28,6 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 - **Color** — any video mode above 2bpp (4/8/16bpp)
 - **Sound** (silent on hardware; plays in simulation)
 - **Floppy disks**
-- **Mac OS 7.1.2** does not boot yet
 
 ## Usage
 
@@ -56,7 +55,9 @@ Images use a raw SCSI format (same as the SCSI2SD project, documented
 `.img`, or `.hda` extension. The SCSI disk is writable; data written from within the OS is
 persisted to the image file.
 
-Booting and a full System 6.0.8 install to SCSI have been verified. A blank 20 MB image with
+Cold boots of System 6.0.8, 7.1, and 7.5.5 to the Finder desktop have been verified (July 2026,
+after a series of SCSI reliability fixes: a registered CPU status-read path, DREQ data-settle
+pacing to stop byte slip, and read-prefetch/completion-IRQ fixes). A blank 20 MB image with
 a partition table and SCSI driver is included as `releases/empty_hdd.zip`; a matching image is
 also available from the
 [MacPlus core releases](https://github.com/MiSTer-devel/MacPlus_MiSTer/tree/master/releases).
@@ -104,8 +105,9 @@ The boot ROM runs a destructive RAM test (the "memory march") on cold boot, whic
 a 10 MB cold boot slow. You can optionally patch the ROM to skip this test and take the ROM's
 fast warm-start path instead.
 
-> **Not thoroughly tested.** This is a development convenience — if you hit boot problems, use a
-> stock, unpatched ROM.
+> Both the stock and the patched ROM have been verified booting System 7.5.5 to the desktop on
+> current builds (July 2026). The stock ROM remains the reference configuration — if you hit
+> boot problems, retest with a stock, unpatched ROM before reporting.
 
 A patcher is provided at
 [`verilator/patch_skip_ramtest.py`](verilator/patch_skip_ramtest.py). It needs Python 3 and the
@@ -140,8 +142,16 @@ emulated.
 
 ### FPGA (Quartus)
 
-Built with **Intel Quartus 17.0.2 Lite**. Open `MacLC.qpf`, compile, and deploy the resulting
-`.rbf` from `output_files/` to the SD card.
+Built with **Intel Quartus 17.0.2 Lite**. Either open `MacLC.qpf` in the Quartus GUI and
+compile, or use the scripted CLI flow (repeatable, headless-friendly):
+
+```bash
+bash scripts/setup_env.sh   # once: create scripts/local.env, set QUARTUS_BIN
+bash scripts/build_only.sh  # full compile -> output_files/MacLC.rbf + STA verdict
+```
+
+See [BUILD.md](BUILD.md) for details. Deploy the resulting `.rbf` from `output_files/` to the
+SD card.
 
 ### Simulation (Verilator)
 
