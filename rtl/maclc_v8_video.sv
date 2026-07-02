@@ -112,7 +112,17 @@ always @(posedge clk_sys) begin
     end
 end
 
-reg de_raw;  // Internal DE before pipeline delay
+// de_raw must be COMBINATIONAL (aligned with pixel_index, which is combinational
+// from h_count via pix_word): the de_d1/de registers below then add exactly the
+// same +1(palette)+1(output) clk_sys latency as the RGB data path, so DE opens
+// with pixel 0's color in vga_rgb. When de_raw was registered on the pix_en grid
+// it entered the chain one full pixel late — the output stage blanked (sim: col0
+// BLACK) or the scaler sampled the primed index's color (FPGA: col0 WHITE in
+// 1bpp, dark 0x0F in 4bpp) and the visible line shifted one pixel. The
+// pix_en-registered hsync/hblank/vblank OUTPUTS below are already +2 clk_sys
+// from the h_count grid = the same total delay as the fixed RGB path, so they
+// stay as-is.
+wire de_raw = (h_count < h_active) && (v_count < v_active);
 
 always @(posedge clk_sys) begin
     if (pix_en) begin
@@ -120,7 +130,6 @@ always @(posedge clk_sys) begin
         vsync <= (v_count >= v_sync_start && v_count < v_sync_end);
         hblank <= (h_count >= h_active);
         vblank <= (v_count >= v_active);
-        de_raw <= (h_count < h_active) && (v_count < v_active);
     end
 end
 
@@ -258,6 +267,16 @@ wire [3:0] px_per_word =
 // lag one pix_en, which left col 0 showing the primed pixel_shift (=0 -> 0x7F white
 // in 1bpp) and shifted each line right by one. At h_count==0 v_count has already
 // advanced to this line, so the word-0 read linebuf[{v_count[0],0}] is correct.
+//
+// pixel_shift is a REGISTERED shift register, so even with the load at h_count==0
+// its output lags the load by one pixel: col 0 still displayed the primed value
+// (0x7F = WHITE in 1bpp on the ROM checkerboard; 0x0F in 4bpp, dark, which is why
+// the System desktop masked it) and the whole line still rendered one pixel right.
+// Fix: on a LOAD cycle present the freshly-read word COMBINATIONALLY (pix_word
+// below) and load pixel_shift PRE-SHIFTED by one pixel, so the shift-register
+// cycles line up with h_count from col 0 onward. px_per_word (= pixels-1) is
+// unchanged: the first pixel comes from disp_word, the remaining px_per_word
+// pixels from the pre-shifted register.
 always @(posedge clk_sys) begin
     if (reset) begin
         disp_idx    <= 0;
@@ -273,7 +292,16 @@ always @(posedge clk_sys) begin
             video_data  <= 16'h0000;
         end else if (px_in_word == 0) begin
             // Load a fresh word (async read of word disp_idx), advance pointer.
-            pixel_shift <= disp_word;
+            // The word's FIRST pixel is displayed THIS cycle via pix_word; store
+            // the register pre-shifted so pixel 2 of the word is at the MSB next
+            // cycle.
+            case (bits_per_pixel)
+                5'd1:  pixel_shift <= {disp_word[14:0], 1'b0};
+                5'd2:  pixel_shift <= {disp_word[13:0], 2'b0};
+                5'd4:  pixel_shift <= {disp_word[11:0], 4'b0};
+                5'd8:  pixel_shift <= {disp_word[7:0],  8'b0};
+                default: pixel_shift <= disp_word;
+            endcase
             video_data  <= disp_word;
             disp_idx    <= disp_idx + 1'b1;
             px_in_word  <= px_per_word;
@@ -290,6 +318,12 @@ always @(posedge clk_sys) begin
     end
 end
 
+// First pixel of every word comes combinationally from the line buffer (the
+// registered pixel_shift only becomes valid one pixel later — the residual
+// left-edge line / one-pixel line shift).
+wire        pix_load  = (px_in_word == 0) && !(hblank_c || vblank_c);
+wire [15:0] pix_word  = pix_load ? disp_word : pixel_shift;
+
 reg [7:0] pixel_index_real;
 reg [7:0] pixel_index_test;
 wire [7:0] pixel_index;
@@ -303,10 +337,10 @@ wire [7:0] pixel_index;
 // 8bpp: direct 0x00-0xFF
 always @(*) begin
     case (video_mode)
-        3'd0: pixel_index_real = {pixel_shift[15], 7'b1111111};            // 1bpp: 0x7F or 0xFF
-        3'd1: pixel_index_real = {pixel_shift[15:14], 6'b111111};          // 2bpp: 0x3F, 0x7F, 0xBF, 0xFF
-        3'd2: pixel_index_real = {pixel_shift[15:12], 4'b1111};            // 4bpp: 0x0F-0xFF
-        3'd3: pixel_index_real = pixel_shift[15:8];                        // 8bpp: direct
+        3'd0: pixel_index_real = {pix_word[15], 7'b1111111};               // 1bpp: 0x7F or 0xFF
+        3'd1: pixel_index_real = {pix_word[15:14], 6'b111111};             // 2bpp: 0x3F, 0x7F, 0xBF, 0xFF
+        3'd2: pixel_index_real = {pix_word[15:12], 4'b1111};               // 4bpp: 0x0F-0xFF
+        3'd3: pixel_index_real = pix_word[15:8];                           // 8bpp: direct
         default: pixel_index_real = 8'd0;
     endcase
 end
