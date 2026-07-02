@@ -376,11 +376,16 @@ def main():
     c_row, c_total, c_updir = plan(args.host, args.port, folder_path, args.core)
     f_steps = f_row + updir_for(f_updir, args.updir_rows)
     c_steps = c_row + updir_for(c_updir, args.updir_rows)
-    # Drive FAST: keep each phase's keystrokes well under the menu's ~5s cursor-nav
-    # timeout, which silently drops keys (a slow run lands one row short, e.g. on
-    # MacLC instead of MacLCii). Do NOT press `osd` at the main menu -- that opens a
-    # settings overlay and the nav then lands on nothing ("still at the menu").
-    keys = (["down"] * f_steps + ["confirm", "sleep:0.6"]
+    # Keep each phase's keystrokes well under the menu's ~5s cursor-nav timeout,
+    # which silently drops keys (a slow run lands one row short). Do NOT press
+    # `osd` at the main menu -- that opens a settings overlay and the nav then
+    # lands on nothing ("still at the menu").
+    # The folder-open settle stays at 1.2s: LCII's 0.6s "fast" settle caused an
+    # off-by-one on .143 (2026-07-02, larger/slower folder listing -- the first
+    # `down` landed before the folder opened and was eaten, selecting the
+    # adjacent stale MacLC rbf). The 5s-timeout concern is per-keystroke pacing,
+    # not this one-time settle.
+    keys = (["down"] * f_steps + ["confirm", "sleep:1.2"]
             + ["down"] * c_steps + ["confirm"])
 
     print(f"[osd] {args.folder}: OSD row {f_row}/{f_total} "
