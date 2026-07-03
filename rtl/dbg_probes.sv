@@ -591,6 +591,13 @@ module dbg_probes (
     reg [7:0]  bl_max_prog = 8'd0, bl_max_data = 8'd0;
     reg [7:0]  bl_cur = 8'd0;
     reg        bl_active = 1'b0, bl_is_prog = 1'b0, bl_vpa_seen = 1'b0;
+    // PBH latency-histogram storage (see comment block below): 12 buckets,
+    // written ONLY from the always block here (single driver).
+    reg [31:0] bh [0:11];
+    wire [3:0] bh_sel;
+    // bucket index for the completing cycle: <=4 ->0, 5..8 ->1..4, >=9 ->5
+    wire [3:0] bh_idx = (bl_cur <= 8'd4) ? 4'd0 :
+                        (bl_cur >= 8'd9) ? 4'd5 : (bl_cur[3:0] - 4'd4);
     always @(posedge clk) begin
         bl_clk <= bl_clk + 32'd1;
         if (cpuAS_n_d && !cpuAS_n) begin              // AS fell: cycle starts
@@ -610,13 +617,34 @@ module dbg_probes (
                 bl_prog_cnt <= bl_prog_cnt + 32'd1;
                 bl_prog_sum <= bl_prog_sum + {24'd0, bl_cur};
                 if (bl_cur > bl_max_prog) bl_max_prog <= bl_cur;
+                bh[bh_idx] <= bh[bh_idx] + 32'd1;
             end else begin
                 bl_data_cnt <= bl_data_cnt + 32'd1;
                 bl_data_sum <= bl_data_sum + {24'd0, bl_cur};
                 if (bl_cur > bl_max_data) bl_max_data <= bl_cur;
+                bh[4'd6 + bh_idx] <= bh[4'd6 + bh_idx] + 32'd1;
             end
         end
     end
+
+    // ---- PBH: latency histogram window (QuickDraw-deficit hunt) -----------
+    // 12 free-running 32-bit bucket counters behind ONE probe instance (the
+    // 38-node hub's name table already reads back corrupted; do not grow the
+    // deck). JTAG writes the 4-bit SOURCE to select a bucket; the probe shows
+    // that counter. Buckets by DTACK-cycle length in clk_sys ticks:
+    //   sel 0-5  = prog (fetch):  <=4, 5, 6, 7, 8, >=9
+    //   sel 6-11 = data:          <=4, 5, 6, 7, 8, >=9
+    // The mode of the distribution = TG68K's effective minimum through our
+    // DTACK path; mass above the mode = reclaimable slot-alignment waits.
+    // Reader: scripts/bushist.tcl (selector scan x2 snapshots, mod-2^32).
+    // Cross-check: sum of prog buckets tracks PBL1, data buckets track PBL3.
+    // (bh storage + bh_idx are declared above the PBL always block, which is
+    // the array's single driver.)
+    altsource_probe #(
+        .instance_id ("PBH0"), .probe_width (32), .source_width(4),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbh0 (.probe(bh[(bh_sel <= 4'd11) ? bh_sel : 4'd0]), .source(bh_sel),
+               .source_clk(clk), .source_ena(1'b1));
 
     altsource_probe #(
         .instance_id ("PBL0"), .probe_width (32), .source_width(1),
