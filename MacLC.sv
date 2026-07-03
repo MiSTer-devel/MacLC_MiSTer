@@ -145,8 +145,9 @@ module emu
 	///////////////////////////////////////////////////
 
 	localparam SCSI_DEVS = 2;          // SCSI block devices -> hps_io slots 0,1
-	localparam VD_PRAM   = 2;          // PRAM NVRAM save image -> hps_io slot 2
-	localparam VDNUM     = 3;          // total hps_io block devices
+	localparam VD_PRAM    = 2;         // PRAM NVRAM save image -> hps_io slot 2
+	localparam VD_TOOLBOX = 3;         // BlueSCSI Toolbox shared folder -> hps_io slot 3
+	localparam VDNUM      = 4;         // total hps_io block devices
 
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
@@ -176,6 +177,20 @@ module emu
 	assign sd_wr[1:0]     = scsi_wr;
 	assign sd_buff_din[0] = scsi_buff_din[0];
 	assign sd_buff_din[1] = scsi_buff_din[1];
+
+	// BlueSCSI Toolbox dedicated slot (3): isolated block device driven by the
+	// primary SCSI target through dataController. Inert until the HPS mounts a
+	// shared folder there (tb_mounted) and the Main handler answers — see
+	// docs/BLUESCSI_CORE_HPS_CONTRACT.md §4a (graceful degradation).
+	wire [31:0] tb_lba;
+	wire        tb_rd, tb_wr;
+	wire [15:0] tb_buff_din;
+	assign sd_lba[VD_TOOLBOX]      = tb_lba;
+	assign sd_rd [VD_TOOLBOX]      = tb_rd;
+	assign sd_wr [VD_TOOLBOX]      = tb_wr;
+	assign sd_buff_din[VD_TOOLBOX] = tb_buff_din;
+	wire        tb_ack     = sd_ack[VD_TOOLBOX];
+	wire        tb_mounted = img_mounted[VD_TOOLBOX];
 	wire        ioctl_write;
 	reg         ioctl_wait = 0;
 	wire [10:0] ps2_key;
@@ -696,6 +711,41 @@ module emu
 	// value-checking probes ($A4BEB0 reads $FE000010/$1C) see a dead slot
 	// instead of phantom-card garbage, and nothing depends on TG68 berr.
 	wire cpu_berr = (fc7_berr && !_cpuAS) || sdma_berr;
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// SCSI / peripheral read-path fit-stabilization (Layer 1 — the structural fix).
+	//
+	// Peripheral reads ($Exxxxx/$Fxxxxx, cpuAddr[23:21]==111) complete via the
+	// 6800-style VPA cycle — NOT the async-DTACK path RAM/ROM/VRAM use. (Verified:
+	// for this region _cpuDTACK is held DEASSERTED above and _cpuVPA asserted, so the
+	// CPU is paced by VMA/E, never by dtack_en.) The VPA cycle is E-paced (E≈812kHz
+	// ⇒ ~40 clk_sys per E period) and the kernel latches read data LATE: at s_state 6,
+	// only after stalling at s_state 4 for xVma (= eCntr==8, one tick before E-fall —
+	// rtl/tg68k/tg68k.v:107,115,135). So from address/select settle (AS at s_state 1)
+	// to the data sample is ALWAYS ≥5 clk_sys.
+	//
+	// The bit that makes this read fit-sensitive is CSR bit6 / scsi_bsy — the deepest
+	// cone in the whole read mux: scsi.v phase reg → bsy=(phase!=IDLE) → |target_bsy
+	// (cross-module) → wide OR → CSR (ncr5380.sv) → far inter-module route → 7-way
+	// cpuDataOut mux (dataController_top.sv) → CPU din. CSR bit1 / scsi_sel is a local
+	// ICR register bit (shallow) — which is exactly why HW read bit1 right but bit6
+	// wrong, depending on placement → the dice-roll boot.
+	//
+	// Fix: register the peripheral read data one clk_sys stage (periph_din_reg) and
+	// feed the CPU the REGISTERED value on VPA cycles. The ≥5-cycle VPA window absorbs
+	// the +1 latency completely (sampled at s_state 6, settled by ~s_state 3), so no
+	// DTACK/VMA change is needed and the memory (DTACK) read path is left byte-for-byte
+	// unchanged. MacLC.sdc adds a conservative 2× multicycle on `-to periph_din_reg`
+	// so STA reports the real (E-paced) margin instead of over-constraining this read
+	// to a single 30.8 ns period. periph_din_reg is only CONSUMED during VPA reads,
+	// when its combinational input is held stable by the CPU.
+	wire vpa_periph_read = !fc7_iack && !fc7_berr && !slot_space && !_cpuAS &&
+	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
+	reg [15:0] periph_din_reg;
+	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
+	wire [15:0] cpu_din_muxed = slot_space     ? 16'hFFFF :
+	                            vpa_periph_read ? periph_din_reg :
+	                                              dataControllerDataOut;
 `ifdef SIMULATION
 	reg _cpuAS_d;
 	always @(posedge clk_sys) _cpuAS_d <= _cpuAS;
@@ -736,7 +786,7 @@ module emu
 				.bgack_n    ( 1'b1 ),
 				.ipl        ( _cpuIPL ),
 				.berr       ( cpu_berr ),
-				.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
+				.din        ( cpu_din_muxed ),
 				.dout       ( tg68_dout ),
 				.longword   ( tg68_longword ),
 				.addr       ( tg68_a )
@@ -1237,6 +1287,14 @@ module emu
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),
+
+		// BlueSCSI Toolbox dedicated transport (slot VD_TOOLBOX).
+		.tb_mounted(tb_mounted),
+		.tb_lba(tb_lba),
+		.tb_rd(tb_rd),
+		.tb_wr(tb_wr),
+		.tb_ack(tb_ack),
+		.tb_buff_din(tb_buff_din),
 
 		// PRAM persistence (NVRAM) — driven by the FSM above
 		.pram_load_wr(pram_load_wr),

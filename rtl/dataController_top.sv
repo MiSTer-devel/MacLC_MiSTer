@@ -108,6 +108,14 @@ module dataController_top(
 	output           [15:0] sd_buff_din[SCSI_DEVS],
 	input                   sd_buff_wr,
 
+	// ---- BlueSCSI Toolbox dedicated block interface (primary SCSI target) ----
+	input                   tb_mounted,
+	output           [31:0] tb_lba,
+	output                  tb_rd,
+	output                  tb_wr,
+	input                   tb_ack,
+	output           [15:0] tb_buff_din,
+
 	// ---- PRAM persistence pass-through (to the Egret's pram[]) ----
 	input             [7:0] pram_load_addr,
 	input             [7:0] pram_load_data,
@@ -383,6 +391,14 @@ module dataController_top(
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
 		.sd_buff_wr(sd_buff_wr),
+
+		// BlueSCSI Toolbox dedicated transport pass-through (primary target).
+		.tb_mounted(tb_mounted),
+		.tb_lba(tb_lba),
+		.tb_rd(tb_rd),
+		.tb_wr(tb_wr),
+		.tb_ack(tb_ack),
+		.tb_buff_din(tb_buff_din),
 
 		// JTAG probe feeds (consumed by dbg_probes.sv in the FPGA top)
 		.dbg_scsi(dbg_scsi),

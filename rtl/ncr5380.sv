@@ -80,6 +80,14 @@ module ncr5380
 	output      [15:0] sd_buff_din[DEVS],
 	input              sd_buff_wr,
 
+	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 6) --
+	input         tb_mounted,
+	output [31:0] tb_lba,
+	output        tb_rd,
+	output        tb_wr,
+	input         tb_ack,
+	output [15:0] tb_buff_din,
+
 	// JTAG debug: selection/arbitration state for the hardware hang
 	output      [15:0] dbg_scsi,
 	// JTAG debug: post-selection phase + HPS disk handshake
@@ -139,6 +147,7 @@ module ncr5380
 	reg reg_wr;
 	reg dma_ack;
 	reg [2:0] dma_ack_holdoff;
+	reg [2:0] dma_settle;
 	reg dma_word_latched;
 	reg dma_longword_latched;
 	reg dma_second_word_latched;
@@ -150,7 +159,20 @@ module ncr5380
 	reg old_dma_wr;
 	reg old_reg_wr;
 
-	wire dma_ack_busy = dma_ack | (dma_ack_holdoff != 3'd0);
+	/* dma_settle: post-ACK-train data-path settle time. The target advances
+	 * data_cnt two clocks after each ACK falling edge (old_ack/stb_adv
+	 * pipeline in scsi.v) and its sector-buffer dpram q outputs update one
+	 * clock after that, so the byte pair presented on din_pair/din_pair_next
+	 * is stale for 3 clocks after the last ACK of a train retires. DREQ used
+	 * to re-assert inside that window; the TG68 bus samples DTACK(=~DREQ) on
+	 * the phi2 grid and latches data two clocks later, which lands INSIDE the
+	 * stale window on one of the two phase parities — the host then re-reads
+	 * the previous byte/word (stream shifted -1/-2) or, for longwords,
+	 * pre-latches a duplicate second word. Holding dma_ack_busy through the
+	 * settle window makes DREQ mean "presented data is valid", for every
+	 * host sampling alignment. (verilator/scsi_bench reproduces all three.)
+	 */
+	wire dma_ack_busy = dma_ack | (dma_ack_holdoff != 3'd0) | (dma_settle != 3'd0);
 	assign dreq = scsi_req & dma_en & !dma_ack_busy;
 
 	wire i_dma_rd = bus_cs &  dack & ior;
@@ -168,6 +190,7 @@ module ncr5380
 			dma_wr <= 0;
 			dma_ack <= 0;
 			dma_ack_holdoff <= 0;
+			dma_settle <= 0;
 			reg_wr <= 0;
 			dma_word_latched <= 0;
 			dma_longword_latched <= 0;
@@ -185,6 +208,15 @@ module ncr5380
 			dma_ack <= 0;
 			reg_wr <= 0;
 
+			/* Re-arm the settle window on every ACK pulse; after the last
+			 * pulse of a train it counts down 4,3,2,1 so dma_ack_busy (and
+			 * therefore !DREQ) covers the target's data_cnt+dpram update
+			 * pipeline (see dma_settle declaration). 4 = 1 (ACK-fall detect
+			 * in scsi.v) + 2 (stb_adv -> data_cnt) + 1 (dpram q).
+			 */
+			if (dma_ack) dma_settle <= 3'd4;
+			else if (dma_settle != 3'd0) dma_settle <= dma_settle - 3'd1;
+
 			if(~old_dma_rd & i_dma_rd) begin
 				dma_word_latched <= dma_word;
 				dma_longword_latched <= dma_longword;
@@ -192,8 +224,15 @@ module ncr5380
 				dma_suppress_ack_latched <= dma_longword_second_pending & dma_second_word;
 				dma_longword_second_pending <= (dma_longword_second_pending & dma_second_word) ? 1'b0 :
 				                               (dma_word & dma_longword & !dma_second_word);
-				if (dma_word & dma_longword & !dma_second_word)
-					dma_second_word_data <= din_pair_next;
+				/* NOTE: dma_second_word_data is NOT captured here. The CPU
+				 * asserts the bus cycle before DREQ gates it (DTACK holds it
+				 * off), so this rising edge can land while a previous ACK
+				 * train is still advancing the target — din_pair_next would
+				 * be mid-update garbage (the "second word duplicates the
+				 * first" corruption). It is captured at the END of the first
+				 * longword cycle below, where DREQ-gated completion plus the
+				 * settle window guarantee it is valid.
+				 */
 			end
 			if(~old_dma_wr & i_dma_wr) begin
 				dma_word_latched <= dma_word;
@@ -213,6 +252,14 @@ module ncr5380
 			end else if((old_dma_wr & ~i_dma_wr) |
 			            (old_dma_rd & ~i_dma_rd &
 			             !dma_suppress_ack_latched)) begin
+				/* First cycle of a longword read is ending: capture the pair
+				 * the target presents at +2/+3 as the (ACK-suppressed) second
+				 * word, BEFORE the ACK train below consumes all four bytes.
+				 * The cycle completed => DREQ was up => the pair is settled.
+				 */
+				if (old_dma_rd & ~i_dma_rd &
+				    dma_longword_latched & dma_word_latched & !dma_second_word_latched)
+					dma_second_word_data <= din_pair_next;
 				dma_ack <= dma_en & bsr_pmatch;
 				if (dma_en & bsr_pmatch)
 					dma_ack_holdoff <= (old_dma_rd & ~i_dma_rd) ?
@@ -526,6 +573,12 @@ module ncr5380
 	wire      [7:0] target_dout[DEVS];
 	wire     [15:0] target_dout_pair[DEVS];
 	wire     [15:0] target_dout_pair_next[DEVS];
+
+	// BlueSCSI Toolbox per-target transport wires; only index 0 (the primary
+	// ID-6 target, TOOLBOX_ENABLE) drives real values — others tie off to 0.
+	wire     [31:0] tb_lba_g[DEVS];
+	wire [DEVS-1:0] tb_rd_g, tb_wr_g;
+	wire     [15:0] tb_buff_din_g[DEVS];
 	reg      [15:0] din_pair;
 	reg      [15:0] din_pair_next;
 
@@ -566,7 +619,7 @@ module ncr5380
 		genvar i;
 		for (i = 0; i < DEVS; i = i + 1) begin : target
 			// connect a target
-			scsi #(.ID(3'd6 - i[2:0])) target
+			scsi #(.ID(3'd6 - i[2:0]), .TOOLBOX_ENABLE(i == 0)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
@@ -605,6 +658,15 @@ module ncr5380
 				.sd_buff_dout( sd_buff_dout ),
 				.sd_buff_din( sd_buff_din[i] ),
 				.sd_buff_wr( sd_buff_wr & target_bsy[i] ),
+
+				// Toolbox transport: only target 0 (ID 6) is wired to the slot.
+				.tb_mounted ( (i == 0) ? tb_mounted : 1'b0 ),
+				.tb_lba     ( tb_lba_g[i] ),
+				.tb_rd      ( tb_rd_g[i] ),
+				.tb_wr      ( tb_wr_g[i] ),
+				.tb_ack     ( (i == 0) ? tb_ack : 1'b0 ),
+				.tb_buff_din( tb_buff_din_g[i] ),
+
 				.dbg_mounted( target_mounted[i] ),
 				.dbg_phase( target_phase[i] ),
 				.dbg_hs( target_hs[i] ),
@@ -619,6 +681,12 @@ module ncr5380
 			);
 		end
 	endgenerate
+
+	// BlueSCSI Toolbox: surface the primary target's transport to the module port.
+	assign tb_lba      = tb_lba_g[0];
+	assign tb_rd       = tb_rd_g[0];
+	assign tb_wr       = tb_wr_g[0];
+	assign tb_buff_din = tb_buff_din_g[0];
 
 	// JTAG debug: capture the selection/arbitration handshake state.
 	//  [15]    out_en       (initiator driving the data bus?)
