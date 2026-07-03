@@ -1,3 +1,13 @@
+> **⚠ PARTIALLY SUPERSEDED 2026-07-02 — see `docs/findings_mame_floppy_groundtruth_2026-07-02.md`**
+> (runtime trace with *bootable* disks). Confirmed here: Fix B (ISM reg decode `n&7`), Fix A's
+> reg 0xC=1. **Overturned:** reg 0xF is `is_2m` = **1 for DD / 0 for HD** (our `mfm_hd` is
+> inverted); Fix C (`effSEL` from ISM Mode bit5) is **wrong on the LC** (head-select is V8 PA5
+> in all modes — maclc never wires the SWIM hdsel_cb); the drive-ID probe actually runs as
+> **IWM status reads**, 800K data I/O never leaves IWM, and this doc's runtime-trace sections
+> were skewed by a false-triggering decoder (GCR write sync-groups faked an ISM switch).
+> Two new fatal bugs found: the IWM→ISM switch detector (enable-gated → never fires) and the
+> ISM Phases full-byte readback. Full diff list in the 07-02 doc §7.
+
 # Findings — MAME ground truth for the floppy drive-ID (and why 1.44 MB / 800 K fail)
 
 *2026-06-13. Ran MAME 0.264 `maclc` (native, in WSL Ubuntu-24.04) as ground

@@ -136,12 +136,14 @@ module swim
 	wire mfm_pull_int = mfm_advance && !selectExternalDrive;
 	wire mfm_pull_ext = mfm_advance &&  selectExternalDrive;
 
-	// Head-select (SEL/HDSEL) source: in ISM mode it is Mode-register bit5
-	// (MAME swim1.cpp: m_hdsel_cb((m_ism_mode>>5)&1)); in IWM mode it is VIA PA5.
-	// floppy.v indexes the drive-sense register as {ca2,ca1,ca0,SEL}; sense regs
-	// 0xC-0xF (the SuperDrive identify nibble) all need SEL=1, which in ISM mode
-	// the ROM asserts via Mode bit5, not the VIA. See findings doc.
-	wire effSEL = ism_mode ? ism_mode_reg[5] : SEL;
+	// Head-select (SEL/HDSEL) source. On the Mac LC this is V8 VIA1 Port-A bit5 in
+	// EVERY mode: maclc.cpp never wires the SWIM's hdsel_cb, so ISM Mode bit5 does
+	// nothing (v8.cpp:258 drives write_hdsel from PA5). The MFM session and the
+	// high sense-register bank (0xC-0xF, incl. the 0xD MFMModeOn verify) are all
+	// reached with PA5, not Mode[5]. (Reverts the 06-13 "Fix C" effSEL=Mode[5],
+	// which left SEL stuck 0 in ISM and made side 1 / high sense regs unreadable.)
+	// F11, MAME 0.264 ground truth. On hdsel_cb machines (Quadras) Mode[5] matters.
+	wire effSEL = SEL;
 
 	floppy floppyInt
 	(
@@ -343,8 +345,10 @@ module swim
 			case ({q7Next,q6Next})
 				2'b00: // data-in register (from disk drive)
 					dataOutLo <= readDataLatch;
-				2'b01: // IWM status register
-					dataOutLo <= { (selectExternalDriveNext ? senseExt : senseInt), 1'b0, diskEnableExt & diskEnableInt, iwmMode };
+				2'b01: // IWM status register: bit7=sense, bit5=ACTIVE (any drive
+				       // selected — MAME ORs the enables; was AND = never active
+				       // unless both drives on). bits4:0 = IWM mode. F9.
+					dataOutLo <= { (selectExternalDriveNext ? senseExt : senseInt), 1'b0, diskEnableExt | diskEnableInt, iwmMode };
 				2'b10: // handshake
 					dataOutLo <= { _iwmBusy, _writeUnderrun, 6'b000000 };
 				2'b11: // IWM mode register (write-only) or write data register

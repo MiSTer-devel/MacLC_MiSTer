@@ -121,13 +121,18 @@ module floppy
 	// See docs/findings_mame_floppy_driveid_2026-06-13.md (MAME 0.264 ground truth).
 	// HW-VALIDATE: is_2m/DRVIN polarity; whether MFMModeOn must track $9/$D strobes.
 	wire [15:0] driveRegsAsRead = {
-		mfm_hd,   // DRVIN ($F) = HD/is_2m sense
+		// DRVIN ($F): MAME is_2m — 1 = DD disk present, 0 = HD disk or empty.
+		// (Was `mfm_hd` = 1-for-HD, INVERTED: the OS then routed 800K DD disks to
+		// the MFM path and 1.44M HD disks to GCR, so BOTH failed. F3, MAME 0.264.)
+		(~driveRegs[`DRIVE_REG_CSTIN] & ~mfm_hd),
 		1'b0, // INSTALLED = yes
 		1'b0, // READY = yes
 		1'b1, // SIDES = double-sided drive
-		1'b1,     // ($B = MAME reg 0xD MFMModeOn) = 1. Part of the SuperDrive
-		          // identify signature x011 (bits f-c). m_mfm defaults to has_mfm=1
-		          // on a SuperDrive; ideally tracks $9(on)/$D(off) strobes (TODO).
+		m_mfm,    // ($B = MAME reg 0xD MFMModeOn): SuperDrive mode flag. Resets to 1
+		          // (has_mfm); the $9 (MFMModeOn) strobe sets it, $D (GCRModeOn)
+		          // clears it, and the OS reads it back to verify the mode switch
+		          // took effect. Was constant 1, which derailed both mount paths.
+		          // F4/F5, MAME 0.264.
 		1'b1, // SUPERDR = yes (SuperDrive/FDHD)  (MAME reg 0x5)
 		1'b1,     // RDDATA1 ($9 here = MAME reg 0xC). = 1: the other '1' in the
 		          // SuperDrive identify signature x011 (motor-off RdData1 reads 1).
@@ -141,6 +146,22 @@ module floppy
 		driveRegs[`DRIVE_REG_CSTIN], // disk in drive
 		driveRegs[`DRIVE_REG_DIRTN] // step direction
 	};
+
+	// MFMModeOn flag (MAME m_mfm), read back as sense reg 0xD. SuperDrive powers up
+	// with it SET (has_mfm); the seek-phase strobe $9 (MFMModeOn) sets it and $D
+	// (GCRModeOn) clears it. Command = {SEL,ca2,ca1,ca0} latched on the LSTRB edge
+	// (SEL = V8 PA5 on the LC; the same edge/phase logic serves ISM-mode Phases-
+	// register strobes). The OS reads 0xD after strobing to confirm the mode. F4/F5.
+	reg m_mfm;
+	wire [3:0] strobeCmd = {SEL, ca2, ca1, ca0};
+	always @(posedge clk or negedge _reset) begin
+		if (!_reset)
+			m_mfm <= 1'b1;
+		else if (cep && _enable == 1'b0 && lstrbEdge == 1'b1) begin
+			if (strobeCmd == 4'h9) m_mfm <= 1'b1;   // MFMModeOn
+			if (strobeCmd == 4'hD) m_mfm <= 1'b0;   // GCRModeOn
+		end
+	end
 
 	reg dskReadAckD;
 	always @(posedge clk) if(cen) dskReadAckD <= dskReadAck;
