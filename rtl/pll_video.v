@@ -1,44 +1,58 @@
-// pll_video.v — dedicated pixel-clock PLL for the Mac LC V8 scanout.
+// pll_video.v — dedicated, runtime-reconfigurable pixel-clock PLL for the
+// Mac LC V8 scanout.
 //
-// The V8 previously scanned out at clk_sys/2 = 16.25 MHz in EVERY monitor mode,
-// which made VGA 640x480 (800x525 total) refresh at 38.7 Hz instead of 59.94.
-// A fractional (Bresenham) CE off clk_sys was tried and reverted (shaky image
-// through the scaler — see maclc_v8_video.sv); the correct fix is a real pixel
-// clock. One extra fractional-N PLL provides all three monitor rates from a
-// single VCO (~704.9 MHz = 50 MHz x 14.098):
+// The V8 previously scanned out at clk_sys/2 = 16.25 MHz in EVERY monitor
+// mode, so VGA 640x480 (800x525 total) refreshed at 38.7 Hz. A fractional CE
+// was tried and reverted (scaler-shaky); a cyclonev_clkselect mux of three
+// PLL taps was tried next and is STRUCTURALLY ILLEGAL: sys_top feeds
+// CLK_VIDEO into its own clock-select blocks, which require a raw PLL output
+// (Fitter Error 15836), and clkselect inclk[1:0] may only carry clock pins.
+// Hence the MiSTer-native pattern (ao486 CPU-speed presets, sys pll_hdmi
+// vsync_adjust): ONE output clock, reconfigured at runtime through
+// sys/pll_cfg (altera_pll_reconfig). Only the C0 counter changes per monitor
+// — the VCO stays put:
 //
-//   outclk_0  /28 = 25.175000 MHz  VGA 640x480      -> 59.94 Hz (exact)
-//   outclk_1  /45 = 15.664444 MHz  12" RGB 512x384  -> 60.14 Hz (real LC:
-//                                  15.6672 MHz / 60.15 Hz, -180 ppm)
-//   outclk_2  /12 = 58.741667 MHz  Portrait 640x870 -> 76.9 Hz (real:
-//                                  57.2832 MHz / 75 Hz, +2.5% — was 21 Hz!)
+//   VCO/2 = 50 MHz x M(14 + 420906795/2^32) = 704.899999 MHz
+//   C0=28 -> 25.175000 MHz  VGA 640x480      -> 59.94 Hz (exact)
+//   C0=45 -> 15.664444 MHz  12" RGB 512x384  -> 60.14 Hz (real LC 15.6672)
+//   C0=12 -> 58.741666 MHz  Portrait 640x870 -> 76.9 Hz (real 57.2832; the
+//                            OSD cannot select Portrait today)
 //
-// The scanout clock is selected per monitor_id by a cyclonev_clkselect in
-// MacLC.sv. CPU/SDRAM stay on the main PLL — nothing but scanout moves.
-// FPGA-only: verilator/sim.v keeps the old clk_sys/2 enable (see pix_ce).
+// STATIC configuration = C0=12 (58.74 MHz): derive_pll_clocks then constrains
+// the whole clk_vid domain at the FASTEST reconfig target, so STA covers
+// every runtime rate. The monitor-select FSM in MacLC.sv reprograms C0 right
+// after lock (boot lands on the OSD-selected monitor within microseconds).
+//
+// Advanced (explicit-counter) parameter form, cloned from sys/pll_hdmi — it
+// pins the VCO and makes outclk_0 physical counter 0, so the reconfig
+// C-counter select (bits [22:18] = 0) is deterministic. A frequency-string
+// solve could legally pick a different VCO/counter and silently break the
+// runtime table.
 
 `timescale 1 ps / 1 ps
 module pll_video (
-	input  wire refclk,
-	input  wire rst,
-	output wire outclk_0, // 25.175 MHz — VGA
-	output wire outclk_1, // 15.664 MHz — 12" RGB
-	output wire outclk_2, // 58.742 MHz — Portrait
-	output wire locked
+	input  wire        refclk,
+	input  wire        rst,
+	output wire        outclk_0,          // pixel clock (see table above)
+	output wire        locked,
+	input  wire [63:0] reconfig_to_pll,
+	output wire [63:0] reconfig_from_pll
 );
 
 	altera_pll #(
 		.fractional_vco_multiplier("true"),
 		.reference_clock_frequency("50.0 MHz"),
+		.pll_fractional_cout(32),
+		.pll_dsm_out_sel("1st_order"),
 		.operation_mode("direct"),
-		.number_of_clocks(3),
-		.output_clock_frequency0("25.175000 MHz"),
+		.number_of_clocks(1),
+		.output_clock_frequency0("58.741666 MHz"),
 		.phase_shift0("0 ps"),
 		.duty_cycle0(50),
-		.output_clock_frequency1("15.664444 MHz"),
+		.output_clock_frequency1("0 MHz"),
 		.phase_shift1("0 ps"),
 		.duty_cycle1(50),
-		.output_clock_frequency2("58.741667 MHz"),
+		.output_clock_frequency2("0 MHz"),
 		.phase_shift2("0 ps"),
 		.duty_cycle2(50),
 		.output_clock_frequency3("0 MHz"),
@@ -86,14 +100,160 @@ module pll_video (
 		.output_clock_frequency17("0 MHz"),
 		.phase_shift17("0 ps"),
 		.duty_cycle17(50),
-		.pll_type("General"),
-		.pll_subtype("General")
+		.pll_type("Cyclone V"),
+		.pll_subtype("Reconfigurable"),
+		.m_cnt_hi_div(7),
+		.m_cnt_lo_div(7),
+		.n_cnt_hi_div(256),
+		.n_cnt_lo_div(256),
+		.m_cnt_bypass_en("false"),
+		.n_cnt_bypass_en("true"),
+		.m_cnt_odd_div_duty_en("false"),
+		.n_cnt_odd_div_duty_en("false"),
+		.c_cnt_hi_div0(6),
+		.c_cnt_lo_div0(6),
+		.c_cnt_prst0(1),
+		.c_cnt_ph_mux_prst0(0),
+		.c_cnt_in_src0("ph_mux_clk"),
+		.c_cnt_bypass_en0("false"),
+		.c_cnt_odd_div_duty_en0("false"),
+		.c_cnt_hi_div1(1),
+		.c_cnt_lo_div1(1),
+		.c_cnt_prst1(1),
+		.c_cnt_ph_mux_prst1(0),
+		.c_cnt_in_src1("ph_mux_clk"),
+		.c_cnt_bypass_en1("true"),
+		.c_cnt_odd_div_duty_en1("false"),
+		.c_cnt_hi_div2(1),
+		.c_cnt_lo_div2(1),
+		.c_cnt_prst2(1),
+		.c_cnt_ph_mux_prst2(0),
+		.c_cnt_in_src2("ph_mux_clk"),
+		.c_cnt_bypass_en2("true"),
+		.c_cnt_odd_div_duty_en2("false"),
+		.c_cnt_hi_div3(1),
+		.c_cnt_lo_div3(1),
+		.c_cnt_prst3(1),
+		.c_cnt_ph_mux_prst3(0),
+		.c_cnt_in_src3("ph_mux_clk"),
+		.c_cnt_bypass_en3("true"),
+		.c_cnt_odd_div_duty_en3("false"),
+		.c_cnt_hi_div4(1),
+		.c_cnt_lo_div4(1),
+		.c_cnt_prst4(1),
+		.c_cnt_ph_mux_prst4(0),
+		.c_cnt_in_src4("ph_mux_clk"),
+		.c_cnt_bypass_en4("true"),
+		.c_cnt_odd_div_duty_en4("false"),
+		.c_cnt_hi_div5(1),
+		.c_cnt_lo_div5(1),
+		.c_cnt_prst5(1),
+		.c_cnt_ph_mux_prst5(0),
+		.c_cnt_in_src5("ph_mux_clk"),
+		.c_cnt_bypass_en5("true"),
+		.c_cnt_odd_div_duty_en5("false"),
+		.c_cnt_hi_div6(1),
+		.c_cnt_lo_div6(1),
+		.c_cnt_prst6(1),
+		.c_cnt_ph_mux_prst6(0),
+		.c_cnt_in_src6("ph_mux_clk"),
+		.c_cnt_bypass_en6("true"),
+		.c_cnt_odd_div_duty_en6("false"),
+		.c_cnt_hi_div7(1),
+		.c_cnt_lo_div7(1),
+		.c_cnt_prst7(1),
+		.c_cnt_ph_mux_prst7(0),
+		.c_cnt_in_src7("ph_mux_clk"),
+		.c_cnt_bypass_en7("true"),
+		.c_cnt_odd_div_duty_en7("false"),
+		.c_cnt_hi_div8(1),
+		.c_cnt_lo_div8(1),
+		.c_cnt_prst8(1),
+		.c_cnt_ph_mux_prst8(0),
+		.c_cnt_in_src8("ph_mux_clk"),
+		.c_cnt_bypass_en8("true"),
+		.c_cnt_odd_div_duty_en8("false"),
+		.c_cnt_hi_div9(1),
+		.c_cnt_lo_div9(1),
+		.c_cnt_prst9(1),
+		.c_cnt_ph_mux_prst9(0),
+		.c_cnt_in_src9("ph_mux_clk"),
+		.c_cnt_bypass_en9("true"),
+		.c_cnt_odd_div_duty_en9("false"),
+		.c_cnt_hi_div10(1),
+		.c_cnt_lo_div10(1),
+		.c_cnt_prst10(1),
+		.c_cnt_ph_mux_prst10(0),
+		.c_cnt_in_src10("ph_mux_clk"),
+		.c_cnt_bypass_en10("true"),
+		.c_cnt_odd_div_duty_en10("false"),
+		.c_cnt_hi_div11(1),
+		.c_cnt_lo_div11(1),
+		.c_cnt_prst11(1),
+		.c_cnt_ph_mux_prst11(0),
+		.c_cnt_in_src11("ph_mux_clk"),
+		.c_cnt_bypass_en11("true"),
+		.c_cnt_odd_div_duty_en11("false"),
+		.c_cnt_hi_div12(1),
+		.c_cnt_lo_div12(1),
+		.c_cnt_prst12(1),
+		.c_cnt_ph_mux_prst12(0),
+		.c_cnt_in_src12("ph_mux_clk"),
+		.c_cnt_bypass_en12("true"),
+		.c_cnt_odd_div_duty_en12("false"),
+		.c_cnt_hi_div13(1),
+		.c_cnt_lo_div13(1),
+		.c_cnt_prst13(1),
+		.c_cnt_ph_mux_prst13(0),
+		.c_cnt_in_src13("ph_mux_clk"),
+		.c_cnt_bypass_en13("true"),
+		.c_cnt_odd_div_duty_en13("false"),
+		.c_cnt_hi_div14(1),
+		.c_cnt_lo_div14(1),
+		.c_cnt_prst14(1),
+		.c_cnt_ph_mux_prst14(0),
+		.c_cnt_in_src14("ph_mux_clk"),
+		.c_cnt_bypass_en14("true"),
+		.c_cnt_odd_div_duty_en14("false"),
+		.c_cnt_hi_div15(1),
+		.c_cnt_lo_div15(1),
+		.c_cnt_prst15(1),
+		.c_cnt_ph_mux_prst15(0),
+		.c_cnt_in_src15("ph_mux_clk"),
+		.c_cnt_bypass_en15("true"),
+		.c_cnt_odd_div_duty_en15("false"),
+		.c_cnt_hi_div16(1),
+		.c_cnt_lo_div16(1),
+		.c_cnt_prst16(1),
+		.c_cnt_ph_mux_prst16(0),
+		.c_cnt_in_src16("ph_mux_clk"),
+		.c_cnt_bypass_en16("true"),
+		.c_cnt_odd_div_duty_en16("false"),
+		.c_cnt_hi_div17(1),
+		.c_cnt_lo_div17(1),
+		.c_cnt_prst17(1),
+		.c_cnt_ph_mux_prst17(0),
+		.c_cnt_in_src17("ph_mux_clk"),
+		.c_cnt_bypass_en17("true"),
+		.c_cnt_odd_div_duty_en17("false"),
+		.pll_vco_div(2),
+		.pll_cp_current(20),
+		.pll_bwctrl(4000),
+		.pll_output_clk_frequency("704.899999 MHz"),
+		.pll_fractional_division("420906795"),
+		.mimic_fbclk_type("none"),
+		.pll_fbclk_mux_1("glb"),
+		.pll_fbclk_mux_2("m_cnt"),
+		.pll_m_cnt_in_src("ph_mux_clk"),
+		.pll_slf_rst("true")
 	) altera_pll_i (
-		.rst      (rst),
-		.outclk   ({outclk_2, outclk_1, outclk_0}),
-		.locked   (locked),
-		.fboutclk ( ),
-		.fbclk    (1'b0),
-		.refclk   (refclk)
+		.rst               (rst),
+		.outclk            ({outclk_0}),
+		.locked            (locked),
+		.reconfig_to_pll   (reconfig_to_pll),
+		.fboutclk          ( ),
+		.fbclk             (1'b0),
+		.refclk            (refclk),
+		.reconfig_from_pll (reconfig_from_pll)
 	);
 endmodule

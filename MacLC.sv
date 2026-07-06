@@ -409,34 +409,77 @@ module emu
 	// The V8 used to scan out at clk_sys/2 = 16.25 MHz in every mode, so VGA
 	// 640x480 (800x525 total) refreshed at 38.7 Hz. clk_vid now carries
 	// 25.175 MHz (VGA, 59.94 Hz) / 15.664 MHz (12" RGB, 60.14 Hz) / 58.742 MHz
-	// (Portrait, 76.9 Hz), hardware-muxed by the OSD monitor_id. Scanout, the
-	// framebuffer read port, the palette lookup and CLK_VIDEO all move to
-	// clk_vid; CPU/SDRAM/System-Tick stay on clk_sys (CPU speed and the
-	// a937c4c tick are pixel-clock independent by construction — do NOT re-tie
-	// ticks/onesec to vblank).
-	wire clk_pix_vga, clk_pix_12in, clk_pix_port, pll_video_locked;
+	// (Portrait tap, OSD-unreachable today). CPU/SDRAM/System-Tick stay on
+	// clk_sys (CPU speed and the a937c4c tick are pixel-clock independent by
+	// construction — do NOT re-tie ticks/onesec to vblank).
+	//
+	// The rate switch is a runtime PLL RECONFIG of the single output counter
+	// (ao486 pattern, sys/pll_cfg): CLK_VIDEO must be a raw PLL output —
+	// sys_top's clock-select blocks reject a muxed clock (Fitter Err 15836),
+	// which killed the earlier cyclonev_clkselect approach. Only C0 changes;
+	// the VCO (704.9 MHz) stays put, so one register write + start suffices.
+	// The static config is C0=12 (58.74 MHz) so STA constrains the clk_vid
+	// domain at the FASTEST runtime rate; the FSM retargets the OSD-selected
+	// monitor right after first lock (video is reset-held until locked).
+	wire clk_vid, pll_video_locked;
+	wire [63:0] reconfig_to_pll, reconfig_from_pll;
 	pll_video pllv
 	(
 		.refclk(CLK_50M),
 		.rst(1'b0),
-		.outclk_0(clk_pix_vga),
-		.outclk_1(clk_pix_12in),
-		.outclk_2(clk_pix_port),
-		.locked(pll_video_locked)
+		.outclk_0(clk_vid),
+		.locked(pll_video_locked),
+		.reconfig_to_pll(reconfig_to_pll),
+		.reconfig_from_pll(reconfig_from_pll)
 	);
 
-	// Hardware clock mux (same primitive sys_top's VGA path uses). Switching
-	// happens only on an OSD monitor change; one glitched frame is acceptable.
-	wire [1:0] pix_sel = (v8_monitor_id == 4'h2) ? 2'd1 :   // 512x384 12" RGB
-	                     (v8_monitor_id == 4'h1) ? 2'd2 :   // Portrait 640x870
-	                                               2'd0;    // VGA 640x480
-	wire clk_vid;
-	cyclonev_clkselect pix_clk_sw
+	wire        pixcfg_waitrequest;
+	reg         pixcfg_write;
+	reg   [5:0] pixcfg_address;
+	reg  [31:0] pixcfg_data;
+	pll_cfg pll_video_cfg
 	(
-		.clkselect(pix_sel),
-		.inclk({1'b0, clk_pix_port, clk_pix_12in, clk_pix_vga}),
-		.outclk(clk_vid)
+		.mgmt_clk(CLK_50M),
+		.mgmt_reset(0),
+		.mgmt_waitrequest(pixcfg_waitrequest),
+		.mgmt_read(0),
+		.mgmt_readdata(),
+		.mgmt_write(pixcfg_write),
+		.mgmt_address(pixcfg_address),
+		.mgmt_writedata(pixcfg_data),
+		.reconfig_to_pll(reconfig_to_pll),
+		.reconfig_from_pll(reconfig_from_pll)
 	);
+
+	// C0 counter value per monitor: {[22:18] counter#=0, [17] odd-div,
+	// [16] bypass, [15:8] high count, [7:0] low count} — layout per
+	// sys/pll_cfg/altera_pll_reconfig_core.v:557-569.
+	wire [31:0] pix_c0 = (v8_monitor_id == 4'h2) ? 32'h00021716 :  // /45 = 15.664 MHz
+	                     (v8_monitor_id == 4'h1) ? 32'h00000606 :  // /12 = 58.742 MHz
+	                                               32'h00000E0E;   // /28 = 25.175 MHz
+	always @(posedge CLK_50M) begin : pix_reconfig
+		reg [31:0] c0_cur = 32'h00000606;  // static config = /12 -> first pass
+		                                   // always retargets the OSD monitor
+		reg [31:0] c0_s1, c0_s2;
+		reg [2:0]  state = 0;
+		c0_s1 <= pix_c0;                   // settle across clk_sys -> CLK_50M
+		c0_s2 <= c0_s1;
+		if (!pixcfg_waitrequest) begin
+			pixcfg_write <= 0;
+			if (pll_video_locked) begin
+				if (state) state <= state + 1'd1;
+				case (state)
+					0: if (c0_s2 == c0_s1 && c0_s2 != c0_cur) begin
+							c0_cur <= c0_s2;
+							state  <= 1;
+						end
+					1: begin pixcfg_address <= 0; pixcfg_data <= 0;      pixcfg_write <= 1; end // polled mode
+					3: begin pixcfg_address <= 5; pixcfg_data <= c0_cur; pixcfg_write <= 1; end // C0 counter
+					5: begin pixcfg_address <= 2; pixcfg_data <= 0;      pixcfg_write <= 1; end // start
+				endcase
+			end
+		end
+	end
 
 	// Video-domain reset: hold scanout in reset until its PLL locks, released
 	// synchronously in clk_vid. (*_meta = 2FF first stage, false-pathed in
