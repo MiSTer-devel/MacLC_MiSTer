@@ -18,10 +18,17 @@
 //   C0=12 -> 58.741666 MHz  Portrait 640x870 -> 76.9 Hz (real 57.2832; the
 //                            OSD cannot select Portrait today)
 //
-// STATIC configuration = C0=12 (58.74 MHz): derive_pll_clocks then constrains
-// the whole clk_vid domain at the FASTEST reconfig target, so STA covers
-// every runtime rate. The monitor-select FSM in MacLC.sv reprograms C0 right
-// after lock (boot lands on the OSD-selected monitor within microseconds).
+// STATIC configuration = C0=28 (25.175 MHz VGA): the FSM's change-detect in
+// MacLC.sv inits to this value, so a VGA boot performs NO runtime reconfig at
+// all — the first pixel-clock build (static /12 + boot-time retarget) BERR-
+// stormed on HW: the PLL unlock/relock glitched CLK_VIDEO right while the HPS
+// was mounting SD images and ascal was locking, degrading SCSI serving into
+// 250 ms DMA stalls (watchdog storm, 8 boot re-entries, hard wedge). No
+// MiSTer core reconfigures its CLK_VIDEO PLL mid-stream; keep boot static.
+// An OSD switch to 12" RGB (C0=45, SLOWER than the 25.175 constraint = STA-
+// safe) still reconfigs at runtime — mid-session, not during boot/mount.
+// Portrait (C0=12, faster) stays OSD-unreachable; do NOT wire it up without
+// moving the static constraint back to /12.
 //
 // Advanced (explicit-counter) parameter form, cloned from sys/pll_hdmi — it
 // pins the VCO and makes outclk_0 physical counter 0, so the reconfig
@@ -46,7 +53,7 @@ module pll_video (
 		.pll_dsm_out_sel("1st_order"),
 		.operation_mode("direct"),
 		.number_of_clocks(1),
-		.output_clock_frequency0("58.741666 MHz"),
+		.output_clock_frequency0("25.175000 MHz"),
 		.phase_shift0("0 ps"),
 		.duty_cycle0(50),
 		.output_clock_frequency1("0 MHz"),
@@ -110,8 +117,8 @@ module pll_video (
 		.n_cnt_bypass_en("true"),
 		.m_cnt_odd_div_duty_en("false"),
 		.n_cnt_odd_div_duty_en("false"),
-		.c_cnt_hi_div0(6),
-		.c_cnt_lo_div0(6),
+		.c_cnt_hi_div0(14),
+		.c_cnt_lo_div0(14),
 		.c_cnt_prst0(1),
 		.c_cnt_ph_mux_prst0(0),
 		.c_cnt_in_src0("ph_mux_clk"),

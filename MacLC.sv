@@ -458,8 +458,11 @@ module emu
 	                     (v8_monitor_id == 4'h1) ? 32'h00000606 :  // /12 = 58.742 MHz
 	                                               32'h00000E0E;   // /28 = 25.175 MHz
 	always @(posedge CLK_50M) begin : pix_reconfig
-		reg [31:0] c0_cur = 32'h00000606;  // static config = /12 -> first pass
-		                                   // always retargets the OSD monitor
+		reg [31:0] c0_cur = 32'h00000E0E;  // = the static /28 VGA config: a VGA
+		                                   // boot performs NO reconfig (the boot-
+		                                   // time PLL glitch BERR-stormed the HPS
+		                                   // SCSI path); only an OSD switch to
+		                                   // 12" retargets, mid-session
 		reg [31:0] c0_s1, c0_s2;
 		reg [2:0]  state = 0;
 		c0_s1 <= pix_c0;                   // settle across clk_sys -> CLK_50M
