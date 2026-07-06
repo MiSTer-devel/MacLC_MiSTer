@@ -391,8 +391,8 @@ module emu
 		.ps2_mouse(ps2_mouse)
 	);
 
-	assign CLK_VIDEO = clk_sys;
-	assign CE_PIXEL  = v8_ce_pix;
+	assign CLK_VIDEO = clk_vid;
+	assign CE_PIXEL  = v8_ce_pix;   // constant 1 now (pix_ce tied high below)
 
 	// Video Output — straight V8 video, no overlays.
 	assign VGA_R  = v8_vga_r;
@@ -403,6 +403,59 @@ module emu
 	assign VGA_HS = v8_hsync;
 	assign VGA_F1 = 0;
 	assign VGA_SL = 0;
+
+	// ------------------------------------------------------------------------
+	// Dedicated pixel clock (pll_video) — true per-monitor scanout rates.
+	// The V8 used to scan out at clk_sys/2 = 16.25 MHz in every mode, so VGA
+	// 640x480 (800x525 total) refreshed at 38.7 Hz. clk_vid now carries
+	// 25.175 MHz (VGA, 59.94 Hz) / 15.664 MHz (12" RGB, 60.14 Hz) / 58.742 MHz
+	// (Portrait, 76.9 Hz), hardware-muxed by the OSD monitor_id. Scanout, the
+	// framebuffer read port, the palette lookup and CLK_VIDEO all move to
+	// clk_vid; CPU/SDRAM/System-Tick stay on clk_sys (CPU speed and the
+	// a937c4c tick are pixel-clock independent by construction — do NOT re-tie
+	// ticks/onesec to vblank).
+	wire clk_pix_vga, clk_pix_12in, clk_pix_port, pll_video_locked;
+	pll_video pllv
+	(
+		.refclk(CLK_50M),
+		.rst(1'b0),
+		.outclk_0(clk_pix_vga),
+		.outclk_1(clk_pix_12in),
+		.outclk_2(clk_pix_port),
+		.locked(pll_video_locked)
+	);
+
+	// Hardware clock mux (same primitive sys_top's VGA path uses). Switching
+	// happens only on an OSD monitor change; one glitched frame is acceptable.
+	wire [1:0] pix_sel = (v8_monitor_id == 4'h2) ? 2'd1 :   // 512x384 12" RGB
+	                     (v8_monitor_id == 4'h1) ? 2'd2 :   // Portrait 640x870
+	                                               2'd0;    // VGA 640x480
+	wire clk_vid;
+	cyclonev_clkselect pix_clk_sw
+	(
+		.clkselect(pix_sel),
+		.inclk({1'b0, clk_pix_port, clk_pix_12in, clk_pix_vga}),
+		.outclk(clk_vid)
+	);
+
+	// Video-domain reset: hold scanout in reset until its PLL locks, released
+	// synchronously in clk_vid. (*_meta = 2FF first stage, false-pathed in
+	// MacLC.sdc.)
+	reg vidrst_meta = 1'b1, vidrst_s = 1'b1;
+	always @(posedge clk_vid) begin
+		vidrst_meta <= ~n_reset || ~pll_video_locked;
+		vidrst_s    <= vidrst_meta;
+	end
+
+	// clk_vid -> clk_sys: VBL/HBL levels for the guest-facing consumers
+	// (pseudovia VBL IRQ, VIA PB7 debug input, dbg_probes).
+	reg vbl_meta, v8_vblank_s, hbl_meta, v8_hblank_s;
+	always @(posedge clk_sys) begin
+		vbl_meta    <= v8_vblank;
+		v8_vblank_s <= vbl_meta;
+		hbl_meta    <= v8_hblank;
+		v8_hblank_s <= hbl_meta;
+	end
 
 	// ASC samples drive AUDIO_L/R directly (Commit C). Legacy DMA gone.
 	assign AUDIO_L = asc_sample_l;
@@ -883,6 +936,7 @@ module emu
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
+		.clk_pix(clk_vid),   // video lookup port in the scanout clock domain
 		.reset(~n_reset),
 		.reg_addr(cpuAddr[10:0]),
 		.uds_n(_cpuUDS),
@@ -913,7 +967,7 @@ module emu
 		.data_out(pseudovia_dout),
 		.we(selectPseudoVIA && !_cpuRW && cpuBusControl),
 		.req(selectPseudoVIA && cpuBusControl),
-		.vblank_irq(v8_vblank),
+		.vblank_irq(v8_vblank_s),   // 2FF-synced from the clk_vid scanout domain
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
 		// SCSI flags RE-TIED-OFF (2026-06-12 evening). History of reversals:
@@ -1083,7 +1137,7 @@ module emu
 		.asc_irq(asc_irq),
 		.asc_sample_l(asc_sample_l),
 		.pvia_video_config(pvia_video_config),
-		.v8_vblank(v8_vblank),
+		.v8_vblank(v8_vblank_s),
 		// BERR investigation (#3 cold-boot reboot loop): the ACTUAL bus-error
 		// signals, not the vector-read inference PEXC/PFR use.
 		.cpu_berr(cpu_berr),
@@ -1093,9 +1147,10 @@ module emu
 	);
 
 	maclc_v8_video v8_video(
-		.clk_sys(clk_sys),
+		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock
 		.clk8_en_p(clk8_en_p),
-		.reset(~n_reset),
+		.pix_ce(1'b1),          // every clk_vid edge = one pixel
+		.reset(vidrst_s),
 
 		// Configuration
 		.video_mode(v8_video_mode),
@@ -1125,10 +1180,12 @@ module emu
 		.vram_rdata(v8_vram_rdata)
 	);
 
-	// On-chip framebuffer (BRAM). Video reads port B (Phase 2); CPU VRAM writes
-	// are mirrored into port A. Single clk_sys domain => coherent, no CDC.
+	// On-chip framebuffer (BRAM). CPU VRAM writes land on port A (clk_sys);
+	// video reads port B in the pixel-clock domain — the CDC lives inside the
+	// dual-clock M10K primitive.
 	vram_bram vram_fb(
-		.clk(clk_sys),
+		.a_clk(clk_sys),
+		.b_clk(clk_vid),
 		.a_addr(vram_bram_waddr),
 		.a_din(memoryDataOut),
 		.a_be({~_cpuUDS, ~_cpuLDS}),
@@ -1286,8 +1343,8 @@ module emu
 		.timestamp(TIMESTAMP),
 
 		// video
-		._hblank(~v8_hblank),
-		._vblank(~v8_vblank),
+		._hblank(~v8_hblank_s),
+		._vblank(~v8_vblank_s),
 		.vid_alt(vid_alt),
 
 

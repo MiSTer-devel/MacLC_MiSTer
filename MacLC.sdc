@@ -51,3 +51,18 @@ set_multicycle_path -hold  -end 1 -from [get_keepers {*TG68KdotC_Kernel*}] -to [
 # stays a normal single-cycle path and is deliberately NOT relaxed here.
 set_multicycle_path -setup -end 2 -to [get_keepers {*periph_din_reg*}]
 set_multicycle_path -hold  -end 1 -to [get_keepers {*periph_din_reg*}]
+
+# ----------------------------------------------------------------------------
+# Pixel-clock domain (pll_video) CDC — false-path the 2FF synchronizer heads.
+# ----------------------------------------------------------------------------
+# The V8 scanout runs on clk_vid (pll_video 25.175/15.664/58.742 MHz, muxed by
+# cyclonev_clkselect). Every deliberate clk_sys<->clk_vid crossing is either
+# (a) inside a dual-clock M10K (vram_bram framebuffer, ariel palette — the RAM
+# primitive has no timed cross-port arc), or (b) a 2FF synchronizer whose
+# first stage is named *_meta: config into the video module (vmode/monid/
+# tbyp/tsel), the video-domain reset (vidrst), and VBL/HBL back into clk_sys
+# (vbl/hbl). Only those heads are cut — any UNINTENDED cross-domain path will
+# still fail timing loudly instead of being silently blessed (deliberately NOT
+# using set_clock_groups -asynchronous).
+set_false_path -to [get_keepers {*vmode_meta* *monid_meta* *tbyp_meta* *tsel_meta*}]
+set_false_path -to [get_keepers {*vidrst_meta* *vbl_meta* *hbl_meta*}]

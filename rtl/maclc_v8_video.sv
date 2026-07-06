@@ -1,9 +1,19 @@
 // Mac LC V8 Video Controller - FIXED
 // Supports 1, 2, 4, 8, and 16 bpp modes correctly
+//
+// CLOCKING: `clk_sys` (historic name) is the SCANOUT clock. On the FPGA it is
+// the dedicated per-monitor pixel clock from pll_video (25.175 / 15.664 /
+// 58.742 MHz, muxed by monitor_id in MacLC.sv) with pix_ce tied 1. In the
+// Verilator sim it remains the true 32.5 MHz clk_sys with pix_ce = /2 toggle
+// (the historic 16.25 MHz behavior — keeps sim frame counts unchanged).
+// Config inputs (video_mode/monitor_id/test_*) originate in the real clk_sys
+// domain and are 2FF-synced below; the *_meta stages are false-pathed in
+// MacLC.sdc.
 
 module maclc_v8_video(
     input clk_sys,
     input clk8_en_p,
+    input pix_ce,     // pixel advance enable: FPGA 1'b1, sim /2 toggle
     input reset,
 
     input [2:0] video_mode,
@@ -40,12 +50,27 @@ module maclc_v8_video(
 reg [10:0] h_total, h_active, h_sync_start, h_sync_end;
 reg [9:0] v_total, v_active, v_sync_start, v_sync_end;
 
+// --- Config CDC: 2FF sync into the scanout clock domain --------------------
+// video_mode/monitor_id/test_* are clk_sys-domain, quasi-static (OSD / guest
+// mode set). Worst case on change = one mis-rendered frame. In sim (same
+// clock) this only adds two cycles of latency.
+reg [2:0] vmode_meta, vmode_v;
+reg [3:0] monid_meta, monid_v;
+reg       tbyp_meta,  tbyp_v;
+reg [1:0] tsel_meta,  tsel_v;
+always @(posedge clk_sys) begin
+    vmode_meta <= video_mode;       vmode_v <= vmode_meta;
+    monid_meta <= monitor_id;       monid_v <= monid_meta;
+    tbyp_meta  <= test_bypass_vram; tbyp_v  <= tbyp_meta;
+    tsel_meta  <= test_pattern_sel; tsel_v  <= tsel_meta;
+end
+
 // Bits per pixel and fetch mask configuration
 reg [4:0] bits_per_pixel; // 1, 2, 4, 8, 16
 reg [3:0] fetch_mask;     // When to fetch new word
 
 always @(*) begin
-    case (video_mode)
+    case (vmode_v)
         3'd0: begin bits_per_pixel = 1;  fetch_mask = 4'hF; end // 1bpp: Fetch every 16
         3'd1: begin bits_per_pixel = 2;  fetch_mask = 4'h7; end // 2bpp: Fetch every 8
         3'd2: begin bits_per_pixel = 4;  fetch_mask = 4'h3; end // 4bpp: Fetch every 4
@@ -57,7 +82,7 @@ end
 
 always @(*) begin
     // Standard V8 monitor timings
-    case (monitor_id)
+    case (monid_v)
         4'h1: begin // 12" RGB (512x384)
              h_total = 11'd832; h_active = 11'd640; // Note: MAME maps active to 512, but V8 uses 640 timing
              h_sync_start = 11'd656; h_sync_end = 11'd752;
@@ -82,21 +107,14 @@ end
 reg [10:0] h_count;
 reg [9:0] v_count;
 
-// Pixel clock enable: divide clk_sys by 2
-// clk_sys=32.5MHz / 2 = 16.25MHz pixel clock (close to Mac LC's 15.6672MHz)
-// NOTE: a fractional (Bresenham) pix_en for a 25.175MHz VGA dot clock was tried
-// and REVERTED — with CLK_VIDEO fixed at clk_sys, a non-uniform CE_PIXEL makes
-// the clk_sys-cycles-per-line jitter, which the scaler renders as a shaky image.
-// A proper 640x480@60Hz needs a dedicated 25.175MHz PLL clock, not a fractional enable.
-reg pix_div;
-always @(posedge clk_sys) begin
-    if (reset)
-        pix_div <= 0;
-    else
-        pix_div <= ~pix_div;
-end
-
-wire pix_en = pix_div;
+// Pixel advance enable — now an INPUT (pix_ce). FPGA: this module runs on the
+// dedicated pll_video pixel clock with pix_ce=1 (every edge = one pixel).
+// Sim: clk_sys with an external /2 toggle = the historic 16.25 MHz cadence.
+// HISTORY: a fractional (Bresenham) pix_en for a 25.175MHz VGA dot clock was
+// tried and REVERTED — with CLK_VIDEO fixed at clk_sys, a non-uniform CE_PIXEL
+// makes the clk_sys-cycles-per-line jitter, which the scaler renders as a
+// shaky image. Hence the real PLL clock (pll_video.v), not a fractional enable.
+wire pix_en = pix_ce;
 
 always @(posedge clk_sys) begin
     ce_pix <= pix_en;
@@ -124,13 +142,21 @@ end
 // stay as-is.
 wire de_raw = (h_count < h_active) && (v_count < v_active);
 
+// Sync/blank outputs: TWO ungated register stages = +2 clk from the h_count
+// grid — the same total delay as the RGB path (de_raw -> de_d1 -> de), in BOTH
+// clocking configurations. (The previous single pix_en-gated stage equalled
+// +2 clk only when pix_en was a /2 enable; with pix_ce=1 it would lead the
+// RGB path by one pixel.)
+reg hsync_p1, vsync_p1, hblank_p1, vblank_p1;
 always @(posedge clk_sys) begin
-    if (pix_en) begin
-        hsync <= (h_count >= h_sync_start && h_count < h_sync_end);
-        vsync <= (v_count >= v_sync_start && v_count < v_sync_end);
-        hblank <= (h_count >= h_active);
-        vblank <= (v_count >= v_active);
-    end
+    hsync_p1  <= (h_count >= h_sync_start && h_count < h_sync_end);
+    vsync_p1  <= (v_count >= v_sync_start && v_count < v_sync_end);
+    hblank_p1 <= (h_count >= h_active);
+    vblank_p1 <= (v_count >= v_active);
+    hsync  <= hsync_p1;
+    vsync  <= vsync_p1;
+    hblank <= hblank_p1;
+    vblank <= vblank_p1;
 end
 
 // COMBINATIONAL blanks (aligned to h_count/v_count), used by the fetch and display
@@ -351,7 +377,7 @@ end
 //   2 = 8x8 checker            (h_count[3] XOR v_count[3] selects two extreme indices)
 //   3 = h XOR v gradient       (classic XOR pattern, exercises all 256 entries)
 always @(*) begin
-    case (test_pattern_sel)
+    case (tsel_v)
         2'd0: pixel_index_test = h_count[8:1];
         2'd1: pixel_index_test = v_count[7:0];
         2'd2: pixel_index_test = (h_count[3] ^ v_count[3]) ? 8'h00 : 8'hFF;
@@ -360,7 +386,7 @@ always @(*) begin
     endcase
 end
 
-assign pixel_index = test_bypass_vram ? pixel_index_test : pixel_index_real;
+assign pixel_index = tbyp_v ? pixel_index_test : pixel_index_real;
 assign palette_addr = pixel_index;
 
 // Pipeline delay: palette RAM read is synchronous (1-cycle latency),

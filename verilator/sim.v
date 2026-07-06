@@ -574,6 +574,7 @@ module emu
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
+		.clk_pix(clk_sys),   // sim: single domain (FPGA: pixel clock)
 		.reset(~n_reset),
 		.reg_addr(cpuAddr[10:0]),
 		.uds_n(_cpuUDS),
@@ -650,9 +651,17 @@ module emu
 		.irq(asc_irq)
 	);
 
+	// Historic 16.25 MHz pixel cadence: the sim keeps scanout on clk_sys with a
+	// /2 advance enable (the FPGA now runs the module on a real per-monitor
+	// pixel clock with pix_ce=1 — see rtl/pll_video.v / MacLC.sv). Keeping the
+	// sim on the old grid preserves boot frame counts (screenshot @350 etc).
+	reg sim_pix_ce = 1'b0;
+	always @(posedge clk_sys) sim_pix_ce <= ~sim_pix_ce;
+
 	maclc_v8_video v8_video(
 		.clk_sys(clk_sys),
 		.clk8_en_p(clk8_en_p),
+		.pix_ce(sim_pix_ce),
 		.reset(~n_reset),
 
 		.video_mode(v8_video_mode),
@@ -685,7 +694,8 @@ module emu
 	wire [15:0] v8_vram_rdata;
 
 	vram_bram vram_fb(
-		.clk(clk_sys),
+		.a_clk(clk_sys),
+		.b_clk(clk_sys),   // sim: single domain (FPGA: b_clk = pixel clock)
 		.a_addr(vram_bram_waddr),
 		.a_din(memoryDataOut),
 		.a_be({~_cpuUDS, ~_cpuLDS}),
