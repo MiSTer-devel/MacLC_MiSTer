@@ -236,16 +236,16 @@ module pll_video (
 		.c_cnt_in_src17("ph_mux_clk"),
 		.c_cnt_bypass_en17("true"),
 		.c_cnt_odd_div_duty_en17("false"),
-		.pll_vco_div(2),
+		// Physical VCO = pll_output_clk_frequency x pll_vco_div. vco_div(1)
+		// keeps the VCO at 704.9 MHz (in range for the I7 speed grade —
+		// vco_div(2)'s 1409.8 MHz exceeded it and failed the fitter, along
+		// with the pll_hdmi-specific feedback overrides removed here: the
+		// main project PLL proves the direct-mode defaults in this device).
+		.pll_vco_div(1),
 		.pll_cp_current(20),
 		.pll_bwctrl(4000),
 		.pll_output_clk_frequency("704.899999 MHz"),
-		.pll_fractional_division("420906795"),
-		.mimic_fbclk_type("none"),
-		.pll_fbclk_mux_1("glb"),
-		.pll_fbclk_mux_2("m_cnt"),
-		.pll_m_cnt_in_src("ph_mux_clk"),
-		.pll_slf_rst("true")
+		.pll_fractional_division("420906795")
 	) altera_pll_i (
 		.rst               (rst),
 		.outclk            ({outclk_0}),
