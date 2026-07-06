@@ -83,7 +83,16 @@ module swim
 	input dskReadAckInt,
 	output [21:0] dskReadAddrExt,
 	input dskReadAckExt,
-	input [7:0] dskReadData
+	input [7:0] dskReadData,
+
+	// --- diagnostic passthroughs (PFLP probes; internal drive only) ---
+	output [15:0] dbg_flp_byte_cnt,
+	output [15:0] dbg_flp_miss_cnt,
+	output [7:0]  dbg_flp_disk_data,
+	output [6:0]  dbg_flp_track,
+	output        dbg_flp_side,
+	output [15:0] dbg_flp_step_cnt,
+	output [7:0]  dbg_iwm_latch      // live IWM read-data latch
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -114,6 +123,7 @@ module swim
 	wire advanceDriveHead; // prevents overrun when debugging, does not exit on a real Mac!
 	reg [7:0] writeData;
 	reg [7:0] readDataLatch;
+	assign dbg_iwm_latch = readDataLatch;  // PFLP live view
 	wire _iwmBusy, _writeUnderrun;
 	assign _iwmBusy = 1'b1; // for writes, a value of 1 here indicates the IWM write buffer is empty
 	assign _writeUnderrun = 1'b1;
@@ -177,7 +187,14 @@ module swim
 		.mfm_pull(mfm_pull_int),
 		.mfm_byte(mfm_byte_int),
 		.mfm_mark(mfm_mark_int),
-		.mfm_crc0(mfm_crc0_int)
+		.mfm_crc0(mfm_crc0_int),
+
+		.dbg_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_disk_image_data(dbg_flp_disk_data),
+		.dbg_drive_track(dbg_flp_track),
+		.dbg_drive_side(dbg_flp_side),
+		.dbg_step_cnt(dbg_flp_step_cnt)
 	);
 
 	floppy floppyExt
@@ -343,8 +360,10 @@ module swim
 		else begin
 			// IWM mode reads (original logic)
 			case ({q7Next,q6Next})
-				2'b00: // data-in register (from disk drive)
-					dataOutLo <= readDataLatch;
+				2'b00: // data-in register: MAME iwm dispatch is `active ? data : FF`
+				       // — an idle controller floats the data bus high. (Was
+				       // readDataLatch unconditionally; matches lbmactwo/MAME.)
+					dataOutLo <= (diskEnableExt | diskEnableInt) ? readDataLatch : 8'hFF;
 				2'b01: // IWM status register: bit7=sense, bit5=ACTIVE (any drive
 				       // selected — MAME ORs the enables; was AND = never active
 				       // unless both drives on). bits4:0 = IWM mode. F9.
@@ -561,26 +580,48 @@ module swim
 	// IWM read data latch (unchanged from original)
 	// ================================================================
 	wire iwmRead = (_cpuRW == 1'b1 && selectSWIM == 1'b1 && _cpuUDS == 1'b0 && !ism_mode);
+	wire anyDiskEnable = diskEnableExt | diskEnableInt;
 	reg [3:0] readLatchClearTimer;
+	reg [11:0] readDataArmDelay;   // post-enable squelch (~126 us at 8.125 MHz cen)
+	reg anyDiskEnableD;
+	wire readDataArmed = (readDataArmDelay == 12'd0);
 	always @(posedge clk or negedge _reset) begin
 		if (_reset == 1'b0) begin
 			readDataLatch <= 0;
 			readLatchClearTimer <= 0;
+			readDataArmDelay <= 0;
+			anyDiskEnableD <= 0;
 		end
 		else if(cen) begin
+			anyDiskEnableD <= anyDiskEnable;
+
+			if (readDataArmDelay != 0) begin
+				readDataArmDelay <= readDataArmDelay - 1'b1;
+			end
+
 			// a countdown timer governs how long after a data latch read before the latch is cleared
 			if (readLatchClearTimer != 0) begin
 				readLatchClearTimer <= readLatchClearTimer - 1'b1;
 			end
 
+			// MAME clears the IWM data register when the controller enters active
+			// read mode; squelch briefly so the mount's first data poll never sees
+			// a stale idle-drive byte. (Ported from lbmactwo iwm.v, HW-validated.)
+			if (anyDiskEnable && !anyDiskEnableD) begin
+				readDataLatch <= 0;
+				readLatchClearTimer <= 0;
+				readDataArmDelay <= 12'h400;
+			end
+
 			// the conclusion of a valid CPU read from the IWM will start the timer to clear the latch
-			if (iwmRead && readDataLatch[7]) begin
+			else if (iwmRead && readDataLatch[7]) begin
 				readLatchClearTimer <= 4'hD; // clear latch 14 clocks after the conclusion of a valid read
 			end
 
-			// when the drive indicates that a new byte is ready, latch it
+			// when the drive indicates that a new byte is ready, latch it (only
+			// with a drive enabled and the post-enable squelch elapsed)
 			// NOTE: the real IWM must self-synchronize with the incoming data to determine when to latch it
-			if (newByteReady) begin
+			if (anyDiskEnable && readDataArmed && newByteReady) begin
 				readDataLatch <= readData;
 			end
 			else if (readLatchClearTimer == 1'b1) begin

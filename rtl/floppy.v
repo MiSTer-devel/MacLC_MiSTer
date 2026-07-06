@@ -93,8 +93,25 @@ module floppy
 	input        mfm_pull,   // SWIM ISM read: advance one decoded byte
 	output [7:0] mfm_byte,   // current decoded MFM byte
 	output       mfm_mark,   // current byte is an address-mark (A1)
-	output       mfm_crc0    // current byte completes a valid CRC field
+	output       mfm_crc0,   // current byte completes a valid CRC field
+
+	// --- diagnostic ports (PFLP probes; safe to leave dangling when unused) ---
+	// Ported from lbmactwo_MiSTer ac44312 (the debug deck that root-caused its
+	// 800K "unreadable" bug). Counters wrap; the host reads deltas over a window.
+	// dbg_byte_cnt : byte deliveries while the OS is actually reading (phases
+	//                parked on RDDATA0/1 with the drive enabled).
+	// dbg_miss_cnt : byte slots that expired in that same state with nothing to
+	//                deliver (diskImageData empty = SDRAM refill starvation).
+	output reg  [15:0] dbg_byte_cnt,
+	output reg  [15:0] dbg_miss_cnt,
+	output wire [7:0]  dbg_disk_image_data,  // live SDRAM-fed encoder byte
+	output wire [6:0]  dbg_drive_track,
+	output wire        dbg_drive_side,
+	output reg  [15:0] dbg_step_cnt          // STEP register writes committed
 );
+	assign dbg_disk_image_data = diskImageData;
+	assign dbg_drive_track     = driveTrack;
+	assign dbg_drive_side      = driveSide;
 
 	assign motor = ~driveRegs[`DRIVE_REG_MOTORON];
 	assign act = lstrbEdge;
@@ -283,6 +300,28 @@ module floppy
 	end
 	end
 
+	// --- diagnostic counters (PFLP probes) --------------------------------
+	// Count only while the CPU is positioned to consume data (phases parked on
+	// RDDATA0/1, drive enabled): dbg_byte_cnt = a byte was delivered on the
+	// 128-clock slot boundary; dbg_miss_cnt = the slot boundary passed with
+	// diskImageData still empty (the SDRAM extra-slot refill starved) or
+	// delivery otherwise blocked. Healthy read: byte_cnt climbs at ~63 kB/s,
+	// miss_cnt static. Observation-only — the delivery path is untouched.
+	wire dbg_read_sel = (driveReadAddr == `DRIVE_REG_RDDATA0 ||
+	                     driveReadAddr == `DRIVE_REG_RDDATA1) && (_enable == 1'b0);
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			dbg_byte_cnt <= 16'd0;
+			dbg_miss_cnt <= 16'd0;
+		end
+		else if (cep && diskDataByteTimer == 0 && dbg_read_sel) begin
+			if (readyToAdvanceHead && diskImageData != 0)
+				dbg_byte_cnt <= dbg_byte_cnt + 16'd1;
+			else
+				dbg_miss_cnt <= dbg_miss_cnt + 16'd1;
+		end
+	end
+
 	// create a signal on the falling edge of lstrb
 	reg lstrbPrev;
 	always @(posedge clk) if(cep) lstrbPrev <= lstrb;
@@ -338,10 +377,12 @@ module floppy
 	//`define DRIVE_REG_STEP		2  /* R: drive head stepping (1 = complete) */
 												/* W: 0 = step drive head */
 	always @(posedge clk or negedge _reset) begin
-		if (_reset == 1'b0) begin	
-			driveTrack <= 0; 
-		end 
+		if (_reset == 1'b0) begin
+			driveTrack   <= 0;
+			dbg_step_cnt <= 16'd0;
+		end
 		else if(cep && _enable == 1'b0 && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_STEP && ca2 == 1'b0) begin
+			dbg_step_cnt <= dbg_step_cnt + 16'd1;  // PFLP: seek activity meter
 			if (driveRegs[`DRIVE_REG_DIRTN] == 1'b0 && driveTrack != 7'h4F) begin
 				driveTrack <= driveTrack + 1'b1;
 			end

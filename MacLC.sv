@@ -947,6 +947,15 @@ module emu
 		.ram_configured(pvia_ram_configured)
 	);
 
+	// Floppy diagnostic wires (from dataController/swim/floppy — PFLP deck)
+	wire [15:0] dbg_flp_byte_cnt;
+	wire [15:0] dbg_flp_miss_cnt;
+	wire [7:0]  dbg_flp_disk_data;
+	wire [6:0]  dbg_flp_track;
+	wire        dbg_flp_side;
+	wire [15:0] dbg_flp_step_cnt;
+	wire [7:0]  dbg_iwm_latch;
+
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
@@ -1010,6 +1019,26 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_prst (.probe({reboot_cnt, first_src, reset_src,
 	                   prst_armed, first_rst_seen, first_nreset, n_reset, 4'd0}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	// --- PFL0/PFL1: floppy (internal drive) read-path diagnostics -------------
+	// Ported from lbmactwo's PFLP/PIWM deck (the counters that root-caused its
+	// 800K bug). PFL0 = {byte_cnt[15:0], miss_cnt[15:0]}: bytes delivered vs
+	// byte slots starved WHILE the OS is positioned to read (phases on RDDATA,
+	// drive enabled). Healthy 800K read ≈ 3,900 bytes/s of byte_cnt delta and a
+	// static miss_cnt. PFL1 = {track[6:0], side, iwm_latch[7:0], step_cnt[7:0],
+	// disk_data[7:0]}: head position, seek activity, live IWM latch + live
+	// SDRAM-fed encoder byte (a stream of legal GCR bytes ≥ $96 when reading).
+	altsource_probe #(
+		.instance_id ("PFL0"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_pfl0 (.probe({dbg_flp_byte_cnt, dbg_flp_miss_cnt}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PFL1"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_pfl1 (.probe({dbg_flp_track, dbg_flp_side, dbg_iwm_latch,
+	                   dbg_flp_step_cnt[7:0], dbg_flp_disk_data}),
 	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
 	dbg_probes probes(
@@ -1305,7 +1334,15 @@ module emu
 		.pram_wr_stb(pram_wr_stb),
 		.pram_ready(pram_ready),
 		// #3 reset-source probe: expose the Egret's 68k-reset line (Port C bit 3)
-		.egret_dbg_reset_680x0(egret_reset_680x0_w)
+		.egret_dbg_reset_680x0(egret_reset_680x0_w),
+		// PFLP floppy diagnostics (internal drive)
+		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_flp_disk_data(dbg_flp_disk_data),
+		.dbg_flp_track(dbg_flp_track),
+		.dbg_flp_side(dbg_flp_side),
+		.dbg_flp_step_cnt(dbg_flp_step_cnt),
+		.dbg_iwm_latch(dbg_iwm_latch)
 	);
 
 	reg disk_act;

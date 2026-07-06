@@ -825,7 +825,17 @@ module emu
 		.pram_save_addr(8'd0),
 		.pram_save_data(),
 		.pram_wr_stb(),
-		.pram_ready(1'b1)
+		.pram_ready(1'b1),
+
+		// PFLP floppy diagnostics — FPGA-only (feed ISSP probes in MacLC.sv);
+		// explicitly unconnected here
+		.dbg_flp_byte_cnt(),
+		.dbg_flp_miss_cnt(),
+		.dbg_flp_disk_data(),
+		.dbg_flp_track(),
+		.dbg_flp_side(),
+		.dbg_flp_step_cnt(),
+		.dbg_iwm_latch()
 	);
 
 	//////////////////////// DOWNLOADING ///////////////////////////

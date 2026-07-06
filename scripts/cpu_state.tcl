@@ -157,6 +157,37 @@ if {[info exists idx(PSDT)]} {
         [expr {($sd>>24)&0xFF}] $mx [expr {$mx / 32500.0}]]
 }
 
+# ---- PFL0/PFL1: floppy read-path diagnostics (internal drive) -----------------
+# PFL0 = {byte_cnt[15:0], miss_cnt[15:0]} — counted ONLY while the OS is
+# positioned to read (phases parked on RDDATA0/1, drive enabled). Wrapping;
+# deltas over the 1 s window below. Healthy 800K read: bytes/s ≈ 3900 while
+# sectors stream, miss/s = 0. Climbing miss = SDRAM extra-slot starvation.
+# PFL1 = {track[6:0], side, iwm_latch[7:0], step_cnt[7:0], disk_data[7:0]}.
+# During a GCR read disk_data/iwm_latch must be legal Sony codes (>= 0x96).
+if {[info exists idx(PFL0)]} {
+    set f0a [rd PFL0]
+    after 1000
+    set f0b [rd PFL0]
+    set b0 [expr {($f0a>>16)&0xFFFF}]; set b1 [expr {($f0b>>16)&0xFFFF}]
+    set m0 [expr {$f0a&0xFFFF}];       set m1 [expr {$f0b&0xFFFF}]
+    set db [expr {($b1 - $b0) & 0xFFFF}]
+    set dm [expr {($m1 - $m0) & 0xFFFF}]
+    set verdict "IDLE (no RDDATA polling)"
+    if {$db > 0 && $dm == 0} { set verdict "READING — delivery healthy" }
+    if {$dm > 0}             { set verdict "STARVING — SDRAM refill missing byte slots" }
+    puts [format "PFL0 floppy     : byte_cnt=%u (+%u/s)  miss_cnt=%u (+%u/s)  => %s" \
+        $b1 $db $m1 $dm $verdict]
+    set f1 [rd PFL1]
+    set trk  [expr {($f1>>25)&0x7F}]
+    set side [expr {($f1>>24)&1}]
+    set lat  [expr {($f1>>16)&0xFF}]
+    set stp  [expr {($f1>>8)&0xFF}]
+    set dat  [expr {$f1&0xFF}]
+    puts [format "PFL1 floppy     : track=%u side=%u iwm_latch=%02X step_cnt8=%u disk_data=%02X%s" \
+        $trk $side $lat $stp $dat \
+        [expr {($dat != 0 && $dat < 0x96) ? "  (NOT a legal GCR code!)" : ""}]]
+}
+
 # ---- PRC0 / PRT1-3: #3 reboot isolation (SCSI-abort trail + init entry) -------
 # busrst = # of SCSI bus resets (driver aborts). sr2700 = # of boot-inits seen by
 # opcode (move #$2700,sr; cold boot = 1, +1 if the reboot re-runs SR setup).

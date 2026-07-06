@@ -143,7 +143,16 @@ module dataController_top(
 	output        egret_dbg_tip,           // TIP from VIA (synced in Egret)
 	output        egret_dbg_byteack,       // BYTEACK from VIA (synced in Egret)
 	output        egret_dbg_reset_680x0,   // Egret holding 68K in reset
-	output        egret_dbg_cpu_reset_out  // Final _cpuReset signal
+	output        egret_dbg_cpu_reset_out, // Final _cpuReset signal
+
+	// Floppy diagnostic passthroughs (PFLP probes; internal drive)
+	output [15:0] dbg_flp_byte_cnt,
+	output [15:0] dbg_flp_miss_cnt,
+	output [7:0]  dbg_flp_disk_data,
+	output [6:0]  dbg_flp_track,
+	output        dbg_flp_side,
+	output [15:0] dbg_flp_step_cnt,
+	output [7:0]  dbg_iwm_latch
 );
 	
 	parameter SCSI_DEVS = 2;
@@ -963,7 +972,15 @@ module dataController_top(
 		.dskReadAckInt(dskReadAckInt),
 		.dskReadAddrExt(dskReadAddrExt),
 		.dskReadAckExt(dskReadAckExt),
-		.dskReadData(memoryDataIn[7:0])
+		.dskReadData(memoryDataIn[7:0]),
+
+		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_flp_disk_data(dbg_flp_disk_data),
+		.dbg_flp_track(dbg_flp_track),
+		.dbg_flp_side(dbg_flp_side),
+		.dbg_flp_step_cnt(dbg_flp_step_cnt),
+		.dbg_iwm_latch(dbg_iwm_latch)
 	);
 
 	// SCC
