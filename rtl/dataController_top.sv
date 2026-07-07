@@ -152,7 +152,8 @@ module dataController_top(
 	output [6:0]  dbg_flp_track,
 	output        dbg_flp_side,
 	output [15:0] dbg_flp_step_cnt,
-	output [7:0]  dbg_iwm_latch
+	output [7:0]  dbg_iwm_latch,
+	output        dbg_flp_byte_stb   // 1-clk delivered-byte strobe (capture ring)
 );
 	
 	parameter SCSI_DEVS = 2;
@@ -980,7 +981,8 @@ module dataController_top(
 		.dbg_flp_track(dbg_flp_track),
 		.dbg_flp_side(dbg_flp_side),
 		.dbg_flp_step_cnt(dbg_flp_step_cnt),
-		.dbg_iwm_latch(dbg_iwm_latch)
+		.dbg_iwm_latch(dbg_iwm_latch),
+		.dbg_flp_byte_stb(dbg_flp_byte_stb)
 	);
 
 	// SCC

@@ -107,7 +107,10 @@ module floppy
 	output wire [7:0]  dbg_disk_image_data,  // live SDRAM-fed encoder byte
 	output wire [6:0]  dbg_drive_track,
 	output wire        dbg_drive_side,
-	output reg  [15:0] dbg_step_cnt          // STEP register writes committed
+	output reg  [15:0] dbg_step_cnt,         // STEP register writes committed
+	output wire        dbg_byte_stb          // 1-clk pulse: byte delivered THIS cycle
+	                                         // (diskImageData is handed over AND
+	                                         // cleared on this edge — sample it now)
 );
 	assign dbg_disk_image_data = diskImageData;
 	assign dbg_drive_track     = driveTrack;
@@ -309,6 +312,12 @@ module floppy
 	// miss_cnt static. Observation-only — the delivery path is untouched.
 	wire dbg_read_sel = (driveReadAddr == `DRIVE_REG_RDDATA0 ||
 	                     driveReadAddr == `DRIVE_REG_RDDATA1) && (_enable == 1'b0);
+	// Same-cycle delivery strobe for the MacLC.sv byte-capture ring: identical
+	// qualification to the dbg_byte_cnt increment below. Must be consumed on
+	// THIS clk edge — the delivery block latches diskImageData into diskDataIn
+	// and zeroes it on the same edge, so one cycle later the byte is gone.
+	assign dbg_byte_stb = cep && diskDataByteTimer == 0 && dbg_read_sel &&
+	                      readyToAdvanceHead && (diskImageData != 0);
 	always @(posedge clk or negedge _reset) begin
 		if (_reset == 1'b0) begin
 			dbg_byte_cnt <= 16'd0;

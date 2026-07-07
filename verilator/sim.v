@@ -845,7 +845,8 @@ module emu
 		.dbg_flp_track(),
 		.dbg_flp_side(),
 		.dbg_flp_step_cnt(),
-		.dbg_iwm_latch()
+		.dbg_iwm_latch(),
+		.dbg_flp_byte_stb()
 	);
 
 	//////////////////////// DOWNLOADING ///////////////////////////

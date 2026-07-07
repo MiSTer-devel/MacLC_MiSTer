@@ -92,7 +92,8 @@ module swim
 	output [6:0]  dbg_flp_track,
 	output        dbg_flp_side,
 	output [15:0] dbg_flp_step_cnt,
-	output [7:0]  dbg_iwm_latch      // live IWM read-data latch
+	output [7:0]  dbg_iwm_latch,     // live IWM read-data latch
+	output        dbg_flp_byte_stb   // 1-clk delivered-byte strobe (capture ring)
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -194,7 +195,8 @@ module swim
 		.dbg_disk_image_data(dbg_flp_disk_data),
 		.dbg_drive_track(dbg_flp_track),
 		.dbg_drive_side(dbg_flp_side),
-		.dbg_step_cnt(dbg_flp_step_cnt)
+		.dbg_step_cnt(dbg_flp_step_cnt),
+		.dbg_byte_stb(dbg_flp_byte_stb)
 	);
 
 	floppy floppyExt

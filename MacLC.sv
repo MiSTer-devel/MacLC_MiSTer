@@ -1055,6 +1055,7 @@ module emu
 	wire        dbg_flp_side;
 	wire [15:0] dbg_flp_step_cnt;
 	wire [7:0]  dbg_iwm_latch;
+	wire        dbg_flp_byte_stb;
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
@@ -1134,12 +1135,77 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_pfl0 (.probe({dbg_flp_byte_cnt, dbg_flp_miss_cnt}),
 	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	// --- PFL1 byte-capture ring (800K content-bug hunt, 2026-07-06) -----------
+	// The in-flight capture proved the 800K failure is a byte-stream CONTENT bug
+	// on track 0 (delivery clean, head never steps, IWM never byte-syncs). This
+	// ring records the first 1024 bytes actually HANDED to the IWM after an arm,
+	// so the GCR sync/gap/address-mark framing can be diffed against MAME's
+	// track-0 stream. ON-CHIP because the minutes-long JTAG streaming sampler
+	// crashed the board (docs/resume_floppy_content_bug_2026-07-06.md).
+	//
+	// No new hub nodes (the ~40-node deck's name table already reads back
+	// corrupted — see rtl/dbg_probes.sv PBH0): PFL1 is widened into a dual-mode
+	// probe instead. source = {arm[10], sel[9:8], addr[7:0]}:
+	//   sel 0 = live PFL1 layout (default 0 after config — tooling-compatible)
+	//   sel 1 = ring word[addr]: 4 delivered bytes, [7:0] = earliest
+	//   sel 2 = status {8'hB5, done, capturing, 2'b00, arm_cnt[3:0], 6'd0, wptr[9:0]}
+	// arm rising edge restarts the capture (re-armable per mount attempt).
+	// Reader: scripts/floppy_ring.tcl (arm / status / dump — bounded, one session).
+	wire [10:0] pfl1_src;
+	reg  [31:0] flp_ring [0:255];           // 1 M10K: 256 words x 4 bytes
+	reg  [23:0] flp_asm;                    // 3 younger bytes awaiting the 4th
+	reg  [1:0]  flp_asm_cnt   = 2'd0;
+	reg  [9:0]  flp_wptr      = 10'd0;      // word pointer; 256 = full
+	reg         flp_capturing = 1'b0;
+	reg         flp_done      = 1'b0;
+	reg  [3:0]  flp_arm_cnt   = 4'd0;
+	reg  [1:0]  flp_arm_sync  = 2'b00;      // JTAG-domain arm bit -> clk_sys
+	reg         flp_arm_d     = 1'b0;
+	wire        flp_arm_edge  = flp_arm_sync[1] & ~flp_arm_d;
+	always @(posedge clk_sys) begin
+		flp_arm_sync <= {flp_arm_sync[0], pfl1_src[10]};
+		flp_arm_d    <= flp_arm_sync[1];
+		if (flp_arm_edge) begin
+			flp_wptr      <= 10'd0;
+			flp_asm_cnt   <= 2'd0;
+			flp_capturing <= 1'b1;
+			flp_done      <= 1'b0;
+			flp_arm_cnt   <= flp_arm_cnt + 4'd1;
+		end
+		else if (flp_capturing && dbg_flp_byte_stb) begin
+			flp_asm     <= {dbg_flp_disk_data, flp_asm[23:8]};
+			flp_asm_cnt <= flp_asm_cnt + 2'd1;
+			if (flp_asm_cnt == 2'd3) begin
+				flp_ring[flp_wptr[7:0]] <= {dbg_flp_disk_data, flp_asm};
+				flp_wptr <= flp_wptr + 10'd1;
+				if (flp_wptr == 10'd255) begin
+					flp_capturing <= 1'b0;
+					flp_done      <= 1'b1;
+				end
+			end
+		end
+	end
+	// readout port (address is static during a JTAG read; sync flops for form)
+	reg [7:0]  flp_raddr = 8'd0;
+	reg [31:0] flp_ring_q;
+	always @(posedge clk_sys) begin
+		flp_raddr  <= pfl1_src[7:0];
+		flp_ring_q <= flp_ring[flp_raddr];
+	end
+	wire [31:0] pfl1_live   = {dbg_flp_track, dbg_flp_side, dbg_iwm_latch,
+	                           dbg_flp_step_cnt[7:0], dbg_flp_disk_data};
+	wire [31:0] pfl1_status = {8'hB5, flp_done, flp_capturing, 2'b00,
+	                           flp_arm_cnt, 6'd0, flp_wptr};
+	reg  [31:0] pfl1_probe_r;
+	always @(posedge clk_sys)
+		pfl1_probe_r <= (pfl1_src[9:8] == 2'b01) ? flp_ring_q   :
+		                (pfl1_src[9:8] == 2'b10) ? pfl1_status  : pfl1_live;
+
 	altsource_probe #(
-		.instance_id ("PFL1"), .probe_width (32), .source_width(1),
+		.instance_id ("PFL1"), .probe_width (32), .source_width(11),
 		.sld_auto_instance_index ("YES")
-	) cp_pfl1 (.probe({dbg_flp_track, dbg_flp_side, dbg_iwm_latch,
-	                   dbg_flp_step_cnt[7:0], dbg_flp_disk_data}),
-	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	) cp_pfl1 (.probe(pfl1_probe_r), .source(pfl1_src),
+	           .source_clk(clk_sys), .source_ena(1'b1));
 
 	dbg_probes probes(
 		.clk(clk_sys),
@@ -1445,7 +1511,8 @@ module emu
 		.dbg_flp_track(dbg_flp_track),
 		.dbg_flp_side(dbg_flp_side),
 		.dbg_flp_step_cnt(dbg_flp_step_cnt),
-		.dbg_iwm_latch(dbg_iwm_latch)
+		.dbg_iwm_latch(dbg_iwm_latch),
+		.dbg_flp_byte_stb(dbg_flp_byte_stb)
 	);
 
 	reg disk_act;
