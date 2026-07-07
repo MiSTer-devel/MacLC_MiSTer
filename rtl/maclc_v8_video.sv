@@ -3,9 +3,11 @@
 //
 // CLOCKING: `clk_sys` (historic name) is the SCANOUT clock. On the FPGA it is
 // the dedicated per-monitor pixel clock from pll_video (25.175 / 15.664 /
-// 58.742 MHz, muxed by monitor_id in MacLC.sv) with pix_ce tied 1. In the
-// Verilator sim it remains the true 32.5 MHz clk_sys with pix_ce = /2 toggle
-// (the historic 16.25 MHz behavior — keeps sim frame counts unchanged).
+// 58.742 MHz, muxed by monitor_id in MacLC.sv) with pix_ce tied 1. In
+// the Verilator sim it stays the true 32.5 MHz clk_sys with pix_ce = /2
+// toggle (the historic 16.25 MHz behavior — keeps sim frame counts
+// unchanged). NB: no comment line here may START with the word "Verilator"
+// after the slashes — that parses as a Verilator metacomment and errors.
 // Config inputs (video_mode/monitor_id/test_*) originate in the real clk_sys
 // domain and are 2FF-synced below; the *_meta stages are false-pathed in
 // MacLC.sdc.
