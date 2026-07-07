@@ -108,13 +108,17 @@ module floppy
 	output wire [6:0]  dbg_drive_track,
 	output wire        dbg_drive_side,
 	output reg  [15:0] dbg_step_cnt,         // STEP register writes committed
-	output wire        dbg_byte_stb          // 1-clk pulse: byte delivered THIS cycle
+	output wire        dbg_byte_stb,         // 1-clk pulse: byte delivered THIS cycle
 	                                         // (diskImageData is handed over AND
 	                                         // cleared on this edge — sample it now)
+	output wire [7:0]  dbg_raw_byte,         // pre-encoder SDRAM fetch latch (idata)
+	output wire [21:0] dbg_gcr_addr          // live GCR encoder fetch address
 );
 	assign dbg_disk_image_data = diskImageData;
 	assign dbg_drive_track     = driveTrack;
 	assign dbg_drive_side      = driveSide;
+	assign dbg_raw_byte        = dskReadDataLatch;
+	assign dbg_gcr_addr        = gcrReadAddr;
 
 	assign motor = ~driveRegs[`DRIVE_REG_MOTORON];
 	assign act = lstrbEdge;

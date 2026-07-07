@@ -93,7 +93,9 @@ module swim
 	output        dbg_flp_side,
 	output [15:0] dbg_flp_step_cnt,
 	output [7:0]  dbg_iwm_latch,     // live IWM read-data latch
-	output        dbg_flp_byte_stb   // 1-clk delivered-byte strobe (capture ring)
+	output        dbg_flp_byte_stb,  // 1-clk delivered-byte strobe (capture ring)
+	output [7:0]  dbg_flp_raw,      // pre-encoder SDRAM fetch latch (internal drive)
+	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -196,7 +198,9 @@ module swim
 		.dbg_drive_track(dbg_flp_track),
 		.dbg_drive_side(dbg_flp_side),
 		.dbg_step_cnt(dbg_flp_step_cnt),
-		.dbg_byte_stb(dbg_flp_byte_stb)
+		.dbg_byte_stb(dbg_flp_byte_stb),
+		.dbg_raw_byte(dbg_flp_raw),
+		.dbg_gcr_addr(dbg_flp_gcr_addr)
 	);
 
 	floppy floppyExt

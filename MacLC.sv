@@ -1056,6 +1056,8 @@ module emu
 	wire [15:0] dbg_flp_step_cnt;
 	wire [7:0]  dbg_iwm_latch;
 	wire        dbg_flp_byte_stb;
+	wire [7:0]  dbg_flp_raw;
+	wire [21:0] dbg_flp_gcr_addr;
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
@@ -1136,26 +1138,34 @@ module emu
 	) cp_pfl0 (.probe({dbg_flp_byte_cnt, dbg_flp_miss_cnt}),
 	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
 	// --- PFL1 byte-capture ring (800K content-bug hunt, 2026-07-06) -----------
-	// The in-flight capture proved the 800K failure is a byte-stream CONTENT bug
-	// on track 0 (delivery clean, head never steps, IWM never byte-syncs). This
-	// ring records the first 1024 bytes actually HANDED to the IWM after an arm,
-	// so the GCR sync/gap/address-mark framing can be diffed against MAME's
-	// track-0 stream. ON-CHIP because the minutes-long JTAG streaming sampler
-	// crashed the board (docs/resume_floppy_content_bug_2026-07-06.md).
+	// v2 raw-fetch instrument (2026-07-07). The v1 enc-only capture proved every
+	// data-field payload reaches the IWM ALL-ZERO while address fields are
+	// perfect — i.e. the encoder nibblizes zeros. This repack records, per
+	// delivered byte, WHAT the SDRAM fetch returned and FROM WHERE:
+	//   ring word = {gcrReadAddr[15:0], raw fetch latch[7:0], delivered enc[7:0]}
+	// 256 strobes per arm; re-arm for more windows. One capture separates:
+	// zero SDRAM content (raw==0 at a correct 0..6143 track-0 addr), a fetch
+	// address-walk fault (addr wrong/stuck), or an encoder fault (raw!=0).
 	//
 	// No new hub nodes (the ~40-node deck's name table already reads back
 	// corrupted — see rtl/dbg_probes.sv PBH0): PFL1 is widened into a dual-mode
 	// probe instead. source = {arm[10], sel[9:8], addr[7:0]}:
 	//   sel 0 = live PFL1 layout (default 0 after config — tooling-compatible)
-	//   sel 1 = ring word[addr]: 4 delivered bytes, [7:0] = earliest
+	//   sel 1 = ring word[addr] = {addr[15:0], raw[7:0], enc[7:0]} of strobe #addr
 	//   sel 2 = status {8'hB5, done, capturing, 2'b00, arm_cnt[3:0], 6'd0, wptr[9:0]}
+	//   sel 3 = floppy-download counters (sub-addressed by addr[1:0]):
+	//       0: {8'hD1, 4'd0, dl_words[19:0]}    accepted index-1 write slots
+	//       1: {8'hD2, 4'd0, dl_nonzero[19:0]}  ...of those, dio_data != 0
+	//       2: {8'hD3, ds, ss, mfm, hd, dio_addr[19:0]}  size-latch + last addr
+	//       3: {8'hD4, 8'd0, dl_xor[15:0]}      XOR of accepted dio_data words
+	//     Expected for a good 800K mount: dl_words = 409600 (0x64000),
+	//     dl_nonzero = the image's nonzero-word count and dl_xor = the image's
+	//     word-XOR (both computed offline by scripts/raw_compare.py).
 	// arm rising edge restarts the capture (re-armable per mount attempt).
 	// Reader: scripts/floppy_ring.tcl (arm / status / dump — bounded, one session).
 	wire [10:0] pfl1_src;
-	reg  [31:0] flp_ring [0:255];           // 1 M10K: 256 words x 4 bytes
-	reg  [23:0] flp_asm;                    // 3 younger bytes awaiting the 4th
-	reg  [1:0]  flp_asm_cnt   = 2'd0;
-	reg  [9:0]  flp_wptr      = 10'd0;      // word pointer; 256 = full
+	reg  [31:0] flp_ring [0:255];           // 1 M10K: 256 x {addr16, raw8, enc8}
+	reg  [9:0]  flp_wptr      = 10'd0;      // strobe pointer; 256 = full
 	reg         flp_capturing = 1'b0;
 	reg         flp_done      = 1'b0;
 	reg  [3:0]  flp_arm_cnt   = 4'd0;
@@ -1167,21 +1177,17 @@ module emu
 		flp_arm_d    <= flp_arm_sync[1];
 		if (flp_arm_edge) begin
 			flp_wptr      <= 10'd0;
-			flp_asm_cnt   <= 2'd0;
 			flp_capturing <= 1'b1;
 			flp_done      <= 1'b0;
 			flp_arm_cnt   <= flp_arm_cnt + 4'd1;
 		end
 		else if (flp_capturing && dbg_flp_byte_stb) begin
-			flp_asm     <= {dbg_flp_disk_data, flp_asm[23:8]};
-			flp_asm_cnt <= flp_asm_cnt + 2'd1;
-			if (flp_asm_cnt == 2'd3) begin
-				flp_ring[flp_wptr[7:0]] <= {dbg_flp_disk_data, flp_asm};
-				flp_wptr <= flp_wptr + 10'd1;
-				if (flp_wptr == 10'd255) begin
-					flp_capturing <= 1'b0;
-					flp_done      <= 1'b1;
-				end
+			flp_ring[flp_wptr[7:0]] <= {dbg_flp_gcr_addr[15:0], dbg_flp_raw,
+			                            dbg_flp_disk_data};
+			flp_wptr <= flp_wptr + 10'd1;
+			if (flp_wptr == 10'd255) begin
+				flp_capturing <= 1'b0;
+				flp_done      <= 1'b1;
 			end
 		end
 	end
@@ -1196,10 +1202,18 @@ module emu
 	                           dbg_flp_step_cnt[7:0], dbg_flp_disk_data};
 	wire [31:0] pfl1_status = {8'hB5, flp_done, flp_capturing, 2'b00,
 	                           flp_arm_cnt, 6'd0, flp_wptr};
+	// sel 3: floppy-download counters (driven next to the download handler below)
+	wire [31:0] pfl1_dl =
+		(pfl1_src[1:0] == 2'd0) ? {8'hD1, 4'd0, flp_dl_words}   :
+		(pfl1_src[1:0] == 2'd1) ? {8'hD2, 4'd0, flp_dl_nonzero} :
+		(pfl1_src[1:0] == 2'd2) ? {8'hD3, dsk_int_ds, dsk_int_ss, dsk_int_mfm,
+		                           dsk_int_hd, dio_addr[19:0]}  :
+		                          {8'hD4, 8'd0, flp_dl_xor};
 	reg  [31:0] pfl1_probe_r;
 	always @(posedge clk_sys)
 		pfl1_probe_r <= (pfl1_src[9:8] == 2'b01) ? flp_ring_q   :
-		                (pfl1_src[9:8] == 2'b10) ? pfl1_status  : pfl1_live;
+		                (pfl1_src[9:8] == 2'b10) ? pfl1_status  :
+		                (pfl1_src[9:8] == 2'b11) ? pfl1_dl      : pfl1_live;
 
 	altsource_probe #(
 		.instance_id ("PFL1"), .probe_width (32), .source_width(11),
@@ -1512,7 +1526,9 @@ module emu
 		.dbg_flp_side(dbg_flp_side),
 		.dbg_flp_step_cnt(dbg_flp_step_cnt),
 		.dbg_iwm_latch(dbg_iwm_latch),
-		.dbg_flp_byte_stb(dbg_flp_byte_stb)
+		.dbg_flp_byte_stb(dbg_flp_byte_stb),
+		.dbg_flp_raw(dbg_flp_raw),
+		.dbg_flp_gcr_addr(dbg_flp_gcr_addr)
 	);
 
 	reg disk_act;
@@ -1638,6 +1654,35 @@ module emu
 		old_cyc <= dioBusControl;
 		if(~dioBusControl) dio_write <= ioctl_wait;
 		if(old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
+	end
+
+	// --- Floppy-download acceptance counters (PFL1 sel-3 readout) -------------
+	// One count per accepted index-1 word: the same slot-exit event that clears
+	// ioctl_wait above, so this counts words that actually GOT a write slot.
+	// After an 800K mount: dl_words < 409600 means write slots are being lost
+	// core-side; dl_words full but dl_nonzero far below the image's own
+	// nonzero-word count means the HPS stream itself carried zeros.
+	reg [19:0] flp_dl_words   = 20'd0;
+	reg [19:0] flp_dl_nonzero = 20'd0;
+	reg [15:0] flp_dl_xor     = 16'd0;   // XOR of accepted dio_data words —
+	                                     // compare against the image's own XOR
+	                                     // (data-integrity check of the stream)
+	always @(posedge clk_sys) begin
+		reg dl_old_cyc  = 1'b0;
+		reg dl_old_down = 1'b0;
+		if (dio_download && !dl_old_down && dio_index[1:0] == 2'b01) begin
+			flp_dl_words   <= 20'd0;
+			flp_dl_nonzero <= 20'd0;
+			flp_dl_xor     <= 16'd0;
+		end
+		else if (dio_download && dio_index[1:0] == 2'b01 &&
+		         dl_old_cyc && !dioBusControl && dio_write) begin
+			flp_dl_words <= flp_dl_words + 20'd1;
+			flp_dl_xor   <= flp_dl_xor ^ dio_data;
+			if (dio_data != 16'h0000) flp_dl_nonzero <= flp_dl_nonzero + 20'd1;
+		end
+		dl_old_cyc  <= dioBusControl;
+		dl_old_down <= dio_download;
 	end
 
 

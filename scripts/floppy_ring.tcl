@@ -5,10 +5,11 @@
 # bounded JTAG session, a few seconds total, with NO mid-run reopen: on any
 # read/write failure it restores live mode and ABORTS.
 #
-# The ring (MacLC.sv, behind the widened PFL1 probe): the first 1024 bytes of
-# the exact GCR stream HANDED to the IWM after an arm edge, recorded on-chip,
-# so the track-0 sync/gap/address-mark framing can be diffed against MAME
-# (scratch/mame_floppy_0702/data_reads_800k.txt.gz, decoded_800k_v3.txt).
+# The ring (MacLC.sv, behind the widened PFL1 probe), v2 raw-fetch format:
+# 256 delivered-byte strobes, each recording {gcrReadAddr[15:0], raw SDRAM
+# fetch latch[7:0], delivered GCR byte[7:0]} — separates zero-SDRAM-content
+# (raw==0 at correct 0..6143 track-0 addrs) from fetch-address faults from
+# encoder faults. sel-3 exposes floppy-download acceptance counters.
 #
 # Usage (quartus bin64 on PATH, e.g. after `source scripts/local.env`):
 #   quartus_stp_tcl -t scripts/floppy_ring.tcl arm             # reset + start capture
@@ -21,9 +22,13 @@
 #      "unreadable" dialog (~50 s — the ring fills in the burst's first ~20 ms)
 #   3. dump                   (~5 s of JTAG; writes hexdump + mark scan)
 #
-# PFL1 source = {arm[10], sel[9:8], addr[7:0]}; sel: 0=live 1=ring[addr] 2=status
+# PFL1 source = {arm[10], sel[9:8], addr[7:0]}
+# sel: 0=live  1=ring[addr]  2=status  3=download counters (addr[1:0] picks)
 # status = {8'hB5 magic, done[23], capturing[22], 2'b00, arm_cnt[19:16], 6'd0, wptr[9:0]}
-# ring word = 4 delivered bytes, [7:0] = earliest
+# ring word = {gcrReadAddr[15:0], raw[7:0], enc[7:0]} of strobe #addr
+# sel3: 0={8'hD1,4'd0,dl_words[19:0]} 1={8'hD2,4'd0,dl_nonzero[19:0]}
+#       2={8'hD3, ds,ss,mfm,hd, dio_addr[19:0]} 3={8'hD4,8'd0,dl_xor[15:0]}
+#       (D1..D4 = read-back magics)
 
 set cmd "status"
 set outfile "floppy_ring_dump.txt"
@@ -121,8 +126,8 @@ proc show_status {s} {
     set cap  [expr {($s >> 22) & 1}]
     set armc [expr {($s >> 16) & 0xF}]
     set wptr [expr {$s & 0x3FF}]
-    puts [format "RING: done=%d capturing=%d arm_cnt=%d words=%d (%d bytes)" \
-        $done $cap $armc $wptr [expr {$wptr * 4}]]
+    puts [format "RING: done=%d capturing=%d arm_cnt=%d strobes=%d" \
+        $done $cap $armc $wptr]
     if {$pfl0 >= 0} {
         set f0 [rdi $pfl0]
         if {$f0 >= 0} {
@@ -133,8 +138,39 @@ proc show_status {s} {
     return $wptr
 }
 
+# sel-3 download counters. Warn-only (an older enc-only build muxes sel3 to
+# the live word, so the D1/D2/D3 magics won't match — status must still work).
+proc show_dl {} {
+    global pfl1
+    set magics {0xD1 0xD2 0xD3 0xD4}
+    set vals {}
+    for {set k 0} {$k < 4} {incr k} {
+        if {![wsi $pfl1 [expr {0x300 | $k}]]} { bail "sel3 source write failed" }
+        after 5
+        set v [rdi $pfl1]
+        if {$v < 0} { bail "sel3 read failed" }
+        if {((($v >> 24) & 0xFF)) != [lindex $magics $k]} {
+            puts [format "DL: sel3 magic mismatch at %d (got %08X) — pre-v2 build, skipping counters" $k $v]
+            return
+        }
+        lappend vals $v
+    }
+    set words [expr {[lindex $vals 0] & 0xFFFFF}]
+    set nz    [expr {[lindex $vals 1] & 0xFFFFF}]
+    set v3    [lindex $vals 2]
+    set dlxor [expr {[lindex $vals 3] & 0xFFFF}]
+    puts [format "DL: dl_words=%u (expect 409600 for 800K) dl_nonzero=%u dl_xor=0x%04X" \
+        $words $nz $dlxor]
+    puts [format "DL: size-latch ds=%d ss=%d mfm=%d hd=%d  last dio_addr=0x%05X (%u)" \
+        [expr {($v3 >> 23) & 1}] [expr {($v3 >> 22) & 1}] \
+        [expr {($v3 >> 21) & 1}] [expr {($v3 >> 20) & 1}] \
+        [expr {$v3 & 0xFFFFF}] [expr {$v3 & 0xFFFFF}]]
+    puts "DL: (reference dl_nonzero/dl_xor for the mounted image: scripts/raw_compare.py)"
+}
+
 if {$cmd eq "status"} {
     show_status [read_status]
+    show_dl
     wsi $pfl1 0
     catch {end_insystem_source_probe}
     puts "DONE"
@@ -158,6 +194,7 @@ if {$cmd eq "arm"} {
 # ---- dump ----
 set s [read_status]
 set wptr [show_status $s]
+show_dl
 if {$wptr == 0} {
     wsi $pfl1 0
     catch {end_insystem_source_probe}
@@ -165,25 +202,38 @@ if {$wptr == 0} {
     exit 1
 }
 if {$wptr > 256} { set wptr 256 }
-puts "sweeping $wptr words (~[expr {$wptr / 40}] s)..."
-set bytes {}
+puts "sweeping $wptr strobes (~[expr {$wptr / 40}] s)..."
+set encs {}
+set raws {}
+set addrs {}
 for {set w 0} {$w < $wptr} {incr w} {
     if {![wsi $pfl1 [expr {0x100 | $w}]]} { bail "addr write failed at word $w" }
     after 5
     set v [rdi $pfl1]
     if {$v < 0} { bail "ring read failed at word $w" }
-    lappend bytes [expr {$v & 0xFF}] [expr {($v >> 8) & 0xFF}] \
-                  [expr {($v >> 16) & 0xFF}] [expr {($v >> 24) & 0xFF}]
+    lappend encs  [expr {$v & 0xFF}]
+    lappend raws  [expr {($v >> 8) & 0xFF}]
+    lappend addrs [expr {($v >> 16) & 0xFFFF}]
 }
 wsi $pfl1 0
 catch {end_insystem_source_probe}
+set bytes $encs   ;# the framing scan below operates on the delivered GCR stream
 
 # ---- output + GCR framing scan (all offline from here — JTAG is done) ----
 set fh [open $outfile w]
 proc out {line} { global fh; puts $line; puts $fh $line }
 
 set n [llength $bytes]
-out "# floppy_ring dump — [clock format [clock seconds]] — $n bytes (earliest first)"
+out "# floppy_ring dump v2 — [clock format [clock seconds]] — $n strobes (earliest first)"
+out "# columns: strobe#  gcrReadAddr(hex)  sec/off(track-0 decode)  raw  enc"
+for {set i 0} {$i < $n} {incr i} {
+    set a [lindex $addrs $i]
+    out [format "S%03d: %04X  %2d/%03d  %02X %02X" $i $a \
+        [expr {$a >> 9}] [expr {$a & 0x1FF}] \
+        [lindex $raws $i] [lindex $bytes $i]]
+}
+out ""
+out "ENC hexdump (delivered GCR stream):"
 for {set i 0} {$i < $n} {incr i 16} {
     set row {}
     for {set j $i} {$j < $n && $j < $i + 16} {incr j} {
@@ -192,12 +242,53 @@ for {set i 0} {$i < $n} {incr i 16} {
     out [format "%04X: %s" $i [join $row " "]]
 }
 out ""
-out "FLAT (for offline grep/diff):"
+out "RAW hexdump (pre-encoder SDRAM fetch latch):"
+for {set i 0} {$i < $n} {incr i 16} {
+    set row {}
+    for {set j $i} {$j < $n && $j < $i + 16} {incr j} {
+        lappend row [format %02X [lindex $raws $j]]
+    }
+    out [format "%04X: %s" $i [join $row " "]]
+}
+out ""
+out "FLAT-ENC (for offline grep/diff):"
 set flat ""
 foreach b $bytes { append flat [format %02X $b] }
 for {set i 0} {$i < [string length $flat]} {incr i 128} {
     out [string range $flat $i [expr {$i + 127}]]
 }
+out ""
+out "FLAT-RAW:"
+set flat ""
+foreach b $raws { append flat [format %02X $b] }
+for {set i 0} {$i < [string length $flat]} {incr i 128} {
+    out [string range $flat $i [expr {$i + 127}]]
+}
+out ""
+
+# raw-stream + addr-walk verdict material
+set raw_nz 0
+foreach b $raws { if {$b != 0} { incr raw_nz } }
+set amin 0xFFFF; set amax 0
+foreach a $addrs {
+    if {$a < $amin} { set amin $a }
+    if {$a > $amax} { set amax $a }
+}
+out "==================== raw-fetch scan ===================="
+out [format "raw nonzero: %d / %d strobes" $raw_nz $n]
+out [format "gcrReadAddr range: %04X..%04X (track-0 data lives at 0000..17FF)" $amin $amax]
+if {$raw_nz == 0 && $amax <= 0x17FF} {
+    out "VERDICT HINT: raw==0 at CORRECT track-0 addresses -> the SDRAM disk-image"
+    out "  region itself reads back zero: content bug is in the DOWNLOAD path"
+    out "  (cross-check dl_words/dl_nonzero above) or the region was clobbered."
+} elseif {$raw_nz > 0 && $amax > 0x17FF} {
+    out "VERDICT HINT: fetch address left the track-0 window -> address-walk fault"
+    out "  (encoder position/track/side inputs) — inspect the S-table addr column."
+} elseif {$raw_nz > 0} {
+    out "VERDICT HINT: raw data IS arriving -> if enc is still all-96 zeros the"
+    out "  encoder/idata handoff is at fault (contradicts the lbmactwo diff!)."
+}
+out "==========================================================="
 out ""
 
 # FF self-sync runs
@@ -262,9 +353,9 @@ foreach a $d5aa_other {
     out [format "  D5AA? @%04X: %s   (malformed mark?)" $a [join $row " "]]
 }
 if {[llength $addrmarks] == 0 && [llength $datamarks] == 0} {
-    out "VERDICT HINT: NO address/data marks in 1 KB (~1.3 sectors' worth) ->"
-    out "  the stream's sync/gap/mark framing is broken; the IWM can never"
-    out "  byte-sync. Re-examine floppy_track_encoder.v output ORDER/phase."
+    out "VERDICT HINT: NO address/data marks in this 256-byte window (can be"
+    out "  normal if it landed mid-field — check the raw-fetch scan above and"
+    out "  re-arm for another window before blaming framing)."
 } else {
     out "VERDICT HINT: marks PRESENT -> framing partially OK; diff the address"
     out "  field + checksums + sync-run lengths against MAME decoded_800k_v3.txt"
