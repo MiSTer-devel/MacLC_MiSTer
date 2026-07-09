@@ -18,23 +18,27 @@
 // textbook M10K template and infers reliably; it also stays plain Verilog so the
 // sim builds it identically. Reads are registered (1-cycle latency).
 //
-// Single clk_sys domain => CPU writes and video reads are coherent with no CDC.
+// Dual-clock (pixel-clock scanout): port A (CPU write) runs on clk_sys, port B
+// (video read) on the V8 pixel clock. M10K is true dual-port with independent
+// port clocks, so the crossing lives INSIDE the RAM primitive — no timed
+// cross-domain paths (no_rw_check applies; a CPU write racing a video read of
+// the same word can only produce one transiently stale pixel).
 // ============================================================================
 module vram_bram #(
     parameter integer DEPTH = 196608,   // 16bpp @ 512x384 = 384KB / 2 bytes
     parameter integer AW    = 18         // ceil(log2(DEPTH))
 )(
-    input             clk,
-
-    // Port A — CPU write (byte-masked). a_dout is reserved for a later phase
-    // (CPU VRAM reads still come from SDRAM today) and is tied off here.
+    // Port A — CPU write (byte-masked), a_clk (= clk_sys) domain. a_dout is
+    // reserved for a later phase (CPU VRAM reads still come from SDRAM today).
+    input             a_clk,
     input  [AW-1:0]   a_addr,
     input  [15:0]     a_din,
     input  [1:0]      a_be,     // {upper, lower} byte write strobes
     input             a_we,
     output reg [15:0] a_dout,
 
-    // Port B — video read
+    // Port B — video read, b_clk (= pixel clock) domain
+    input             b_clk,
     input  [AW-1:0]   b_addr,
     output [15:0]     b_dout
 );
@@ -47,15 +51,15 @@ module vram_bram #(
     reg [7:0] q_lo, q_hi;
 
     // Port A: byte-masked write (whole-byte WE per lane).
-    always @(posedge clk) if (a_we && a_be[0]) mem_lo[a_addr] <= a_din[7:0];
-    always @(posedge clk) if (a_we && a_be[1]) mem_hi[a_addr] <= a_din[15:8];
+    always @(posedge a_clk) if (a_we && a_be[0]) mem_lo[a_addr] <= a_din[7:0];
+    always @(posedge a_clk) if (a_we && a_be[1]) mem_hi[a_addr] <= a_din[15:8];
 
     // Port B: registered read (video).
-    always @(posedge clk) q_lo <= mem_lo[b_addr];
-    always @(posedge clk) q_hi <= mem_hi[b_addr];
+    always @(posedge b_clk) q_lo <= mem_lo[b_addr];
+    always @(posedge b_clk) q_hi <= mem_hi[b_addr];
     assign b_dout = {q_hi, q_lo};
 
     // Reserved CPU read port — unused in Phase 1/2 (CPU reads come from SDRAM).
-    always @(posedge clk) a_dout <= 16'h0000;
+    always @(posedge a_clk) a_dout <= 16'h0000;
 
 endmodule

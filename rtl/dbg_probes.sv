@@ -21,6 +21,7 @@
 //   PSWL  IRQ/deferral machine state    PSC6  {rst/completion, last opcodes}
 //   PASC  ASC irq vs CPU-write cadence  PAUD  audio sample min/max
 //   PVID  video mode/vbl/CLUT/VRAM activity
+//   PBL0-6  CPU bus-latency meter (fetch/data/VPA split) — scripts/buslat.tcl
 module dbg_probes (
     input wire        clk,
 
@@ -563,5 +564,115 @@ module dbg_probes (
         .instance_id ("PVID"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
     ) cp_pvid (.probe(pvid_r), .source(), .source_clk(clk), .source_ena(1'b1));
+
+    // ---- PBL0-6: CPU bus-latency meter (in-game slowdown, 2026-07-03) -----
+    // Classifies every terminated CPU bus cycle and accumulates its duration
+    // (clk_sys ticks AS held low, fall->rise, saturating at 255):
+    //   prog = instruction fetch (FC 2/6), DTACK-terminated
+    //   data = operand space (FC 1/5), DTACK-terminated
+    //   vpa  = any cycle VPA answered (E-clock I/O + IACK) — separate class
+    //          because its E-sync latency is architectural on a real Mac too,
+    //          and it would otherwise poison the memory-latency averages.
+    // BERR-terminated cycles (boot-time fc7 probes) land in prog/data with
+    // their timeout length; they are boot-only noise, ignore in gameplay runs.
+    //
+    // Readout (scripts/buslat.tcl samples twice dt apart, all mod-2^32):
+    //   PBL0 clk_sys free-run           -> dt = delta/32.5e6 s
+    //   PBL1/PBL2 prog count/tick sum   -> avg fetch latency = d2/d1
+    //   PBL3/PBL4 data count/tick sum   -> avg data latency  = d4/d3
+    //   PBL6 vpa tick sum                (vpa count in PBL5[15:0], wrap16)
+    //   bus occupancy = (d2+d4+d6)/d0
+    //   PBL5 = {max_prog[7:0], max_data[7:0], vpa_cnt[15:0]}, maxes since load
+    reg [31:0] bl_clk = 32'd0;
+    reg [31:0] bl_prog_cnt = 32'd0, bl_prog_sum = 32'd0;
+    reg [31:0] bl_data_cnt = 32'd0, bl_data_sum = 32'd0;
+    reg [31:0] bl_vpa_sum  = 32'd0;
+    reg [15:0] bl_vpa_cnt  = 16'd0;
+    reg [7:0]  bl_max_prog = 8'd0, bl_max_data = 8'd0;
+    reg [7:0]  bl_cur = 8'd0;
+    reg        bl_active = 1'b0, bl_is_prog = 1'b0, bl_vpa_seen = 1'b0;
+    // PBH latency-histogram storage (see comment block below): 12 buckets,
+    // written ONLY from the always block here (single driver).
+    reg [31:0] bh [0:11];
+    wire [3:0] bh_sel;
+    // bucket index for the completing cycle: <=4 ->0, 5..8 ->1..4, >=9 ->5
+    wire [3:0] bh_idx = (bl_cur <= 8'd4) ? 4'd0 :
+                        (bl_cur >= 8'd9) ? 4'd5 : (bl_cur[3:0] - 4'd4);
+    always @(posedge clk) begin
+        bl_clk <= bl_clk + 32'd1;
+        if (cpuAS_n_d && !cpuAS_n) begin              // AS fell: cycle starts
+            bl_active   <= 1'b1;
+            bl_cur      <= 8'd1;
+            bl_is_prog  <= (cpuFC == 3'b010) || (cpuFC == 3'b110);
+            bl_vpa_seen <= !cpuVPA_n;
+        end else if (bl_active && !cpuAS_n) begin     // in progress
+            if (bl_cur != 8'hFF) bl_cur <= bl_cur + 8'd1;
+            if (!cpuVPA_n) bl_vpa_seen <= 1'b1;
+        end else if (bl_active && cpuAS_n) begin      // AS rose: cycle done
+            bl_active <= 1'b0;
+            if (bl_vpa_seen) begin
+                bl_vpa_cnt <= bl_vpa_cnt + 16'd1;
+                bl_vpa_sum <= bl_vpa_sum + {24'd0, bl_cur};
+            end else if (bl_is_prog) begin
+                bl_prog_cnt <= bl_prog_cnt + 32'd1;
+                bl_prog_sum <= bl_prog_sum + {24'd0, bl_cur};
+                if (bl_cur > bl_max_prog) bl_max_prog <= bl_cur;
+                bh[bh_idx] <= bh[bh_idx] + 32'd1;
+            end else begin
+                bl_data_cnt <= bl_data_cnt + 32'd1;
+                bl_data_sum <= bl_data_sum + {24'd0, bl_cur};
+                if (bl_cur > bl_max_data) bl_max_data <= bl_cur;
+                bh[4'd6 + bh_idx] <= bh[4'd6 + bh_idx] + 32'd1;
+            end
+        end
+    end
+
+    // ---- PBH: latency histogram window (QuickDraw-deficit hunt) -----------
+    // 12 free-running 32-bit bucket counters behind ONE probe instance (the
+    // 38-node hub's name table already reads back corrupted; do not grow the
+    // deck). JTAG writes the 4-bit SOURCE to select a bucket; the probe shows
+    // that counter. Buckets by DTACK-cycle length in clk_sys ticks:
+    //   sel 0-5  = prog (fetch):  <=4, 5, 6, 7, 8, >=9
+    //   sel 6-11 = data:          <=4, 5, 6, 7, 8, >=9
+    // The mode of the distribution = TG68K's effective minimum through our
+    // DTACK path; mass above the mode = reclaimable slot-alignment waits.
+    // Reader: scripts/bushist.tcl (selector scan x2 snapshots, mod-2^32).
+    // Cross-check: sum of prog buckets tracks PBL1, data buckets track PBL3.
+    // (bh storage + bh_idx are declared above the PBL always block, which is
+    // the array's single driver.)
+    altsource_probe #(
+        .instance_id ("PBH0"), .probe_width (32), .source_width(4),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbh0 (.probe(bh[(bh_sel <= 4'd11) ? bh_sel : 4'd0]), .source(bh_sel),
+               .source_clk(clk), .source_ena(1'b1));
+
+    altsource_probe #(
+        .instance_id ("PBL0"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbl0 (.probe(bl_clk), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PBL1"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbl1 (.probe(bl_prog_cnt), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PBL2"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbl2 (.probe(bl_prog_sum), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PBL3"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbl3 (.probe(bl_data_cnt), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PBL4"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbl4 (.probe(bl_data_sum), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PBL5"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbl5 (.probe({bl_max_prog, bl_max_data, bl_vpa_cnt}), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PBL6"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pbl6 (.probe(bl_vpa_sum), .source(), .source_clk(clk), .source_ena(1'b1));
 
 endmodule

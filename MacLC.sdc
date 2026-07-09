@@ -51,3 +51,28 @@ set_multicycle_path -hold  -end 1 -from [get_keepers {*TG68KdotC_Kernel*}] -to [
 # stays a normal single-cycle path and is deliberately NOT relaxed here.
 set_multicycle_path -setup -end 2 -to [get_keepers {*periph_din_reg*}]
 set_multicycle_path -hold  -end 1 -to [get_keepers {*periph_din_reg*}]
+
+# ----------------------------------------------------------------------------
+# Pixel-clock domain (pll_video) CDC — false-path the 2FF synchronizer heads.
+# ----------------------------------------------------------------------------
+# The V8 scanout runs on clk_vid (pll_video, reconfigured 25.175/15.664/58.742
+# MHz). sys_top.sdc decouples every clock domain with set_clock_groups, but
+# its core-PLL pattern (*|pll|pll_inst|...) matches only the MAIN pll — the
+# pll_video clock landed in NO group, so every framework path touching
+# CLK_VIDEO (ascal video-in, OSD, HDMI transfer) was timed against unrelated
+# domains: design-wide false violations (worst -27.9 ns, clk_sys TNS -89k).
+# Declare it asynchronous to everything else, exactly like pll_hdmi/pll_audio.
+#
+# The deliberate clk_sys<->clk_vid crossings this blesses are all safe by
+# construction: (a) dual-clock M10Ks (vram_bram framebuffer, ariel palette —
+# no timed cross-port arc), (b) 2FF *_meta synchronizers (config into the
+# video module, video-domain reset, VBL/HBL back into clk_sys), and (c) the
+# quasi-static words_per_line bus into addrController's VRAM write packing —
+# incoherent only across a monitor/depth change, when the guest redraws the
+# whole screen anyway.
+set_clock_groups -asynchronous -group [get_clocks {emu|pllv|*|divclk}]
+
+# Belt-and-braces documentation of the synchronizer heads (redundant with the
+# clock group above, harmless).
+set_false_path -to [get_keepers {*vmode_meta* *monid_meta* *tbyp_meta* *tsel_meta*}]
+set_false_path -to [get_keepers {*vidrst_meta* *vbl_meta* *hbl_meta*}]

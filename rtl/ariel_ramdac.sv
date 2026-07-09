@@ -2,11 +2,15 @@
 // Palette controller for Mac LC V8 video
 //
 // On real hardware the RAMDAC is clocked by V8's CULTDAC0 output (pixel
-// clock). Here we use clk_sys directly; the pixel-clock divider lives in
-// maclc_v8_video.sv. See plan_040526.md Step 4.
+// clock). The video lookup port now IS in the pixel-clock domain (clk_pix,
+// matching the schematic); the CPU register side stays on clk_sys. The
+// palette RAM is a dual-clock M10K — the crossing lives inside the primitive
+// (no_rw_check: a CPU palette write racing a lookup of the same entry can
+// only tint one pixel for one frame).
 
 module ariel_ramdac(
     input clk_sys,
+    input clk_pix,   // pixel clock (video lookup port); sim passes clk_sys
     input reset,
 
     // CPU interface (mapped at 0x524000-0x525FFF)
@@ -43,9 +47,10 @@ localparam REG_KEY_COLOR  = 2'd3;
 // Compute byte register from A1 and LDS
 wire [1:0] byte_reg = {reg_addr[0], ~lds_n};
 
-// Dual-port palette RAM: port A = CPU, port B = video lookup
-// 256 entries x 24 bits (8:8:8 RGB)
-(* ramstyle = "M10K" *) reg [23:0] palette [0:255];
+// Dual-port palette RAM: port A = CPU (clk_sys), port B = video lookup
+// (clk_pix). 256 entries x 24 bits (8:8:8 RGB). no_rw_check: the two ports
+// are in different clock domains (see header).
+(* ramstyle = "M10K,no_rw_check" *) reg [23:0] palette [0:255];
 
 // Palette address counter
 reg [7:0] palette_addr;
@@ -89,8 +94,10 @@ wire [7:0] init_b =
     (init_addr[7:5] == 3'd6) ? init_bri :              // white/grey
                                8'h00;
 
-// Video lookup (port B) - synchronous read for block RAM inference
-always @(posedge clk_sys) begin
+// Video lookup (port B) - synchronous read for block RAM inference.
+// Pixel-clock domain: maclc_v8_video issues pixel_index and consumes rgb_out
+// one clk_pix later (its de_d1 pipeline compensates exactly this latency).
+always @(posedge clk_pix) begin
     rgb_out <= palette[pixel_index];
 end
 

@@ -8,11 +8,24 @@ This is a Macintosh LC emulation core for the MiSTer FPGA platform. It's based o
 
 ## Build Commands
 
+**See [BUILD.md](BUILD.md) for the full scripted CLI build/deploy flow** (setup,
+`scripts/build_only.sh` modes, status output, running multiple builds on one host,
+and porting the toolchain to other cores).
+
 ### FPGA Build (Quartus)
-The project uses Intel Quartus 17.0.2 Lite Edition:
+The project uses Intel Quartus 17.0.2 Lite Edition.
+
+**GUI:**
 - Open `MacLC.qpf` in Quartus
 - Compile to generate RBF output in `output_files/`
 - Deploy RBF to MiSTer SD card root
+
+**CLI (see [BUILD.md](BUILD.md)):**
+```bash
+bash scripts/setup_env.sh     # first time: create scripts/local.env, then set QUARTUS_BIN
+bash scripts/build_only.sh    # full compile -> output_files/MacLC.rbf + status summary
+bash scripts/deploy_screenshot.sh   # optional: push + launch on the MiSTer
+```
 
 ### Verilator Simulation
 ```bash

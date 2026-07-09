@@ -157,6 +157,37 @@ if {[info exists idx(PSDT)]} {
         [expr {($sd>>24)&0xFF}] $mx [expr {$mx / 32500.0}]]
 }
 
+# ---- PFL0/PFL1: floppy read-path diagnostics (internal drive) -----------------
+# PFL0 = {byte_cnt[15:0], miss_cnt[15:0]} — counted ONLY while the OS is
+# positioned to read (phases parked on RDDATA0/1, drive enabled). Wrapping;
+# deltas over the 1 s window below. Healthy 800K read: bytes/s ≈ 3900 while
+# sectors stream, miss/s = 0. Climbing miss = SDRAM extra-slot starvation.
+# PFL1 = {track[6:0], side, iwm_latch[7:0], step_cnt[7:0], disk_data[7:0]}.
+# During a GCR read disk_data/iwm_latch must be legal Sony codes (>= 0x96).
+if {[info exists idx(PFL0)]} {
+    set f0a [rd PFL0]
+    after 1000
+    set f0b [rd PFL0]
+    set b0 [expr {($f0a>>16)&0xFFFF}]; set b1 [expr {($f0b>>16)&0xFFFF}]
+    set m0 [expr {$f0a&0xFFFF}];       set m1 [expr {$f0b&0xFFFF}]
+    set db [expr {($b1 - $b0) & 0xFFFF}]
+    set dm [expr {($m1 - $m0) & 0xFFFF}]
+    set verdict "IDLE (no RDDATA polling)"
+    if {$db > 0 && $dm == 0} { set verdict "READING — delivery healthy" }
+    if {$dm > 0}             { set verdict "STARVING — SDRAM refill missing byte slots" }
+    puts [format "PFL0 floppy     : byte_cnt=%u (+%u/s)  miss_cnt=%u (+%u/s)  => %s" \
+        $b1 $db $m1 $dm $verdict]
+    set f1 [rd PFL1]
+    set trk  [expr {($f1>>25)&0x7F}]
+    set side [expr {($f1>>24)&1}]
+    set lat  [expr {($f1>>16)&0xFF}]
+    set stp  [expr {($f1>>8)&0xFF}]
+    set dat  [expr {$f1&0xFF}]
+    puts [format "PFL1 floppy     : track=%u side=%u iwm_latch=%02X step_cnt8=%u disk_data=%02X%s" \
+        $trk $side $lat $stp $dat \
+        [expr {($dat != 0 && $dat < 0x96) ? "  (NOT a legal GCR code!)" : ""}]]
+}
+
 # ---- PRC0 / PRT1-3: #3 reboot isolation (SCSI-abort trail + init entry) -------
 # busrst = # of SCSI bus resets (driver aborts). sr2700 = # of boot-inits seen by
 # opcode (move #$2700,sr; cold boot = 1, +1 if the reboot re-runs SR setup).
@@ -245,10 +276,10 @@ puts [format "  sd_ack_seen=%d%d io_ack_seen=%d%d live io_rd=%d%d io_wr=%d%d io_
     [expr {($p3>>1)&1}] [expr {($p3>>0)&1}]]
 
 set w [rd PSCW]
-puts [format "PSCW wr-stall   : data_cnt=%d phase=%s done=%d io_wr=%d io_ack=%d io_busy=%d buf_sel=%d cmd_write=%d tlen=%d req=%d" \
-    [expr {$w&0xFFFF}] [lindex $phn [expr {($w>>16)&7}]] \
-    [expr {($w>>19)&1}] [expr {($w>>20)&1}] [expr {($w>>21)&1}] [expr {($w>>22)&1}] \
-    [expr {($w>>23)&1}] [expr {($w>>24)&1}] [expr {($w>>25)&0x3F}] [expr {($w>>31)&1}]]
+puts [format "PSCW busreset   : valid=%d count=%d | at 1st reset: max_phase=%s read_done=%d sel_seen=%d last_op=%02X | live: max_phase=%s read_done=%d" \
+    [expr {($w>>31)&1}] [expr {($w>>19)&0x7F}] \
+    [lindex $phn [expr {($w>>28)&7}]] [expr {($w>>27)&1}] [expr {($w>>26)&1}] [expr {($w>>11)&0xFF}] \
+    [lindex $phn [expr {($w>>8)&7}]] [expr {($w>>7)&1}]]
 
 set n [rd PSNC]
 puts [format "PSNC dma engine : dreq=%d req=%d ack=%d dma_en=%d dma_ack=%d ack_busy=%d holdoff=%d mr_dma=%d pmatch=%d word=%d long=%d tcr=%X dack_beats=%d" \

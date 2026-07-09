@@ -1,9 +1,21 @@
 // Mac LC V8 Video Controller - FIXED
 // Supports 1, 2, 4, 8, and 16 bpp modes correctly
+//
+// CLOCKING: `clk_sys` (historic name) is the SCANOUT clock. On the FPGA it is
+// the dedicated per-monitor pixel clock from pll_video (25.175 / 15.664 /
+// 58.742 MHz, muxed by monitor_id in MacLC.sv) with pix_ce tied 1. In
+// the Verilator sim it stays the true 32.5 MHz clk_sys with pix_ce = /2
+// toggle (the historic 16.25 MHz behavior — keeps sim frame counts
+// unchanged). NB: no comment line here may START with the word "Verilator"
+// after the slashes — that parses as a Verilator metacomment and errors.
+// Config inputs (video_mode/monitor_id/test_*) originate in the real clk_sys
+// domain and are 2FF-synced below; the *_meta stages are false-pathed in
+// MacLC.sdc.
 
 module maclc_v8_video(
     input clk_sys,
     input clk8_en_p,
+    input pix_ce,     // pixel advance enable: FPGA 1'b1, sim /2 toggle
     input reset,
 
     input [2:0] video_mode,
@@ -40,12 +52,27 @@ module maclc_v8_video(
 reg [10:0] h_total, h_active, h_sync_start, h_sync_end;
 reg [9:0] v_total, v_active, v_sync_start, v_sync_end;
 
+// --- Config CDC: 2FF sync into the scanout clock domain --------------------
+// video_mode/monitor_id/test_* are clk_sys-domain, quasi-static (OSD / guest
+// mode set). Worst case on change = one mis-rendered frame. In sim (same
+// clock) this only adds two cycles of latency.
+reg [2:0] vmode_meta, vmode_v;
+reg [3:0] monid_meta, monid_v;
+reg       tbyp_meta,  tbyp_v;
+reg [1:0] tsel_meta,  tsel_v;
+always @(posedge clk_sys) begin
+    vmode_meta <= video_mode;       vmode_v <= vmode_meta;
+    monid_meta <= monitor_id;       monid_v <= monid_meta;
+    tbyp_meta  <= test_bypass_vram; tbyp_v  <= tbyp_meta;
+    tsel_meta  <= test_pattern_sel; tsel_v  <= tsel_meta;
+end
+
 // Bits per pixel and fetch mask configuration
 reg [4:0] bits_per_pixel; // 1, 2, 4, 8, 16
 reg [3:0] fetch_mask;     // When to fetch new word
 
 always @(*) begin
-    case (video_mode)
+    case (vmode_v)
         3'd0: begin bits_per_pixel = 1;  fetch_mask = 4'hF; end // 1bpp: Fetch every 16
         3'd1: begin bits_per_pixel = 2;  fetch_mask = 4'h7; end // 2bpp: Fetch every 8
         3'd2: begin bits_per_pixel = 4;  fetch_mask = 4'h3; end // 4bpp: Fetch every 4
@@ -57,7 +84,7 @@ end
 
 always @(*) begin
     // Standard V8 monitor timings
-    case (monitor_id)
+    case (monid_v)
         4'h1: begin // 12" RGB (512x384)
              h_total = 11'd832; h_active = 11'd640; // Note: MAME maps active to 512, but V8 uses 640 timing
              h_sync_start = 11'd656; h_sync_end = 11'd752;
@@ -82,21 +109,14 @@ end
 reg [10:0] h_count;
 reg [9:0] v_count;
 
-// Pixel clock enable: divide clk_sys by 2
-// clk_sys=32.5MHz / 2 = 16.25MHz pixel clock (close to Mac LC's 15.6672MHz)
-// NOTE: a fractional (Bresenham) pix_en for a 25.175MHz VGA dot clock was tried
-// and REVERTED — with CLK_VIDEO fixed at clk_sys, a non-uniform CE_PIXEL makes
-// the clk_sys-cycles-per-line jitter, which the scaler renders as a shaky image.
-// A proper 640x480@60Hz needs a dedicated 25.175MHz PLL clock, not a fractional enable.
-reg pix_div;
-always @(posedge clk_sys) begin
-    if (reset)
-        pix_div <= 0;
-    else
-        pix_div <= ~pix_div;
-end
-
-wire pix_en = pix_div;
+// Pixel advance enable — now an INPUT (pix_ce). FPGA: this module runs on the
+// dedicated pll_video pixel clock with pix_ce=1 (every edge = one pixel).
+// Sim: clk_sys with an external /2 toggle = the historic 16.25 MHz cadence.
+// HISTORY: a fractional (Bresenham) pix_en for a 25.175MHz VGA dot clock was
+// tried and REVERTED — with CLK_VIDEO fixed at clk_sys, a non-uniform CE_PIXEL
+// makes the clk_sys-cycles-per-line jitter, which the scaler renders as a
+// shaky image. Hence the real PLL clock (pll_video.v), not a fractional enable.
+wire pix_en = pix_ce;
 
 always @(posedge clk_sys) begin
     ce_pix <= pix_en;
@@ -112,16 +132,33 @@ always @(posedge clk_sys) begin
     end
 end
 
-reg de_raw;  // Internal DE before pipeline delay
+// de_raw must be COMBINATIONAL (aligned with pixel_index, which is combinational
+// from h_count via pix_word): the de_d1/de registers below then add exactly the
+// same +1(palette)+1(output) clk_sys latency as the RGB data path, so DE opens
+// with pixel 0's color in vga_rgb. When de_raw was registered on the pix_en grid
+// it entered the chain one full pixel late — the output stage blanked (sim: col0
+// BLACK) or the scaler sampled the primed index's color (FPGA: col0 WHITE in
+// 1bpp, dark 0x0F in 4bpp) and the visible line shifted one pixel. The
+// pix_en-registered hsync/hblank/vblank OUTPUTS below are already +2 clk_sys
+// from the h_count grid = the same total delay as the fixed RGB path, so they
+// stay as-is.
+wire de_raw = (h_count < h_active) && (v_count < v_active);
 
+// Sync/blank outputs: TWO ungated register stages = +2 clk from the h_count
+// grid — the same total delay as the RGB path (de_raw -> de_d1 -> de), in BOTH
+// clocking configurations. (The previous single pix_en-gated stage equalled
+// +2 clk only when pix_en was a /2 enable; with pix_ce=1 it would lead the
+// RGB path by one pixel.)
+reg hsync_p1, vsync_p1, hblank_p1, vblank_p1;
 always @(posedge clk_sys) begin
-    if (pix_en) begin
-        hsync <= (h_count >= h_sync_start && h_count < h_sync_end);
-        vsync <= (v_count >= v_sync_start && v_count < v_sync_end);
-        hblank <= (h_count >= h_active);
-        vblank <= (v_count >= v_active);
-        de_raw <= (h_count < h_active) && (v_count < v_active);
-    end
+    hsync_p1  <= (h_count >= h_sync_start && h_count < h_sync_end);
+    vsync_p1  <= (v_count >= v_sync_start && v_count < v_sync_end);
+    hblank_p1 <= (h_count >= h_active);
+    vblank_p1 <= (v_count >= v_active);
+    hsync  <= hsync_p1;
+    vsync  <= vsync_p1;
+    hblank <= hblank_p1;
+    vblank <= vblank_p1;
 end
 
 // COMBINATIONAL blanks (aligned to h_count/v_count), used by the fetch and display
@@ -258,6 +295,16 @@ wire [3:0] px_per_word =
 // lag one pix_en, which left col 0 showing the primed pixel_shift (=0 -> 0x7F white
 // in 1bpp) and shifted each line right by one. At h_count==0 v_count has already
 // advanced to this line, so the word-0 read linebuf[{v_count[0],0}] is correct.
+//
+// pixel_shift is a REGISTERED shift register, so even with the load at h_count==0
+// its output lags the load by one pixel: col 0 still displayed the primed value
+// (0x7F = WHITE in 1bpp on the ROM checkerboard; 0x0F in 4bpp, dark, which is why
+// the System desktop masked it) and the whole line still rendered one pixel right.
+// Fix: on a LOAD cycle present the freshly-read word COMBINATIONALLY (pix_word
+// below) and load pixel_shift PRE-SHIFTED by one pixel, so the shift-register
+// cycles line up with h_count from col 0 onward. px_per_word (= pixels-1) is
+// unchanged: the first pixel comes from disp_word, the remaining px_per_word
+// pixels from the pre-shifted register.
 always @(posedge clk_sys) begin
     if (reset) begin
         disp_idx    <= 0;
@@ -273,7 +320,16 @@ always @(posedge clk_sys) begin
             video_data  <= 16'h0000;
         end else if (px_in_word == 0) begin
             // Load a fresh word (async read of word disp_idx), advance pointer.
-            pixel_shift <= disp_word;
+            // The word's FIRST pixel is displayed THIS cycle via pix_word; store
+            // the register pre-shifted so pixel 2 of the word is at the MSB next
+            // cycle.
+            case (bits_per_pixel)
+                5'd1:  pixel_shift <= {disp_word[14:0], 1'b0};
+                5'd2:  pixel_shift <= {disp_word[13:0], 2'b0};
+                5'd4:  pixel_shift <= {disp_word[11:0], 4'b0};
+                5'd8:  pixel_shift <= {disp_word[7:0],  8'b0};
+                default: pixel_shift <= disp_word;
+            endcase
             video_data  <= disp_word;
             disp_idx    <= disp_idx + 1'b1;
             px_in_word  <= px_per_word;
@@ -290,6 +346,12 @@ always @(posedge clk_sys) begin
     end
 end
 
+// First pixel of every word comes combinationally from the line buffer (the
+// registered pixel_shift only becomes valid one pixel later — the residual
+// left-edge line / one-pixel line shift).
+wire        pix_load  = (px_in_word == 0) && !(hblank_c || vblank_c);
+wire [15:0] pix_word  = pix_load ? disp_word : pixel_shift;
+
 reg [7:0] pixel_index_real;
 reg [7:0] pixel_index_test;
 wire [7:0] pixel_index;
@@ -303,10 +365,10 @@ wire [7:0] pixel_index;
 // 8bpp: direct 0x00-0xFF
 always @(*) begin
     case (video_mode)
-        3'd0: pixel_index_real = {pixel_shift[15], 7'b1111111};            // 1bpp: 0x7F or 0xFF
-        3'd1: pixel_index_real = {pixel_shift[15:14], 6'b111111};          // 2bpp: 0x3F, 0x7F, 0xBF, 0xFF
-        3'd2: pixel_index_real = {pixel_shift[15:12], 4'b1111};            // 4bpp: 0x0F-0xFF
-        3'd3: pixel_index_real = pixel_shift[15:8];                        // 8bpp: direct
+        3'd0: pixel_index_real = {pix_word[15], 7'b1111111};               // 1bpp: 0x7F or 0xFF
+        3'd1: pixel_index_real = {pix_word[15:14], 6'b111111};             // 2bpp: 0x3F, 0x7F, 0xBF, 0xFF
+        3'd2: pixel_index_real = {pix_word[15:12], 4'b1111};               // 4bpp: 0x0F-0xFF
+        3'd3: pixel_index_real = pix_word[15:8];                           // 8bpp: direct
         default: pixel_index_real = 8'd0;
     endcase
 end
@@ -317,7 +379,7 @@ end
 //   2 = 8x8 checker            (h_count[3] XOR v_count[3] selects two extreme indices)
 //   3 = h XOR v gradient       (classic XOR pattern, exercises all 256 entries)
 always @(*) begin
-    case (test_pattern_sel)
+    case (tsel_v)
         2'd0: pixel_index_test = h_count[8:1];
         2'd1: pixel_index_test = v_count[7:0];
         2'd2: pixel_index_test = (h_count[3] ^ v_count[3]) ? 8'h00 : 8'hFF;
@@ -326,7 +388,7 @@ always @(*) begin
     endcase
 end
 
-assign pixel_index = test_bypass_vram ? pixel_index_test : pixel_index_real;
+assign pixel_index = tbyp_v ? pixel_index_test : pixel_index_real;
 assign palette_addr = pixel_index;
 
 // Pipeline delay: palette RAM read is synchronous (1-cycle latency),

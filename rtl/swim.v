@@ -83,7 +83,19 @@ module swim
 	input dskReadAckInt,
 	output [21:0] dskReadAddrExt,
 	input dskReadAckExt,
-	input [7:0] dskReadData
+	input [7:0] dskReadData,
+
+	// --- diagnostic passthroughs (PFLP probes; internal drive only) ---
+	output [15:0] dbg_flp_byte_cnt,
+	output [15:0] dbg_flp_miss_cnt,
+	output [7:0]  dbg_flp_disk_data,
+	output [6:0]  dbg_flp_track,
+	output        dbg_flp_side,
+	output [15:0] dbg_flp_step_cnt,
+	output [7:0]  dbg_iwm_latch,     // live IWM read-data latch
+	output        dbg_flp_byte_stb,  // 1-clk delivered-byte strobe (capture ring)
+	output [7:0]  dbg_flp_raw,      // pre-encoder SDRAM fetch latch (internal drive)
+	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -114,6 +126,7 @@ module swim
 	wire advanceDriveHead; // prevents overrun when debugging, does not exit on a real Mac!
 	reg [7:0] writeData;
 	reg [7:0] readDataLatch;
+	assign dbg_iwm_latch = readDataLatch;  // PFLP live view
 	wire _iwmBusy, _writeUnderrun;
 	assign _iwmBusy = 1'b1; // for writes, a value of 1 here indicates the IWM write buffer is empty
 	assign _writeUnderrun = 1'b1;
@@ -136,12 +149,14 @@ module swim
 	wire mfm_pull_int = mfm_advance && !selectExternalDrive;
 	wire mfm_pull_ext = mfm_advance &&  selectExternalDrive;
 
-	// Head-select (SEL/HDSEL) source: in ISM mode it is Mode-register bit5
-	// (MAME swim1.cpp: m_hdsel_cb((m_ism_mode>>5)&1)); in IWM mode it is VIA PA5.
-	// floppy.v indexes the drive-sense register as {ca2,ca1,ca0,SEL}; sense regs
-	// 0xC-0xF (the SuperDrive identify nibble) all need SEL=1, which in ISM mode
-	// the ROM asserts via Mode bit5, not the VIA. See findings doc.
-	wire effSEL = ism_mode ? ism_mode_reg[5] : SEL;
+	// Head-select (SEL/HDSEL) source. On the Mac LC this is V8 VIA1 Port-A bit5 in
+	// EVERY mode: maclc.cpp never wires the SWIM's hdsel_cb, so ISM Mode bit5 does
+	// nothing (v8.cpp:258 drives write_hdsel from PA5). The MFM session and the
+	// high sense-register bank (0xC-0xF, incl. the 0xD MFMModeOn verify) are all
+	// reached with PA5, not Mode[5]. (Reverts the 06-13 "Fix C" effSEL=Mode[5],
+	// which left SEL stuck 0 in ISM and made side 1 / high sense regs unreadable.)
+	// F11, MAME 0.264 ground truth. On hdsel_cb machines (Quadras) Mode[5] matters.
+	wire effSEL = SEL;
 
 	floppy floppyInt
 	(
@@ -175,7 +190,17 @@ module swim
 		.mfm_pull(mfm_pull_int),
 		.mfm_byte(mfm_byte_int),
 		.mfm_mark(mfm_mark_int),
-		.mfm_crc0(mfm_crc0_int)
+		.mfm_crc0(mfm_crc0_int),
+
+		.dbg_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_disk_image_data(dbg_flp_disk_data),
+		.dbg_drive_track(dbg_flp_track),
+		.dbg_drive_side(dbg_flp_side),
+		.dbg_step_cnt(dbg_flp_step_cnt),
+		.dbg_byte_stb(dbg_flp_byte_stb),
+		.dbg_raw_byte(dbg_flp_raw),
+		.dbg_gcr_addr(dbg_flp_gcr_addr)
 	);
 
 	floppy floppyExt
@@ -341,10 +366,14 @@ module swim
 		else begin
 			// IWM mode reads (original logic)
 			case ({q7Next,q6Next})
-				2'b00: // data-in register (from disk drive)
-					dataOutLo <= readDataLatch;
-				2'b01: // IWM status register
-					dataOutLo <= { (selectExternalDriveNext ? senseExt : senseInt), 1'b0, diskEnableExt & diskEnableInt, iwmMode };
+				2'b00: // data-in register: MAME iwm dispatch is `active ? data : FF`
+				       // — an idle controller floats the data bus high. (Was
+				       // readDataLatch unconditionally; matches lbmactwo/MAME.)
+					dataOutLo <= (diskEnableExt | diskEnableInt) ? readDataLatch : 8'hFF;
+				2'b01: // IWM status register: bit7=sense, bit5=ACTIVE (any drive
+				       // selected — MAME ORs the enables; was AND = never active
+				       // unless both drives on). bits4:0 = IWM mode. F9.
+					dataOutLo <= { (selectExternalDriveNext ? senseExt : senseInt), 1'b0, diskEnableExt | diskEnableInt, iwmMode };
 				2'b10: // handshake
 					dataOutLo <= { _iwmBusy, _writeUnderrun, 6'b000000 };
 				2'b11: // IWM mode register (write-only) or write data register
@@ -557,26 +586,48 @@ module swim
 	// IWM read data latch (unchanged from original)
 	// ================================================================
 	wire iwmRead = (_cpuRW == 1'b1 && selectSWIM == 1'b1 && _cpuUDS == 1'b0 && !ism_mode);
+	wire anyDiskEnable = diskEnableExt | diskEnableInt;
 	reg [3:0] readLatchClearTimer;
+	reg [11:0] readDataArmDelay;   // post-enable squelch (~126 us at 8.125 MHz cen)
+	reg anyDiskEnableD;
+	wire readDataArmed = (readDataArmDelay == 12'd0);
 	always @(posedge clk or negedge _reset) begin
 		if (_reset == 1'b0) begin
 			readDataLatch <= 0;
 			readLatchClearTimer <= 0;
+			readDataArmDelay <= 0;
+			anyDiskEnableD <= 0;
 		end
 		else if(cen) begin
+			anyDiskEnableD <= anyDiskEnable;
+
+			if (readDataArmDelay != 0) begin
+				readDataArmDelay <= readDataArmDelay - 1'b1;
+			end
+
 			// a countdown timer governs how long after a data latch read before the latch is cleared
 			if (readLatchClearTimer != 0) begin
 				readLatchClearTimer <= readLatchClearTimer - 1'b1;
 			end
 
+			// MAME clears the IWM data register when the controller enters active
+			// read mode; squelch briefly so the mount's first data poll never sees
+			// a stale idle-drive byte. (Ported from lbmactwo iwm.v, HW-validated.)
+			if (anyDiskEnable && !anyDiskEnableD) begin
+				readDataLatch <= 0;
+				readLatchClearTimer <= 0;
+				readDataArmDelay <= 12'h400;
+			end
+
 			// the conclusion of a valid CPU read from the IWM will start the timer to clear the latch
-			if (iwmRead && readDataLatch[7]) begin
+			else if (iwmRead && readDataLatch[7]) begin
 				readLatchClearTimer <= 4'hD; // clear latch 14 clocks after the conclusion of a valid read
 			end
 
-			// when the drive indicates that a new byte is ready, latch it
+			// when the drive indicates that a new byte is ready, latch it (only
+			// with a drive enabled and the post-enable squelch elapsed)
 			// NOTE: the real IWM must self-synchronize with the incoming data to determine when to latch it
-			if (newByteReady) begin
+			if (anyDiskEnable && readDataArmed && newByteReady) begin
 				readDataLatch <= readData;
 			end
 			else if (readLatchClearTimer == 1'b1) begin

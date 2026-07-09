@@ -391,8 +391,8 @@ module emu
 		.ps2_mouse(ps2_mouse)
 	);
 
-	assign CLK_VIDEO = clk_sys;
-	assign CE_PIXEL  = v8_ce_pix;
+	assign CLK_VIDEO = clk_vid;
+	assign CE_PIXEL  = v8_ce_pix;   // constant 1 now (pix_ce tied high below)
 
 	// Video Output — straight V8 video, no overlays.
 	assign VGA_R  = v8_vga_r;
@@ -403,6 +403,105 @@ module emu
 	assign VGA_HS = v8_hsync;
 	assign VGA_F1 = 0;
 	assign VGA_SL = 0;
+
+	// ------------------------------------------------------------------------
+	// Dedicated pixel clock (pll_video) — true per-monitor scanout rates.
+	// The V8 used to scan out at clk_sys/2 = 16.25 MHz in every mode, so VGA
+	// 640x480 (800x525 total) refreshed at 38.7 Hz. clk_vid now carries
+	// 25.175 MHz (VGA, 59.94 Hz) / 15.664 MHz (12" RGB, 60.14 Hz) / 58.742 MHz
+	// (Portrait tap, OSD-unreachable today). CPU/SDRAM/System-Tick stay on
+	// clk_sys (CPU speed and the a937c4c tick are pixel-clock independent by
+	// construction — do NOT re-tie ticks/onesec to vblank).
+	//
+	// The rate switch is a runtime PLL RECONFIG of the single output counter
+	// (ao486 pattern, sys/pll_cfg): CLK_VIDEO must be a raw PLL output —
+	// sys_top's clock-select blocks reject a muxed clock (Fitter Err 15836),
+	// which killed the earlier cyclonev_clkselect approach. Only C0 changes;
+	// the VCO (704.9 MHz) stays put, so one register write + start suffices.
+	// The static config is C0=12 (58.74 MHz) so STA constrains the clk_vid
+	// domain at the FASTEST runtime rate; the FSM retargets the OSD-selected
+	// monitor right after first lock (video is reset-held until locked).
+	wire clk_vid, pll_video_locked;
+	wire [63:0] reconfig_to_pll, reconfig_from_pll;
+	pll_video pllv
+	(
+		.refclk(CLK_50M),
+		.rst(1'b0),
+		.outclk_0(clk_vid),
+		.locked(pll_video_locked),
+		.reconfig_to_pll(reconfig_to_pll),
+		.reconfig_from_pll(reconfig_from_pll)
+	);
+
+	wire        pixcfg_waitrequest;
+	reg         pixcfg_write;
+	reg   [5:0] pixcfg_address;
+	reg  [31:0] pixcfg_data;
+	pll_cfg pll_video_cfg
+	(
+		.mgmt_clk(CLK_50M),
+		.mgmt_reset(0),
+		.mgmt_waitrequest(pixcfg_waitrequest),
+		.mgmt_read(0),
+		.mgmt_readdata(),
+		.mgmt_write(pixcfg_write),
+		.mgmt_address(pixcfg_address),
+		.mgmt_writedata(pixcfg_data),
+		.reconfig_to_pll(reconfig_to_pll),
+		.reconfig_from_pll(reconfig_from_pll)
+	);
+
+	// C0 counter value per monitor: {[22:18] counter#=0, [17] odd-div,
+	// [16] bypass, [15:8] high count, [7:0] low count} — layout per
+	// sys/pll_cfg/altera_pll_reconfig_core.v:557-569.
+	wire [31:0] pix_c0 = (v8_monitor_id == 4'h2) ? 32'h00021716 :  // /45 = 15.664 MHz
+	                     (v8_monitor_id == 4'h1) ? 32'h00000606 :  // /12 = 58.742 MHz
+	                                               32'h00000E0E;   // /28 = 25.175 MHz
+	always @(posedge CLK_50M) begin : pix_reconfig
+		reg [31:0] c0_cur = 32'h00000E0E;  // = the static /28 VGA config: a VGA
+		                                   // boot performs NO reconfig (the boot-
+		                                   // time PLL glitch BERR-stormed the HPS
+		                                   // SCSI path); only an OSD switch to
+		                                   // 12" retargets, mid-session
+		reg [31:0] c0_s1, c0_s2;
+		reg [2:0]  state = 0;
+		c0_s1 <= pix_c0;                   // settle across clk_sys -> CLK_50M
+		c0_s2 <= c0_s1;
+		if (!pixcfg_waitrequest) begin
+			pixcfg_write <= 0;
+			if (pll_video_locked) begin
+				if (state) state <= state + 1'd1;
+				case (state)
+					0: if (c0_s2 == c0_s1 && c0_s2 != c0_cur) begin
+							c0_cur <= c0_s2;
+							state  <= 1;
+						end
+					1: begin pixcfg_address <= 0; pixcfg_data <= 0;      pixcfg_write <= 1; end // polled mode
+					3: begin pixcfg_address <= 5; pixcfg_data <= c0_cur; pixcfg_write <= 1; end // C0 counter
+					5: begin pixcfg_address <= 2; pixcfg_data <= 0;      pixcfg_write <= 1; end // start
+				endcase
+			end
+		end
+	end
+
+	// Video-domain reset: hold scanout in reset until its PLL locks, released
+	// synchronously in clk_vid. (*_meta = 2FF first stage, false-pathed in
+	// MacLC.sdc.)
+	reg vidrst_meta = 1'b1, vidrst_s = 1'b1;
+	always @(posedge clk_vid) begin
+		vidrst_meta <= ~n_reset || ~pll_video_locked;
+		vidrst_s    <= vidrst_meta;
+	end
+
+	// clk_vid -> clk_sys: VBL/HBL levels for the guest-facing consumers
+	// (pseudovia VBL IRQ, VIA PB7 debug input, dbg_probes).
+	reg vbl_meta, v8_vblank_s, hbl_meta, v8_hblank_s;
+	always @(posedge clk_sys) begin
+		vbl_meta    <= v8_vblank;
+		v8_vblank_s <= vbl_meta;
+		hbl_meta    <= v8_hblank;
+		v8_hblank_s <= hbl_meta;
+	end
 
 	// ASC samples drive AUDIO_L/R directly (Commit C). Legacy DMA gone.
 	assign AUDIO_L = asc_sample_l;
@@ -883,6 +982,7 @@ module emu
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
+		.clk_pix(clk_vid),   // video lookup port in the scanout clock domain
 		.reset(~n_reset),
 		.reg_addr(cpuAddr[10:0]),
 		.uds_n(_cpuUDS),
@@ -913,7 +1013,7 @@ module emu
 		.data_out(pseudovia_dout),
 		.we(selectPseudoVIA && !_cpuRW && cpuBusControl),
 		.req(selectPseudoVIA && cpuBusControl),
-		.vblank_irq(v8_vblank),
+		.vblank_irq(v8_vblank_s),   // 2FF-synced from the clk_vid scanout domain
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
 		// SCSI flags RE-TIED-OFF (2026-06-12 evening). History of reversals:
@@ -946,6 +1046,18 @@ module emu
 		.ram_config_out(pvia_ram_config_out),
 		.ram_configured(pvia_ram_configured)
 	);
+
+	// Floppy diagnostic wires (from dataController/swim/floppy — PFLP deck)
+	wire [15:0] dbg_flp_byte_cnt;
+	wire [15:0] dbg_flp_miss_cnt;
+	wire [7:0]  dbg_flp_disk_data;
+	wire [6:0]  dbg_flp_track;
+	wire        dbg_flp_side;
+	wire [15:0] dbg_flp_step_cnt;
+	wire [7:0]  dbg_iwm_latch;
+	wire        dbg_flp_byte_stb;
+	wire [7:0]  dbg_flp_raw;
+	wire [21:0] dbg_flp_gcr_addr;
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
@@ -1012,6 +1124,103 @@ module emu
 	                   prst_armed, first_rst_seen, first_nreset, n_reset, 4'd0}),
 	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
+	// --- PFL0/PFL1: floppy (internal drive) read-path diagnostics -------------
+	// Ported from lbmactwo's PFLP/PIWM deck (the counters that root-caused its
+	// 800K bug). PFL0 = {byte_cnt[15:0], miss_cnt[15:0]}: bytes delivered vs
+	// byte slots starved WHILE the OS is positioned to read (phases on RDDATA,
+	// drive enabled). Healthy 800K read ≈ 3,900 bytes/s of byte_cnt delta and a
+	// static miss_cnt. PFL1 = {track[6:0], side, iwm_latch[7:0], step_cnt[7:0],
+	// disk_data[7:0]}: head position, seek activity, live IWM latch + live
+	// SDRAM-fed encoder byte (a stream of legal GCR bytes ≥ $96 when reading).
+	altsource_probe #(
+		.instance_id ("PFL0"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_pfl0 (.probe({dbg_flp_byte_cnt, dbg_flp_miss_cnt}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	// --- PFL1 byte-capture ring (800K content-bug hunt, 2026-07-06) -----------
+	// v2 raw-fetch instrument (2026-07-07). The v1 enc-only capture proved every
+	// data-field payload reaches the IWM ALL-ZERO while address fields are
+	// perfect — i.e. the encoder nibblizes zeros. This repack records, per
+	// delivered byte, WHAT the SDRAM fetch returned and FROM WHERE:
+	//   ring word = {gcrReadAddr[15:0], raw fetch latch[7:0], delivered enc[7:0]}
+	// 256 strobes per arm; re-arm for more windows. One capture separates:
+	// zero SDRAM content (raw==0 at a correct 0..6143 track-0 addr), a fetch
+	// address-walk fault (addr wrong/stuck), or an encoder fault (raw!=0).
+	//
+	// No new hub nodes (the ~40-node deck's name table already reads back
+	// corrupted — see rtl/dbg_probes.sv PBH0): PFL1 is widened into a dual-mode
+	// probe instead. source = {arm[10], sel[9:8], addr[7:0]}:
+	//   sel 0 = live PFL1 layout (default 0 after config — tooling-compatible)
+	//   sel 1 = ring word[addr] = {addr[15:0], raw[7:0], enc[7:0]} of strobe #addr
+	//   sel 2 = status {8'hB5, done, capturing, 2'b00, arm_cnt[3:0], 6'd0, wptr[9:0]}
+	//   sel 3 = floppy-download counters (sub-addressed by addr[1:0]):
+	//       0: {8'hD1, 4'd0, dl_words[19:0]}    accepted index-1 write slots
+	//       1: {8'hD2, 4'd0, dl_nonzero[19:0]}  ...of those, dio_data != 0
+	//       2: {8'hD3, ds, ss, mfm, hd, dio_addr[19:0]}  size-latch + last addr
+	//       3: {8'hD4, 8'd0, dl_xor[15:0]}      XOR of accepted dio_data words
+	//     Expected for a good 800K mount: dl_words = 409600 (0x64000),
+	//     dl_nonzero = the image's nonzero-word count and dl_xor = the image's
+	//     word-XOR (both computed offline by scripts/raw_compare.py).
+	// arm rising edge restarts the capture (re-armable per mount attempt).
+	// Reader: scripts/floppy_ring.tcl (arm / status / dump — bounded, one session).
+	wire [10:0] pfl1_src;
+	reg  [31:0] flp_ring [0:255];           // 1 M10K: 256 x {addr16, raw8, enc8}
+	reg  [9:0]  flp_wptr      = 10'd0;      // strobe pointer; 256 = full
+	reg         flp_capturing = 1'b0;
+	reg         flp_done      = 1'b0;
+	reg  [3:0]  flp_arm_cnt   = 4'd0;
+	reg  [1:0]  flp_arm_sync  = 2'b00;      // JTAG-domain arm bit -> clk_sys
+	reg         flp_arm_d     = 1'b0;
+	wire        flp_arm_edge  = flp_arm_sync[1] & ~flp_arm_d;
+	always @(posedge clk_sys) begin
+		flp_arm_sync <= {flp_arm_sync[0], pfl1_src[10]};
+		flp_arm_d    <= flp_arm_sync[1];
+		if (flp_arm_edge) begin
+			flp_wptr      <= 10'd0;
+			flp_capturing <= 1'b1;
+			flp_done      <= 1'b0;
+			flp_arm_cnt   <= flp_arm_cnt + 4'd1;
+		end
+		else if (flp_capturing && dbg_flp_byte_stb) begin
+			flp_ring[flp_wptr[7:0]] <= {dbg_flp_gcr_addr[15:0], dbg_flp_raw,
+			                            dbg_flp_disk_data};
+			flp_wptr <= flp_wptr + 10'd1;
+			if (flp_wptr == 10'd255) begin
+				flp_capturing <= 1'b0;
+				flp_done      <= 1'b1;
+			end
+		end
+	end
+	// readout port (address is static during a JTAG read; sync flops for form)
+	reg [7:0]  flp_raddr = 8'd0;
+	reg [31:0] flp_ring_q;
+	always @(posedge clk_sys) begin
+		flp_raddr  <= pfl1_src[7:0];
+		flp_ring_q <= flp_ring[flp_raddr];
+	end
+	wire [31:0] pfl1_live   = {dbg_flp_track, dbg_flp_side, dbg_iwm_latch,
+	                           dbg_flp_step_cnt[7:0], dbg_flp_disk_data};
+	wire [31:0] pfl1_status = {8'hB5, flp_done, flp_capturing, 2'b00,
+	                           flp_arm_cnt, 6'd0, flp_wptr};
+	// sel 3: floppy-download counters (driven next to the download handler below)
+	wire [31:0] pfl1_dl =
+		(pfl1_src[1:0] == 2'd0) ? {8'hD1, 4'd0, flp_dl_words}   :
+		(pfl1_src[1:0] == 2'd1) ? {8'hD2, 4'd0, flp_dl_nonzero} :
+		(pfl1_src[1:0] == 2'd2) ? {8'hD3, dsk_int_ds, dsk_int_ss, dsk_int_mfm,
+		                           dsk_int_hd, dio_addr[19:0]}  :
+		                          {8'hD4, 8'd0, flp_dl_xor};
+	reg  [31:0] pfl1_probe_r;
+	always @(posedge clk_sys)
+		pfl1_probe_r <= (pfl1_src[9:8] == 2'b01) ? flp_ring_q   :
+		                (pfl1_src[9:8] == 2'b10) ? pfl1_status  :
+		                (pfl1_src[9:8] == 2'b11) ? pfl1_dl      : pfl1_live;
+
+	altsource_probe #(
+		.instance_id ("PFL1"), .probe_width (32), .source_width(11),
+		.sld_auto_instance_index ("YES")
+	) cp_pfl1 (.probe(pfl1_probe_r), .source(pfl1_src),
+	           .source_clk(clk_sys), .source_ena(1'b1));
+
 	dbg_probes probes(
 		.clk(clk_sys),
 		.cpuAddr(cpuAddr[23:0]),
@@ -1054,7 +1263,7 @@ module emu
 		.asc_irq(asc_irq),
 		.asc_sample_l(asc_sample_l),
 		.pvia_video_config(pvia_video_config),
-		.v8_vblank(v8_vblank),
+		.v8_vblank(v8_vblank_s),
 		// BERR investigation (#3 cold-boot reboot loop): the ACTUAL bus-error
 		// signals, not the vector-read inference PEXC/PFR use.
 		.cpu_berr(cpu_berr),
@@ -1064,9 +1273,10 @@ module emu
 	);
 
 	maclc_v8_video v8_video(
-		.clk_sys(clk_sys),
+		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock
 		.clk8_en_p(clk8_en_p),
-		.reset(~n_reset),
+		.pix_ce(1'b1),          // every clk_vid edge = one pixel
+		.reset(vidrst_s),
 
 		// Configuration
 		.video_mode(v8_video_mode),
@@ -1096,10 +1306,12 @@ module emu
 		.vram_rdata(v8_vram_rdata)
 	);
 
-	// On-chip framebuffer (BRAM). Video reads port B (Phase 2); CPU VRAM writes
-	// are mirrored into port A. Single clk_sys domain => coherent, no CDC.
+	// On-chip framebuffer (BRAM). CPU VRAM writes land on port A (clk_sys);
+	// video reads port B in the pixel-clock domain — the CDC lives inside the
+	// dual-clock M10K primitive.
 	vram_bram vram_fb(
-		.clk(clk_sys),
+		.a_clk(clk_sys),
+		.b_clk(clk_vid),
 		.a_addr(vram_bram_waddr),
 		.a_din(memoryDataOut),
 		.a_be({~_cpuUDS, ~_cpuLDS}),
@@ -1257,8 +1469,8 @@ module emu
 		.timestamp(TIMESTAMP),
 
 		// video
-		._hblank(~v8_hblank),
-		._vblank(~v8_vblank),
+		._hblank(~v8_hblank_s),
+		._vblank(~v8_vblank_s),
 		.vid_alt(vid_alt),
 
 
@@ -1305,7 +1517,18 @@ module emu
 		.pram_wr_stb(pram_wr_stb),
 		.pram_ready(pram_ready),
 		// #3 reset-source probe: expose the Egret's 68k-reset line (Port C bit 3)
-		.egret_dbg_reset_680x0(egret_reset_680x0_w)
+		.egret_dbg_reset_680x0(egret_reset_680x0_w),
+		// PFLP floppy diagnostics (internal drive)
+		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_flp_disk_data(dbg_flp_disk_data),
+		.dbg_flp_track(dbg_flp_track),
+		.dbg_flp_side(dbg_flp_side),
+		.dbg_flp_step_cnt(dbg_flp_step_cnt),
+		.dbg_iwm_latch(dbg_iwm_latch),
+		.dbg_flp_byte_stb(dbg_flp_byte_stb),
+		.dbg_flp_raw(dbg_flp_raw),
+		.dbg_flp_gcr_addr(dbg_flp_gcr_addr)
 	);
 
 	reg disk_act;
@@ -1431,6 +1654,35 @@ module emu
 		old_cyc <= dioBusControl;
 		if(~dioBusControl) dio_write <= ioctl_wait;
 		if(old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
+	end
+
+	// --- Floppy-download acceptance counters (PFL1 sel-3 readout) -------------
+	// One count per accepted index-1 word: the same slot-exit event that clears
+	// ioctl_wait above, so this counts words that actually GOT a write slot.
+	// After an 800K mount: dl_words < 409600 means write slots are being lost
+	// core-side; dl_words full but dl_nonzero far below the image's own
+	// nonzero-word count means the HPS stream itself carried zeros.
+	reg [19:0] flp_dl_words   = 20'd0;
+	reg [19:0] flp_dl_nonzero = 20'd0;
+	reg [15:0] flp_dl_xor     = 16'd0;   // XOR of accepted dio_data words —
+	                                     // compare against the image's own XOR
+	                                     // (data-integrity check of the stream)
+	always @(posedge clk_sys) begin
+		reg dl_old_cyc  = 1'b0;
+		reg dl_old_down = 1'b0;
+		if (dio_download && !dl_old_down && dio_index[1:0] == 2'b01) begin
+			flp_dl_words   <= 20'd0;
+			flp_dl_nonzero <= 20'd0;
+			flp_dl_xor     <= 16'd0;
+		end
+		else if (dio_download && dio_index[1:0] == 2'b01 &&
+		         dl_old_cyc && !dioBusControl && dio_write) begin
+			flp_dl_words <= flp_dl_words + 20'd1;
+			flp_dl_xor   <= flp_dl_xor ^ dio_data;
+			if (dio_data != 16'h0000) flp_dl_nonzero <= flp_dl_nonzero + 20'd1;
+		end
+		dl_old_cyc  <= dioBusControl;
+		dl_old_down <= dio_download;
 	end
 
 

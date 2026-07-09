@@ -143,7 +143,19 @@ module dataController_top(
 	output        egret_dbg_tip,           // TIP from VIA (synced in Egret)
 	output        egret_dbg_byteack,       // BYTEACK from VIA (synced in Egret)
 	output        egret_dbg_reset_680x0,   // Egret holding 68K in reset
-	output        egret_dbg_cpu_reset_out  // Final _cpuReset signal
+	output        egret_dbg_cpu_reset_out, // Final _cpuReset signal
+
+	// Floppy diagnostic passthroughs (PFLP probes; internal drive)
+	output [15:0] dbg_flp_byte_cnt,
+	output [15:0] dbg_flp_miss_cnt,
+	output [7:0]  dbg_flp_disk_data,
+	output [6:0]  dbg_flp_track,
+	output        dbg_flp_side,
+	output [15:0] dbg_flp_step_cnt,
+	output [7:0]  dbg_iwm_latch,
+	output        dbg_flp_byte_stb,  // 1-clk delivered-byte strobe (capture ring)
+	output [7:0]  dbg_flp_raw,      // pre-encoder SDRAM fetch latch (internal drive)
+	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
 );
 	
 	parameter SCSI_DEVS = 2;
@@ -411,26 +423,10 @@ module dataController_top(
 		.dbg_wr(dbg_wr)
 	);
 
-	// count vblanks, and set 1 second interrupt after 60 vblanks
-	reg [5:0] vblankCount;
-	reg _lastVblank;
-	always @(posedge clk32) begin
-		if (clk8_en_n) begin
-			_lastVblank <= _vblank;
-			if (_vblank == 1'b0 && _lastVblank == 1'b1) begin
-				if (vblankCount != 59) begin
-					vblankCount <= vblankCount + 1'b1;
-				end
-				else begin
-					vblankCount <= 6'h0;
-					`ifdef VERBOSE_TRACE
-					$display("DC: ONE SECOND TICK @%0t", $time);
-					`endif
-				end
-			end
-		end
-	end
-	wire onesec = vblankCount == 59;
+	// onesec (VIA1 CA2) is derived from the fixed 60.15 Hz system tick — see
+	// the tick_60hz block below. It must NOT count video vblanks: the vblank
+	// rate is monitor-mode dependent (38.7 Hz in 640x480 VGA), which made a
+	// "second" last 1.55 s.
 
 	// VIA
 	wire [2:0] snd_vol;
@@ -581,22 +577,38 @@ module dataController_top(
 `endif
 	/* verilator lint_on STMTDLY */
 
-	// 60.15 Hz Timer for VIA1 CA1
-	// The Mac LC has a dedicated timer for the 60.15 Hz System Tick, separate from the video VBL.
-	// 8.125 MHz / 60.15 Hz ~= 135,078 cycles
+	// 60.15 Hz System Tick for VIA1 CA1 (+ derived one-second CA2).
+	// The Mac LC's V8 generates a fixed 60.15 Hz tick independent of the video
+	// mode's real vblank (MAME v8.cpp mac_6015 timer). The ROM's CA1 VBL ISR
+	// increments Ticks from this, so it paces EVERYTHING tick-driven: caret
+	// blink, double-click timing, and TickCount-paced games (POP's frame wait
+	// sits in a TickCount compare loop — verified on HW via PIFD sampling).
+	//
+	// CA1 interrupts on a single edge POLARITY, so the line must complete a
+	// full period per tick: toggle every HALF period.
+	//   8.125 MHz / 60.15 Hz = 135,078 cycles/period -> toggle every 67,539.
+	// (The previous full-period toggle halved the System Tick to 30.075 Hz.)
+	//
+	// onesec: 60 CA1 periods = 0.9975 s (the real LC's CA2 comes from the RTC
+	// at 1 Hz; 60 ticks is the closest tick-locked equivalent and is what the
+	// old vblank-counting version intended).
 	reg [17:0] tick_cnt;
 	reg tick_60hz;
+	reg [5:0] tickCount;
 
 	always @(posedge clk32) begin
 		if (clk8_en_p) begin
-			if (tick_cnt >= 135078) begin
+			if (tick_cnt >= 67538) begin
 				tick_cnt <= 0;
 				tick_60hz <= ~tick_60hz;
+				if (!tick_60hz)   // about to rise: one full tick period elapsed
+					tickCount <= (tickCount == 59) ? 6'h0 : tickCount + 1'b1;
 			end else begin
 				tick_cnt <= tick_cnt + 1'b1;
 			end
 		end
 	end
+	wire onesec = tickCount == 59;
 
 	via6522 via(
 		.clock      (clk32),
@@ -963,7 +975,18 @@ module dataController_top(
 		.dskReadAckInt(dskReadAckInt),
 		.dskReadAddrExt(dskReadAddrExt),
 		.dskReadAckExt(dskReadAckExt),
-		.dskReadData(memoryDataIn[7:0])
+		.dskReadData(memoryDataIn[7:0]),
+
+		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
+		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),
+		.dbg_flp_disk_data(dbg_flp_disk_data),
+		.dbg_flp_track(dbg_flp_track),
+		.dbg_flp_side(dbg_flp_side),
+		.dbg_flp_step_cnt(dbg_flp_step_cnt),
+		.dbg_iwm_latch(dbg_iwm_latch),
+		.dbg_flp_byte_stb(dbg_flp_byte_stb),
+		.dbg_flp_raw(dbg_flp_raw),
+		.dbg_flp_gcr_addr(dbg_flp_gcr_addr)
 	);
 
 	// SCC
