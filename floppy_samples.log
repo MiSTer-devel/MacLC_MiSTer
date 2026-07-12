@@ -1,0 +1,72 @@
+=== sample 1 17:11:59 ===
+PIFA last IF    : A06EFA (ifcnt 178 -> 243, fetching)
+PADR cpuAddr    : A15AA4  (high)
+PDRD I/O read   : F26010 (PseudoVIA) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=96
+=== sample 2 17:12:05 ===
+PIFA last IF    : A06EB6 (ifcnt 18 -> 142, fetching)
+PADR cpuAddr    : 07C988  (RAM)
+PDRD I/O read   : F01C00 (VIA1) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=D9
+=== sample 3 17:12:12 ===
+PIFA last IF    : 063436 (ifcnt 11 -> 18, fetching)
+PADR cpuAddr    : 069FA0  (RAM)
+PDRD I/O read   : F01C00 (VIA1) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=96
+=== sample 4 17:12:19 ===
+PIFA last IF    : 068020 (ifcnt 83 -> 107, fetching)
+PADR cpuAddr    : 05D326  (RAM)
+PDRD I/O read   : F01C00 (VIA1) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=96
+=== sample 5 17:12:25 ===
+PIFA last IF    : 05D0B2 (ifcnt 148 -> 137, fetching)
+PADR cpuAddr    : 7F10B8  (RAM)
+PDRD I/O read   : F26010 (PseudoVIA) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=9F
+=== sample 6 17:12:32 ===
+PIFA last IF    : A15B12 (ifcnt 14 -> 152, fetching)
+PADR cpuAddr    : 05D390  (RAM)
+PDRD I/O read   : F26010 (PseudoVIA) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=CF
+=== sample 7 17:12:39 ===
+PIFA last IF    : 05D388 (ifcnt 126 -> 176, fetching)
+PADR cpuAddr    : 053642  (RAM)
+PDRD I/O read   : F01C00 (VIA1) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=F2
+=== sample 8 17:12:45 ===
+PIFA last IF    : A19D88 (ifcnt 166 -> 69, fetching)
+PADR cpuAddr    : A0DBC8  (high)
+PDRD I/O read   : F01000 (VIA1) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=DA
+=== sample 9 17:12:52 ===
+PIFA last IF    : 063434 (ifcnt 76 -> 54, fetching)
+PADR cpuAddr    : A0A34A  (high)
+PDRD I/O read   : F01C00 (VIA1) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=96
+=== sample 10 17:12:59 ===
+PIFA last IF    : A1AA0C (ifcnt 149 -> 22, fetching)
+PADR cpuAddr    : 00E68A  (RAM)
+PDRD I/O read   : F26010 (PseudoVIA) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=DA
+=== sample 11 17:13:06 ===
+PIFA last IF    : A19E42 (ifcnt 8 -> 19, fetching)
+PADR cpuAddr    : A1C93E  (high)
+PDRD I/O read   : F01C00 (VIA1) = 0000
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=96
+=== sample 12 17:13:13 ===
+PIFA last IF    : A19CEA (ifcnt 41 -> 196, fetching)
+PADR cpuAddr    : A0DBC0  (high)
+PDRD I/O read   : F01000 (VIA1) = 9443
+PFL0 floppy     : byte_cnt=7011 (+0/s)  miss_cnt=0 (+0/s)  => IDLE (no RDDATA polling)
+PFL1 floppy     : track=0 side=0 iwm_latch=FF step_cnt8=0 disk_data=00

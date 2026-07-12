@@ -1040,7 +1040,12 @@ wire [31:0] sense_len = (tlen == 16'd256) ? 32'd4 : {16'd0, tlen};
 // are <<2-scaled at latch time.
 localparam [31:0] INQUIRY_LEN = (CDROM != 0) ? 32'd54 : 32'd36;
 wire        cd_ms30    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h30);
-wire [31:0] cd_toc_len = (cmd[9][7:6] == 2'b10) ? {16'd0, tlen[15:2], 2'b00} : 32'd4;
+// ops 00/01: MAME serves a fixed 4; clamp to the allocation as well so a
+// short alloc can never leave unserved bytes holding REQ (the 2026-06-10
+// alloc-overserve wedge class). Identical to MAME for the observed alloc=4.
+wire [31:0] cd_toc_len = (cmd[9][7:6] == 2'b10) ? {16'd0, tlen[15:2], 2'b00}
+                       : (tlen < 16'd4)         ? {16'd0, tlen}
+                       :                          32'd4;
 // A real target returns min(allocation length, actual response size) and then
 // switches to STATUS; the initiator detects the early phase change via the
 // BSR phase-mismatch bit. Serving the raw allocation length (previous

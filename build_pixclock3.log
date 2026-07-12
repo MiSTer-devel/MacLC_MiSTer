@@ -1,0 +1,30 @@
+    Info (332119):    15.696               0.000 altera_reserved_tck 
+    Info (332119):    18.921               0.000 pll_audio|pll_audio_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk 
+Info (332114): Report Metastability: Found 391 synchronizer chains.
+    Info (332114): Design MTBF is not calculated because the design doesn't meet its timing requirements.
+Info (332102): Design is not fully constrained for setup requirements
+Info (332102): Design is not fully constrained for hold requirements
+Info: Quartus Prime TimeQuest Timing Analyzer was successful. 0 errors, 171 warnings
+    Info: Peak virtual memory: 6176 megabytes
+    Info: Processing ended: Mon Jul 06 11:20:28 2026
+    Info: Elapsed time: 00:00:13
+    Info: Total CPU time (on all processors): 00:00:21
+Info (293000): Quartus Prime Full Compilation was successful. 0 errors, 453 warnings
+Info (23030): Evaluation of Tcl script c:/intelfpga_lite/17.0/quartus/common/tcl/internal/qsh_flow.tcl was successful
+Info: Quartus Prime Shell was successful. 0 errors, 453 warnings
+    Info: Peak virtual memory: 4679 megabytes
+    Info: Processing ended: Mon Jul 06 11:20:29 2026
+    Info: Elapsed time: 00:27:02
+    Info: Total CPU time (on all processors): 01:39:38
+
+------------------------------------------------------------
+BUILD STATUS  (MacLC, 27m02s)
+------------------------------------------------------------
+  Analysis & Synthesis   Analysis & Synthesis Status : Successful - Mon Jul 06 10:57:25 2026
+  Fitter                 Fitter Status : Successful - Mon Jul 06 11:19:41 2026
+  Timing (STA)           VIOLATED — worst slack -27.883 ns  *** TIMING NOT MET ***
+  Artifact               output_files/MacLC.rbf  (4463644 bytes, 2026-07-06 11:20:14)
+  Quartus flow           exit=0
+  Full log               output_files/build_20260706_105327.log
+------------------------------------------------------------
+[11:20:29] RESULT: OK — output_files/MacLC.rbf ready. Deploy with: bash scripts/deploy_screenshot.sh

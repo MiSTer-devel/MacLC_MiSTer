@@ -1,0 +1,30 @@
+    Info (332114): Worst-Case MTBF values are calculated based on the worst-case silicon characteristics, with worst-case operating conditions.
+    Info (332114):   - Under worst-case conditions, an increase of 100ps in available settling time will increase MTBF values by a factor of 8.0
+    Info (332114): Typical MTBF values are calculated based on the nominal silicon characteristics, at nominal operating conditions.
+    Info (332114):   - Under typical conditions, an increase of 100ps in available settling time will increase MTBF values by a factor of 17.8
+Info (332102): Design is not fully constrained for setup requirements
+Info (332102): Design is not fully constrained for hold requirements
+Info: Quartus Prime TimeQuest Timing Analyzer was successful. 0 errors, 129 warnings
+    Info: Peak virtual memory: 6090 megabytes
+    Info: Processing ended: Mon Jul 06 09:53:19 2026
+    Info: Elapsed time: 00:00:13
+    Info: Total CPU time (on all processors): 00:00:21
+Info (293000): Quartus Prime Full Compilation was successful. 0 errors, 357 warnings
+Info (23030): Evaluation of Tcl script c:/intelfpga_lite/17.0/quartus/common/tcl/internal/qsh_flow.tcl was successful
+Info: Quartus Prime Shell was successful. 0 errors, 357 warnings
+    Info: Peak virtual memory: 4678 megabytes
+    Info: Processing ended: Mon Jul 06 09:53:19 2026
+    Info: Elapsed time: 00:19:50
+    Info: Total CPU time (on all processors): 01:21:04
+
+------------------------------------------------------------
+BUILD STATUS  (MacLC, 19m50s)
+------------------------------------------------------------
+  Analysis & Synthesis   Analysis & Synthesis Status : Successful - Mon Jul 06 09:37:33 2026
+  Fitter                 Fitter Status : Successful - Mon Jul 06 09:52:29 2026
+  Timing (STA)           met — worst slack +0.242 ns
+  Artifact               output_files/MacLC.rbf  (4428780 bytes, 2026-07-06 09:53:05)
+  Quartus flow           exit=0
+  Full log               output_files/build_20260706_093329.log
+------------------------------------------------------------
+[09:53:20] RESULT: OK — output_files/MacLC.rbf ready. Deploy with: bash scripts/deploy_screenshot.sh

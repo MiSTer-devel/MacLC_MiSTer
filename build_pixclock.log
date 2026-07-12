@@ -1,0 +1,30 @@
+Error (15836): inclk[3] port of Clock Select Block "vga_clk_sw" is driven by an illegal source, but must be driven by a clock pin or a PLL's CLK or FBOUT output File: C:/Temp/mistercore/MacLC_MiSTer/sys/sys_top.v Line: 1342
+    Info (15024): Input port INCLK[0] of node "vga_clk_sw" is not connected File: C:/Temp/mistercore/MacLC_MiSTer/sys/sys_top.v Line: 1342
+Error (15836): inclk[3] port of Clock Select Block "vga_clk_sw" is driven by emu:emu|clk_vid, but must be driven by a PLL's output clock File: C:/Temp/mistercore/MacLC_MiSTer/MacLC.sv Line: 433
+Error: Quartus Prime Analysis & Synthesis was unsuccessful. 6 errors, 90 warnings
+    Error: Peak virtual memory: 6703 megabytes
+    Error: Processing ended: Mon Jul 06 10:32:06 2026
+    Error: Elapsed time: 00:03:54
+    Error: Total CPU time (on all processors): 00:05:14
+Error (293001): Quartus Prime Full Compilation was unsuccessful. 8 errors, 90 warnings
+Error: Flow compile (for project C:/Temp/mistercore/MacLC_MiSTer/MacLC) was not successful
+Error: ERROR: Error(s) found while running an executable. See report file(s) for error message(s). Message log indicates which executable was run last.
+
+Error (23031): Evaluation of Tcl script c:/intelfpga_lite/17.0/quartus/common/tcl/internal/qsh_flow.tcl unsuccessful
+Error: Quartus Prime Shell was unsuccessful. 15 errors, 90 warnings
+    Error: Peak virtual memory: 4817 megabytes
+    Error: Processing ended: Mon Jul 06 10:32:07 2026
+    Error: Elapsed time: 00:03:59
+    Error: Total CPU time (on all processors): 00:06:00
+
+------------------------------------------------------------
+BUILD STATUS  (MacLC, 3m59s)
+------------------------------------------------------------
+  Analysis & Synthesis   Analysis & Synthesis Status : Successful - Mon Jul 06 10:32:01 2026
+  Fitter                 Fitter Status : Successful - Mon Jul 06 09:52:29 2026
+  Timing (STA)           met — worst slack +0.242 ns
+  Artifact               output_files/MacLC.rbf  (4428780 bytes, 2026-07-06 09:53:05)
+  Quartus flow           exit=3
+  Full log               output_files/build_20260706_102808.log
+------------------------------------------------------------
+[10:32:07] RESULT: FAILED (quartus exit=3) — see output_files/build_20260706_102808.log
