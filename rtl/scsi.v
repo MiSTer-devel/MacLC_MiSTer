@@ -12,6 +12,7 @@ module scsi
 	input 	  sel,
 	input 	  bus_busy, // another device currently holds the bus (its BSY)
 	input 	  atn, // initiator requests to send a message
+	input 	  cd_enable, // CDROM only: drive present (responds to selection even w/o disc)
 	output 	  bsy, // target holds bus
 
 	output 	  msg,
@@ -86,6 +87,12 @@ parameter [2:0] ID = 0;
 // target presents as a Toolbox device and owns the dedicated tb_* transport.
 // docs/BLUESCSI_CORE_HPS_CONTRACT.md
 parameter TOOLBOX_ENABLE = 0;
+// Apple CD-ROM mode (docs/plan_scsi_cdrom.md; MAME nscsi_cdrom_apple_device is
+// the byte-for-byte oracle). 0 = hard disk: every CDROM conditional below
+// constant-folds away, leaving the wedge-hardened disk target bit-identical.
+// 1 = read-only CD-ROM: 2048-byte logical blocks served as 4 consecutive
+// 512-byte HPS blocks (lba/tlen <<2), AppleCD INQUIRY/TOC/no-disc sense.
+parameter CDROM = 0;
 
 // Read-prefetch ring depth (number of 512-byte sectors held in the buffer).
 // The read path keeps this many blocks fetched AHEAD of the Mac so the per-block
@@ -348,6 +355,9 @@ wire [7:0] cmd_dout =
 		cmd_read_capacity?read_capacity_dout:
 		cmd_mode_sense?mode_sense_dout:
 		cmd_request_sense?request_sense_dout:
+		cmd_cd_toc?cd_toc_dout:
+		cmd_cd_subq?cd_subq_dout:
+		cmd_cd_astat?cd_astat_dout:
 		cmd_tb_devinfo?tb_devinfo_dout:
 		cmd_tb_debug?tb_debug_dout:
 		cmd_tb_fs_in?tb_serve:
@@ -358,6 +368,9 @@ wire [15:0] cmd_dout_pair =
 		cmd_read_capacity?{read_capacity_dout, read_capacity_dout_next}:
 		cmd_mode_sense?{mode_sense_dout, mode_sense_dout_next}:
 		cmd_request_sense?{request_sense_dout, request_sense_dout_next}:
+		cmd_cd_toc?{cd_toc_dout, cd_toc_dout_next}:
+		cmd_cd_subq?{cd_subq_dout, cd_subq_dout_next}:
+		cmd_cd_astat?{cd_astat_dout, cd_astat_dout_next}:
 		cmd_tb_devinfo?{tb_devinfo_dout, tb_devinfo_dout_next}:
 		cmd_tb_debug?{tb_debug_dout, tb_debug_dout_next}:
 		cmd_tb_fs_in?tb_serve_pair:
@@ -368,6 +381,9 @@ wire [15:0] cmd_dout_pair_next =
 		cmd_read_capacity?{read_capacity_dout_next2, read_capacity_dout_next3}:
 		cmd_mode_sense?{mode_sense_dout_next2, mode_sense_dout_next3}:
 		cmd_request_sense?{request_sense_dout_next2, request_sense_dout_next3}:
+		cmd_cd_toc?{cd_toc_dout_next2, cd_toc_dout_next3}:
+		cmd_cd_subq?{cd_subq_dout_next2, cd_subq_dout_next3}:
+		cmd_cd_astat?{cd_astat_dout_next2, cd_astat_dout_next3}:
 		cmd_tb_devinfo?{tb_devinfo_dout_next2, tb_devinfo_dout_next3}:
 		cmd_tb_debug?{tb_debug_dout_next2, tb_debug_dout_next3}:
 		cmd_tb_fs_in?tb_serve_pair_next:
@@ -376,10 +392,23 @@ wire [15:0] cmd_dout_pair_next =
 // REQUEST SENSE response: minimal fixed-format sense, "NO SENSE".
 //   byte 0 = 0x70 (current error, valid=0), byte 7 = 0x0a (add'l length 10),
 //   sense key (byte 2) = 0 = NO SENSE, all else 0.
-wire [7:0] request_sense_dout       = (data_cnt       == 32'd0)?8'h70:(data_cnt       == 32'd7)?8'h0a:8'h00;
-wire [7:0] request_sense_dout_next  = (data_cnt_next  == 32'd0)?8'h70:(data_cnt_next  == 32'd7)?8'h0a:8'h00;
-wire [7:0] request_sense_dout_next2 = (data_cnt_next2 == 32'd0)?8'h70:(data_cnt_next2 == 32'd7)?8'h0a:8'h00;
-wire [7:0] request_sense_dout_next3 = (data_cnt_next3 == 32'd0)?8'h70:(data_cnt_next3 == 32'd7)?8'h0a:8'h00;
+//   CDROM serves the latched cd_sense_key/asc (byte 2 / byte 12) instead, so
+//   the AppleCD driver sees NOT READY + vendor ASC 0xB0 while no disc is in.
+function [7:0] sense_byte;
+	input [31:0] cnt;
+	begin
+		sense_byte =
+			(cnt == 32'd0 )?8'h70:
+			(cnt == 32'd2 )?((CDROM != 0)?{4'd0, cd_sense_key}:8'h00):
+			(cnt == 32'd7 )?8'h0a:
+			(cnt == 32'd12)?((CDROM != 0)?cd_sense_asc:8'h00):
+			8'h00;
+	end
+endfunction
+wire [7:0] request_sense_dout       = sense_byte(data_cnt);
+wire [7:0] request_sense_dout_next  = sense_byte(data_cnt_next);
+wire [7:0] request_sense_dout_next2 = sense_byte(data_cnt_next2);
+wire [7:0] request_sense_dout_next3 = sense_byte(data_cnt_next3);
 
 // INQUIRY vendor id (8 bytes, space-padded). The value is SCSI_VENDOR_STRING,
 // defined in the included rtl/scsi_vendor.vh (committed default "MiSTer  "). A
@@ -398,10 +427,49 @@ localparam [63:0] SCSI_VENDOR_ID = `SCSI_VENDOR_STRING;
 // matching real drives and Snow. It was 32 (=37 total): a driver that reads
 // the standard 36 bytes then left 1 unserved byte on the target -> REQ held
 // forever -> the post-clamp Welcome wedge of 2026-06-10c.
+// CDROM INQUIRY: byte-exact copy of MAME nscsi_cdrom_apple_device (data taken
+// from the ROM of an AppleCD 150; same descriptor scsi_empty_cd shipped). The
+// stock Apple CD-ROM extension binds only to known Apple-shipped drives, so
+// the SONY CDU-8002 identity is required for the driver to attach (this is
+// hardware emulation fidelity, like MAME — not a vendor-string cosmetic).
+// 5 + additional-length 0x31 = 54-byte standard response.
+function [7:0] cd_inquiry_byte;
+	input [31:0] cnt;
+	begin
+		cd_inquiry_byte =
+			(cnt == 32'd0 )?8'h05:  // CD-ROM device class
+			(cnt == 32'd1 )?8'h80:  // removable
+			(cnt == 32'd2 )?8'h01:
+			(cnt == 32'd3 )?8'h01:
+			(cnt == 32'd4 )?8'h31:  // additional length
+			(cnt == 32'd8 )?"S":(cnt == 32'd9 )?"O":
+			(cnt == 32'd10)?"N":(cnt == 32'd11)?"Y":
+			((cnt >= 32'd12) && (cnt <= 32'd15))?" ":  // vendor pad
+			(cnt == 32'd16)?"C":(cnt == 32'd17)?"D":
+			(cnt == 32'd18)?"-":(cnt == 32'd19)?"R":
+			(cnt == 32'd20)?"O":(cnt == 32'd21)?"M":
+			(cnt == 32'd22)?" ":(cnt == 32'd23)?"C":
+			(cnt == 32'd24)?"D":(cnt == 32'd25)?"U":
+			(cnt == 32'd26)?"-":(cnt == 32'd27)?"8":
+			(cnt == 32'd28)?"0":(cnt == 32'd29)?"0":
+			(cnt == 32'd30)?"2":(cnt == 32'd31)?" ":
+			(cnt == 32'd32)?"1":(cnt == 32'd33)?".":
+			(cnt == 32'd34)?"8":(cnt == 32'd35)?"g":
+			(cnt == 32'd39)?8'hd0:(cnt == 32'd40)?8'h90:
+			(cnt == 32'd41)?8'h27:(cnt == 32'd42)?8'h3e:
+			(cnt == 32'd43)?8'h01:(cnt == 32'd44)?8'h04:
+			(cnt == 32'd45)?8'h91:(cnt == 32'd47)?8'h18:
+			(cnt == 32'd48)?8'h06:(cnt == 32'd49)?8'hf0:
+			(cnt == 32'd50)?8'hfe:
+			8'h00;
+	end
+endfunction
+
 function [7:0] inquiry_byte;
 	input [31:0] cnt;
 	begin
-		inquiry_byte =
+		if (CDROM != 0) inquiry_byte = cd_inquiry_byte(cnt);
+		else inquiry_byte =
 			(cnt == 32'd4 )?8'd31:  // additional length
 
 			// vendor id (bytes 8-15) from the SCSI_VENDOR_ID parameter. A string's
@@ -433,17 +501,26 @@ wire [7:0] inquiry_dout_next3 = inquiry_byte(data_cnt_next3);
 // output of read capacity command
 //wire [31:0] capacity = 32'd41056;   // 40960 + 96 blocks = 20MB
 //wire [31:0] capacity = 32'd1024096;   // 1024000 + 96 blocks = 500MB
-reg [31:0] capacity;
+// Initialized: the CDROM target answers MODE SENSE before any image has ever
+// been mounted (drive present, no disc), so the capacity bytes must not be X.
+reg [31:0] capacity = 32'd0;
 reg        mounted = 0;
 always @(posedge clk) begin
 	if (img_mounted) begin
 		if (|img_blocks) begin
-			capacity <= img_blocks - 1'd1;
+			// CDROM: capacity is in 2048-byte logical blocks (last LBA), i.e.
+			// the mounted 512-block count / 4 - 1. Disks: 512-blocks - 1.
+			capacity <= (CDROM != 0) ? ({2'b00, img_blocks[31:2]} - 1'd1)
+			                         : (img_blocks - 1'd1);
 			if (!mounted) $display("Image mounted on target %d, size: %d", ID, img_blocks);
 			mounted <= 1;
 		end else
 			mounted <= 0;
-	end
+	end else if ((CDROM != 0) && cd_eject_pulse)
+		// APPLE EJECT (0xC0): drop the medium; the OSD re-mount is the
+		// "insert disc". The HPS-side image stays mounted — harmless, the
+		// target simply reports no-disc until the user re-mounts.
+		mounted <= 0;
 end
 
 wire [7:0] read_capacity_dout =
@@ -451,29 +528,135 @@ wire [7:0] read_capacity_dout =
 		(data_cnt == 32'd1 )?capacity[23:16]:
 		(data_cnt == 32'd2 )?capacity[15:8]:
 		(data_cnt == 32'd3 )?capacity[7:0]:
-		(data_cnt == 32'd6 )?8'd2:             // 512 bytes per sector
+		(data_cnt == 32'd6 )?((CDROM != 0)?8'h08:8'd2): // block length 2048 (CD) / 512 (disk)
 		8'h00;
 wire [7:0] read_capacity_dout_next =
 		(data_cnt_next == 32'd0 )?capacity[31:24]:
 		(data_cnt_next == 32'd1 )?capacity[23:16]:
 		(data_cnt_next == 32'd2 )?capacity[15:8]:
 		(data_cnt_next == 32'd3 )?capacity[7:0]:
-		(data_cnt_next == 32'd6 )?8'd2:
+		(data_cnt_next == 32'd6 )?((CDROM != 0)?8'h08:8'd2):
 		8'h00;
 wire [7:0] read_capacity_dout_next2 =
 		(data_cnt_next2 == 32'd0 )?capacity[31:24]:
 		(data_cnt_next2 == 32'd1 )?capacity[23:16]:
 		(data_cnt_next2 == 32'd2 )?capacity[15:8]:
 		(data_cnt_next2 == 32'd3 )?capacity[7:0]:
-		(data_cnt_next2 == 32'd6 )?8'd2:
+		(data_cnt_next2 == 32'd6 )?((CDROM != 0)?8'h08:8'd2):
 		8'h00;
 wire [7:0] read_capacity_dout_next3 =
 		(data_cnt_next3 == 32'd0 )?capacity[31:24]:
 		(data_cnt_next3 == 32'd1 )?capacity[23:16]:
 		(data_cnt_next3 == 32'd2 )?capacity[15:8]:
 		(data_cnt_next3 == 32'd3 )?capacity[7:0]:
-		(data_cnt_next3 == 32'd6 )?8'd2:
+		(data_cnt_next3 == 32'd6 )?((CDROM != 0)?8'h08:8'd2):
 		8'h00;
+
+// =====================================================================
+// CDROM response synthesis (folds away on disk targets).
+//
+// Apple READ TOC (0xC1, MAME nscsi_cdrom_apple_device): BCD values, MSF
+// addresses, op = CDB[9][7:6]:
+//   00 -> {first track 01, last track 01, 0, 0}
+//   01 -> lead-out start {M, S, F, 0}
+//   10 -> per-track 4-byte descriptors {ADR/control, M, S, F}, repeating the
+//         last track past the end. One data track at LBA 0 => every
+//         descriptor is {0x14, 00, 00, 00} (MAME to_msf() has NO +150 pregap
+//         offset in the Apple handler — matched deliberately).
+// The only computed field is the lead-out MSF: a tiny FSM converts capacity
+// to BCD M/S/F once per mount (~160 clks), so the serve path stays pure
+// combinational constants — no divider near the REQ/ACK machinery.
+// =====================================================================
+reg [7:0] cd_lead_m = 8'h00, cd_lead_s = 8'h00, cd_lead_f = 8'h00;  // BCD
+
+function [7:0] cd_to_bcd;
+	input [6:0] v;   // 0..99
+	reg [6:0] tens;
+	reg [6:0] ones;
+	begin
+		tens = v / 7'd10;
+		ones = v % 7'd10;
+		cd_to_bcd = {tens[3:0], ones[3:0]};
+	end
+endfunction
+
+reg [19:0] cd_msf_val;
+reg  [6:0] cd_msf_m;
+reg  [5:0] cd_msf_s;
+reg  [1:0] cd_msf_st = 2'd0;
+always @(posedge clk) begin
+	if ((CDROM != 0) && img_mounted && |img_blocks) begin
+		cd_msf_val <= img_blocks[21:2];   // lead-out LBA = total 2048-byte blocks
+		cd_msf_m   <= 7'd0;
+		cd_msf_s   <= 6'd0;
+		cd_msf_st  <= 2'd1;
+	end else if (CDROM != 0) begin
+		case (cd_msf_st)
+		2'd1: if ((cd_msf_val >= 20'd4500) && (cd_msf_m != 7'd99)) begin
+				cd_msf_val <= cd_msf_val - 20'd4500;   // minutes (saturate at BCD 99)
+				cd_msf_m   <= cd_msf_m + 1'd1;
+			end else cd_msf_st <= 2'd2;
+		2'd2: if (cd_msf_val >= 20'd75) begin
+				cd_msf_val <= cd_msf_val - 20'd75;     // seconds
+				cd_msf_s   <= cd_msf_s + 1'd1;
+			end else cd_msf_st <= 2'd3;
+		2'd3: begin
+				cd_lead_m <= cd_to_bcd(cd_msf_m);
+				cd_lead_s <= cd_to_bcd({1'b0, cd_msf_s});
+				cd_lead_f <= cd_to_bcd(cd_msf_val[6:0]);
+				cd_msf_st <= 2'd0;
+			end
+		default: ;
+		endcase
+	end
+end
+
+function [7:0] cd_toc_byte;
+	input [31:0] cnt;
+	begin
+		case (cmd[9][7:6])
+		2'b00:   cd_toc_byte = (cnt == 32'd0) ? 8'h01 :         // first track (BCD)
+		                       (cnt == 32'd1) ? 8'h01 : 8'h00;  // last track (BCD)
+		2'b01:   cd_toc_byte = (cnt == 32'd0) ? cd_lead_m :
+		                       (cnt == 32'd1) ? cd_lead_s :
+		                       (cnt == 32'd2) ? cd_lead_f : 8'h00;
+		2'b10:   cd_toc_byte = (cnt[1:0] == 2'd0) ? 8'h14 : 8'h00;
+		default: cd_toc_byte = 8'h00;
+		endcase
+	end
+endfunction
+
+// READ Q SUBCODE (0xC2, 9 bytes): idle deck — track 01 (BCD), index 01,
+// relative and absolute position 00:00:00.
+function [7:0] cd_subq_byte;
+	input [31:0] cnt;
+	begin
+		cd_subq_byte = ((cnt == 32'd1) || (cnt == 32'd2)) ? 8'h01 : 8'h00;
+	end
+endfunction
+
+// AUDIO STATUS (0xCC, 6 bytes): status 5 = VOID/idle (m_stopped reset state),
+// ADR/control of the current (data) track, position 00:00:00.
+function [7:0] cd_astat_byte;
+	input [31:0] cnt;
+	begin
+		cd_astat_byte = (cnt == 32'd0) ? 8'h05 :
+		                (cnt == 32'd2) ? 8'h14 : 8'h00;
+	end
+endfunction
+
+wire [7:0] cd_toc_dout         = cd_toc_byte(data_cnt);
+wire [7:0] cd_toc_dout_next    = cd_toc_byte(data_cnt_next);
+wire [7:0] cd_toc_dout_next2   = cd_toc_byte(data_cnt_next2);
+wire [7:0] cd_toc_dout_next3   = cd_toc_byte(data_cnt_next3);
+wire [7:0] cd_subq_dout        = cd_subq_byte(data_cnt);
+wire [7:0] cd_subq_dout_next   = cd_subq_byte(data_cnt_next);
+wire [7:0] cd_subq_dout_next2  = cd_subq_byte(data_cnt_next2);
+wire [7:0] cd_subq_dout_next3  = cd_subq_byte(data_cnt_next3);
+wire [7:0] cd_astat_dout       = cd_astat_byte(data_cnt);
+wire [7:0] cd_astat_dout_next  = cd_astat_byte(data_cnt_next);
+wire [7:0] cd_astat_dout_next2 = cd_astat_byte(data_cnt_next2);
+wire [7:0] cd_astat_dout_next3 = cd_astat_byte(data_cnt_next3);
 
 // MODE SENSE(6): 4-byte header + 8-byte block descriptor = 12 bytes.
 // Header byte 0 = mode data length = total-1 = 11, so a driver that trusts
@@ -519,11 +702,49 @@ function [7:0] mode_sense_p31_byte;
 	end
 endfunction
 
-// Page select: 0x31 detection page vs. the unchanged default below.
-wire [7:0] mode_sense_dout       = mode_sense_p31 ? mode_sense_p31_byte(data_cnt)       : mode_sense_def_dout;
-wire [7:0] mode_sense_dout_next  = mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next)  : mode_sense_def_dout_next;
-wire [7:0] mode_sense_dout_next2 = mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next2) : mode_sense_def_dout_next2;
-wire [7:0] mode_sense_dout_next3 = mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next3) : mode_sense_def_dout_next3;
+// CDROM MODE SENSE(6). Header + 8-byte block descriptor (12 bytes): device-
+// specific byte = 0x80 (write-protected), block length 0x000800 (2048),
+// #blocks = capacity (2048-block last LBA, same byte slots as the disk
+// response). Page 0x30 appends the 24-byte "magic Apple page" (0x30, 0x00,
+// "APPLE COMPUTER, INC   ") — byte-exact from MAME apple_magic, which some
+// Apple drivers/utilities probe even on CD drives. Other pages: header+desc
+// only (proven pattern of the disk response).
+function [7:0] cd_mode_sense_byte;
+	input [31:0] cnt;
+	begin
+		cd_mode_sense_byte =
+			(cnt == 32'd0 )?(cd_ms30 ? 8'd35 : 8'd11):  // mode data length = total-1
+			(cnt == 32'd2 )?8'h80:                      // WP (read-only medium)
+			(cnt == 32'd3 )?8'd8:                       // block descriptor length
+			(cnt == 32'd5 )?capacity[23:16]:
+			(cnt == 32'd6 )?capacity[15:8]:
+			(cnt == 32'd7 )?capacity[7:0]:
+			(cnt == 32'd10)?8'h08:                      // block length 0x000800 = 2048
+			(cnt == 32'd12)?8'h30:                      // page code (0x30 request only)
+			(cnt == 32'd14)?"A":(cnt == 32'd15)?"P":
+			(cnt == 32'd16)?"P":(cnt == 32'd17)?"L":
+			(cnt == 32'd18)?"E":(cnt == 32'd19)?" ":
+			(cnt == 32'd20)?"C":(cnt == 32'd21)?"O":
+			(cnt == 32'd22)?"M":(cnt == 32'd23)?"P":
+			(cnt == 32'd24)?"U":(cnt == 32'd25)?"T":
+			(cnt == 32'd26)?"E":(cnt == 32'd27)?"R":
+			(cnt == 32'd28)?",":(cnt == 32'd29)?" ":
+			(cnt == 32'd30)?"I":(cnt == 32'd31)?"N":
+			(cnt == 32'd32)?"C":
+			((cnt >= 32'd33) && (cnt <= 32'd35))?" ":
+			8'h00;
+	end
+endfunction
+
+// Page select: CDROM response, else 0x31 detection page vs. the default.
+wire [7:0] mode_sense_dout       = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt)       : mode_sense_def_dout;
+wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next)  : mode_sense_def_dout_next;
+wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next2)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next2) : mode_sense_def_dout_next2;
+wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next3)
+                                 : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next3) : mode_sense_def_dout_next3;
 
 // Default MODE SENSE(6) response (unchanged; served for every page except 0x31).
 wire [7:0] mode_sense_def_dout =
@@ -812,6 +1033,14 @@ reg        data_complete;
 // REQUEST SENSE it means 4 bytes (pre-SCSI-2 convention). Undo it here.
 wire [31:0] alloc_len = (tlen == 16'd256) ? 32'd0 : {16'd0, tlen};
 wire [31:0] sense_len = (tlen == 16'd256) ? 32'd4 : {16'd0, tlen};
+// CDROM response sizes. INQUIRY = 54 (5 + additional-length 0x31). Apple READ
+// TOC (0xC1): ops 00/01 return a fixed 4 bytes; op 10 (track range) returns
+// floor(alloc/4) four-byte descriptors = alloc & ~3 (MAME: num_trks = size/4).
+// tlen here is the RAW 10-byte-CDB allocation ({cmd[7],cmd[8]}) — only READs
+// are <<2-scaled at latch time.
+localparam [31:0] INQUIRY_LEN = (CDROM != 0) ? 32'd54 : 32'd36;
+wire        cd_ms30    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h30);
+wire [31:0] cd_toc_len = (cmd[9][7:6] == 2'b10) ? {16'd0, tlen[15:2], 2'b00} : 32'd4;
 // A real target returns min(allocation length, actual response size) and then
 // switches to STATUS; the initiator detects the early phase change via the
 // BSR phase-mismatch bit. Serving the raw allocation length (previous
@@ -827,9 +1056,16 @@ wire [31:0] data_len =
 		 cmd_read_capacity?32'd8:
 		 cmd_read?{ 7'd0, tlen, 9'd0 }:   // read command length is in 512 bytes blocks
 		 cmd_write?{ 7'd0, tlen, 9'd0 }:  // write command length is in 512 bytes blocks
-		 cmd_inquiry?((alloc_len < 32'd36) ? alloc_len : 32'd36):
-		 cmd_mode_sense?(mode_sense_p31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
-		                                : ((alloc_len < 32'd12) ? alloc_len : 32'd12)):
+		 cmd_cd_toc?cd_toc_len:           // Apple READ TOC (see cd_toc_len)
+		 cmd_cd_subq?32'd9:               // READ Q SUBCODE: fixed 9 bytes
+		 cmd_cd_astat?32'd6:              // AUDIO STATUS: fixed 6 bytes
+		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
+		 cmd_inquiry?((alloc_len < INQUIRY_LEN) ? alloc_len : INQUIRY_LEN):
+		 cmd_mode_sense?((CDROM != 0) ? (cd_ms30 ? ((alloc_len < 32'd36) ? alloc_len : 32'd36)
+		                                         : ((alloc_len < 32'd12) ? alloc_len : 32'd12))
+		                              : (mode_sense_p31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
+		                                                : ((alloc_len < 32'd12) ? alloc_len : 32'd12))):
+		 ((CDROM != 0) && cmd_mode_select)?alloc_len:  // MODE SELECT alloc 0 = no data (not 256)
 		 cmd_request_sense?((sense_len < 32'd18) ? sense_len : 32'd18):
 		 cmd_tb_devinfo?tb_devinfo_len:                       // 0xD9 DEVICE INFO
 		 cmd_tb_debug_get?32'd1:                              // 0xD6 get = one flag byte
@@ -944,8 +1180,12 @@ wire       cmd6_cpl = (cmd_group == 3'b000) && (cmd_cnt == 6);
 // other group-110 opcodes aren't mis-lengthed (0xC0 EJECT is a 6-byte CDB).
 // docs/BLUESCSI_MISTER_MAIN_PLAN.md, docs/BLUESCSI_HANDOFF.md §1.
 wire       cmd_toolbox_op = (op_code >= 8'hd0) && (op_code <= 8'hd9);
+// Apple CD vendor commands 0xC0-0xCE are ALL 10-byte CDBs (MAME
+// nscsi_cdrom_apple_device::scsi_command_done: command&0xf0==0xc0 -> 10).
+wire       cmd_apple_cd_op = (CDROM != 0) && (op_code[7:4] == 4'hc);
 wire       cmd10_cpl = (((cmd_group == 3'b010) || (cmd_group == 3'b001)) && (cmd_cnt == 10))
-                       || (cmd_toolbox_op && (cmd_cnt == 10));
+                       || (cmd_toolbox_op && (cmd_cnt == 10))
+                       || (cmd_apple_cd_op && (cmd_cnt == 10));
 
 // https://en.wikipedia.org/wiki/SCSI_command
 wire       cmd_read = cmd_read6 || cmd_read10;
@@ -970,6 +1210,21 @@ wire       cmd_verify10 = (op_code == 8'h2f); // fake
 // triggers the recovery path -- the Mac could never clear the condition and
 // wedged.  Support it and return a clean "NO SENSE" block.
 wire       cmd_request_sense = (op_code == 8'h03);
+
+// ----- Apple CD-ROM command set (CDROM targets only; all fold to 0 on disks).
+// Oracle: MAME nscsi_cdrom_apple_device (docs/plan_scsi_cdrom.md Appendix A).
+wire       cmd_cd_eject     = (CDROM != 0) && (op_code == 8'hc0);  // EJECT DISC
+wire       cmd_cd_toc       = (CDROM != 0) && (op_code == 8'hc1);  // READ TOC (BCD/MSF)
+wire       cmd_cd_subq      = (CDROM != 0) && (op_code == 8'hc2);  // READ Q SUBCODE (9 B)
+wire       cmd_cd_astat     = (CDROM != 0) && (op_code == 8'hcc);  // AUDIO STATUS (6 B)
+wire       cmd_cd_actl      = (CDROM != 0) && (op_code == 8'hce);  // AUDIO CONTROL (DataOut cmd[8] B, discarded)
+// Audio transport commands: v1 = data CDs only, accept as no-op GOOD (deferred
+// per plan §5.1; they only matter for CD-DA which has no PCM path yet).
+wire       cmd_cd_audio_nop = (CDROM != 0) && ((op_code == 8'hc8) || (op_code == 8'hc9) ||
+                                               (op_code == 8'hca) || (op_code == 8'hcb) ||
+                                               (op_code == 8'hcd));
+wire       cmd_cd_prevent   = (CDROM != 0) && (op_code == 8'h1e);  // PREVENT/ALLOW MEDIUM REMOVAL
+wire       cmd_cd_startstop = (CDROM != 0) && (op_code == 8'h1b);  // START/STOP UNIT
 
 // ----- BlueSCSI Toolbox vendor commands (0xD0-0xD9) ----------------------
 // M0 = the RTL-serviceable subset that needs NO host filesystem, so the Mac
@@ -1029,12 +1284,73 @@ always @(posedge clk) begin
 end
 
 // valid command in buffer? TODO: check for valid command parameters
-wire  cmd_ok = cmd_read || cmd_write || cmd_inquiry || cmd_test_unit_ready ||
+wire  cmd_ok_hd = cmd_read || cmd_write || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_format || cmd_mode_sense ||
 		  cmd_read_buffer || cmd_write_buffer || cmd_verify6 || cmd_verify10 ||
 		  cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug ||
 		  (cmd_tb_fs_in && tb_ready) ||  // fs DataIn ops valid only with a shared folder (else CHECK)
 		  (cmd_tb_send  && tb_ready);    // fs DataOut (upload) ops, likewise
+
+// CD-ROM command set: read-only — WRITE/FORMAT/buffer/verify are NOT accepted
+// (CHECK CONDITION + ILLEGAL REQUEST), matching a real AppleCD drive.
+wire  cmd_ok_cd = cmd_read || cmd_inquiry || cmd_test_unit_ready ||
+		  cmd_read_capacity || cmd_mode_select || cmd_mode_sense ||
+		  cmd_request_sense || cmd_cd_eject || cmd_cd_toc || cmd_cd_subq ||
+		  cmd_cd_astat || cmd_cd_actl || cmd_cd_audio_nop ||
+		  cmd_cd_prevent || cmd_cd_startstop;
+
+wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
+
+// Media-dependent commands fail with the AppleCD no-disc sense while no image
+// is mounted (MAME return_no_cd: SK_NOT_READY + vendor ASC 0xB0 — 0x3A makes
+// MacOS "hammer the drive asking the user to format it", cd.cpp:1214).
+wire  cd_needs_media = cmd_test_unit_ready || cmd_read || cmd_read_capacity ||
+		  cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_actl ||
+		  cmd_cd_audio_nop;
+wire  cd_no_media = (CDROM != 0) && !mounted && cd_needs_media;
+
+// New-command strobe (one clk on the CDB completing). Used by the CD sense /
+// eject logic; folds away on disk targets.
+reg   cd_cpl_d = 1'b0;
+always @(posedge clk) cd_cpl_d <= (phase == PHASE_CMD_IN) && cmd_cpl;
+wire  cd_new_cmd = (phase == PHASE_CMD_IN) && cmd_cpl && !cd_cpl_d;
+wire  cd_eject_pulse = cd_new_cmd && cmd_cd_eject && !cd_prevent;
+
+// REQUEST SENSE state (CDROM only): key/ASC latched when a command CHECKs,
+// cleared by the next successful non-REQUEST-SENSE command (SCSI-1 semantics).
+reg [3:0] cd_sense_key = 4'd0;
+reg [7:0] cd_sense_asc = 8'd0;
+reg       cd_prevent   = 1'b0;
+always @(posedge clk) begin
+	if (rst) begin
+		cd_sense_key <= 4'd0;
+		cd_sense_asc <= 8'd0;
+		cd_prevent   <= 1'b0;
+	end else if ((CDROM != 0) && cd_new_cmd) begin
+		if (!cmd_ok) begin
+			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
+			cd_sense_asc <= 8'h20; // invalid operation code
+		end else if (cd_no_media) begin
+			cd_sense_key <= 4'h2;  // NOT READY
+			cd_sense_asc <= 8'hb0; // AppleCD vendor "no disc"
+		end else if (cmd_cd_eject) begin
+			if (cd_prevent) begin
+				cd_sense_key <= 4'h5; // ILLEGAL REQUEST
+				cd_sense_asc <= 8'h80; // "prevent bit is set" (MAME)
+			end else begin
+				cd_sense_key <= 4'h2;  // NOT READY
+				cd_sense_asc <= 8'h3a; // medium not present (post-eject, MAME)
+			end
+		end else if (cmd_cd_prevent) begin
+			cd_prevent   <= cmd[4][0];
+			cd_sense_key <= 4'd0;
+			cd_sense_asc <= 8'd0;
+		end else if (!cmd_request_sense) begin
+			cd_sense_key <= 4'd0;
+			cd_sense_asc <= 8'd0;
+		end
+	end
+end
 
 // latch parameters once command is complete
 reg [31:0] lba;
@@ -1043,8 +1359,18 @@ reg [15:0] tlen;
 always @(posedge clk) begin
 	if (old_io_ack & ~io_ack) lba <= lba + 1'd1;
 	if(cmd_cpl && (phase == PHASE_CMD_IN)) begin
-		lba <= cmd6_cpl?{11'd0, lba6}:lba10;
-		tlen <= cmd6_cpl?{7'd0, tlen6}:tlen10;
+		// CDROM READs address 2048-byte logical blocks; the HPS block device
+		// is 512-byte sectors, so scale lba/tlen by 4 AT LATCH TIME and the
+		// whole downstream ring/flush/data_len machinery runs unmodified in
+		// 512-byte units. Non-READ commands keep raw CDB values (their
+		// lengths are byte counts, e.g. MODE SELECT / AUDIO CONTROL).
+		if ((CDROM != 0) && cmd_read) begin
+			lba  <= (cmd6_cpl?{11'd0, lba6}:lba10) << 2;
+			tlen <= (cmd6_cpl?{7'd0, tlen6}:tlen10) << 2;
+		end else begin
+			lba <= cmd6_cpl?{11'd0, lba6}:lba10;
+			tlen <= cmd6_cpl?{7'd0, tlen6}:tlen10;
+		end
 	end
 end
    
@@ -1072,7 +1398,10 @@ always @(posedge clk) begin
 			// that byte could otherwise "select" this target mid-dialog and
 			// two targets would then consume the shared ACK stream in
 			// parallel (command/LBA corruption -> misdirected writes).
-			if(sel && din[ID] && mounted && !bus_busy)
+			// A CD-ROM drive is present on the bus even with no disc inserted
+			// (the AppleCD driver polls TEST UNIT READY to detect insertion),
+			// so the CDROM target selects on cd_enable instead of mounted.
+			if(sel && din[ID] && ((CDROM != 0) ? cd_enable : mounted) && !bus_busy)
 				phase <= PHASE_CMD_IN;
 		end
 
@@ -1081,9 +1410,11 @@ always @(posedge clk) begin
 			if(cmd_cpl) begin
 				$display("New command on target %d: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", ID, cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5], cmd[6], cmd[7], cmd[8], cmd[9]);
 				// is this a supported and valid command?
-				if(cmd_ok) begin
+				// (CDROM: media-dependent commands CHECK with the no-disc
+				// sense while unmounted; a prevent-blocked EJECT CHECKs too.)
+				if(cmd_ok && !cd_no_media) begin
 					// yes, continue
-					status <= `STATUS_OK;
+					status <= (cmd_cd_eject && cd_prevent) ? `STATUS_CHECK_CONDITION : `STATUS_OK;
 
 					// continue according to command
 
@@ -1091,9 +1422,9 @@ always @(posedge clk) begin
 					if(cmd_tb_fs_in) phase <= PHASE_TB;   // toolbox DataIn fs op: HPS round-trip, then serve
 						else if(cmd_tb_send_end) phase <= PHASE_TB;       // SEND END: no payload, straight to round-trip
 						else if(cmd_tb_send_pay) phase <= PHASE_DATA_IN;  // SEND PREP/DATA: collect the DataOut payload first
-						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get) phase <= PHASE_DATA_OUT;
+						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat) phase <= PHASE_DATA_OUT;
 					// these commands receive dataa
-					else if(cmd_write || cmd_mode_select || cmd_write_buffer) phase <= PHASE_DATA_IN;
+					else if(cmd_write || cmd_mode_select || cmd_write_buffer || cmd_cd_actl) phase <= PHASE_DATA_IN;
 					// and all other valid commands are just "ok"
 					else phase <= PHASE_STATUS_OUT;
 				end else begin
