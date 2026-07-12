@@ -78,8 +78,10 @@ The core emulates an Apple-compatible CD-ROM drive on **SCSI ID 3**:
   when disabled
 
 **The guest System must have a CD driver installed** — the stock Apple *CD-ROM* extension
-works (the drive identifies as a `CD-ROM CDU-8004`, which the Apple driver accepts), as
-should third-party CD drivers. Without a driver the disc mounts nothing on the desktop.
+works: the drive presents the AppleCD 150 identity (`SONY CD-ROM CDU-8002`, byte-exact
+from real hardware), which the stock driver requires — a generic identity was tried and
+the driver refuses to attach. Third-party CD drivers should also work. Without a driver
+the disc mounts nothing on the desktop.
 
 Image format support:
 
