@@ -1,5 +1,18 @@
 # Plan — SCSI CD-ROM drive (ISO / TOAST + CHD)
 
+> **STATUS 2026-07-12 (branch `add-scsi-cdrom`): Phases 1+2 IMPLEMENTED, HW test pending.**
+> Phase 1 landed as a `CDROM` parameter on the proven `scsi.v` target (not a
+> separate module): disk instances constant-fold to the pre-CD netlist, the ID-3
+> instance reuses the wedge-hardened REQ/ACK/ring machinery. hps_io slot moved
+> to **4** (master had grown PRAM=2 + Toolbox=3 since this plan), OSD `SC4` +
+> `OI` enable option (status[18]). Phase 2 did **NOT** need the feared EXT_BUS
+> bridge: the Toolbox branch's per-slot `sd_type` dispatch in Main_MiSTer let
+> CUE/CHD/raw-2352 be served as a **flat 2048-byte virtual block device**
+> (`support/maclc/maclc_cd.cpp`, Main branch `add-bluescsi-toolbox-for-MacLC`) —
+> the RTL never learns the container format; flat ISO/TOAST passes through
+> stock-Main generic mounts. CD audio (Phase 3) still deferred. §2.2's in-RTL
+> 2352 straddle path: dropped, superseded by the Main-side normalization.
+
 Date: 2026-06-08 (rev 2026-06-09) · Branch: `new-video-technique-part-2`
 Scope agreed with user: **ISO + TOAST** (in-core) **+ CHD** (via firmware).
 **One CD drive** (SCSI ID 3). BIN/CUE no longer a target (it comes free once the

@@ -164,3 +164,8 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 - SCSI writes work but are experimental
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
+- CD-ROM (SCSI ID 3, OSD slot `SC4`): data discs only, no CD audio yet.
+  Flat 2048-byte images (ISO/TOAST) work on a stock Main_MiSTer; CUE/BIN
+  (2352) and CHD need the Main fork's `support/maclc/maclc_cd` layer
+  (branch `add-bluescsi-toolbox-for-MacLC`). The guest System needs the
+  Apple CD-ROM extension (or a third-party CD driver) to mount discs.
