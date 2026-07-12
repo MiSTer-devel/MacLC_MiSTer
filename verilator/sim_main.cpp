@@ -865,6 +865,10 @@ int main(int argc, char** argv, char** env) {
 			fprintf(stderr, "Mounting SCSI%d image: %s\n", disk_index, scsi_disk_files[disk_index].c_str());
 		}
 	}
+	if (!cdrom_file.empty()) {
+		blockdevice.MountDisk(cdrom_file, 2);
+		fprintf(stderr, "Mounting CD-ROM image (SCSI-3): %s\n", cdrom_file.c_str());
+	}
 
 #ifndef DISABLE_AUDIO
 	audio.Initialise();
