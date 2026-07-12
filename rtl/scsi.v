@@ -427,24 +427,29 @@ localparam [63:0] SCSI_VENDOR_ID = `SCSI_VENDOR_STRING;
 // matching real drives and Snow. It was 32 (=37 total): a driver that reads
 // the standard 36 bytes then left 1 unserved byte on the target -> REQ held
 // forever -> the post-clamp Welcome wedge of 2026-06-10c.
-// CDROM INQUIRY: byte-exact copy of MAME nscsi_cdrom_apple_device (data taken
-// from the ROM of an AppleCD 150; same descriptor scsi_empty_cd shipped). The
-// stock Apple CD-ROM extension binds only to known Apple-shipped drives, so
-// the SONY CDU-8002 identity is required for the driver to attach (this is
-// hardware emulation fidelity, like MAME — not a vendor-string cosmetic).
-// 5 + additional-length 0x31 = 54-byte standard response.
+// CDROM INQUIRY: standard 36-byte response, cross-host consistent with Snow
+// (core/src/mac/scsi/cdrom/mod.rs). The stock Apple CD-ROM extension binds on
+// the PRODUCT field pattern ("CD-ROM CDU-8..."), NOT the vendor id — proven by
+// Snow, which ships vendor "SNOW"/product "CD-ROM CDU-8004 " and the stock
+// driver attaches. So the vendor comes from SCSI_VENDOR_ID (same policy +
+// local-override mechanism as the disks) and the product/revision bytes match
+// Snow exactly (fictitious CDU-8004 model; CDU-8 prefix is the compat key).
+// Deliberate deviation from Snow: additional-length = 31 (spec-correct for a
+// 36-byte response, like the disk target above). Snow writes 32, implying 37
+// total — it gets away with it only by truncating to the allocation length;
+// serving an unread trailing byte is exactly the 2026-06-10c REQ-held wedge.
+// (Replaced the earlier 54-byte MAME AppleCD-150 ROM dump: HW-validated
+// 2026-07-12, but it hardcoded a SONY identity and had a 15-byte vendor tail.)
 function [7:0] cd_inquiry_byte;
 	input [31:0] cnt;
 	begin
 		cd_inquiry_byte =
 			(cnt == 32'd0 )?8'h05:  // CD-ROM device class
 			(cnt == 32'd1 )?8'h80:  // removable
-			(cnt == 32'd2 )?8'h01:
-			(cnt == 32'd3 )?8'h01:
-			(cnt == 32'd4 )?8'h31:  // additional length
-			(cnt == 32'd8 )?"S":(cnt == 32'd9 )?"O":
-			(cnt == 32'd10)?"N":(cnt == 32'd11)?"Y":
-			((cnt >= 32'd12) && (cnt <= 32'd15))?" ":  // vendor pad
+			(cnt == 32'd2 )?8'h02:  // ANSI-2 (Snow-consistent)
+			(cnt == 32'd3 )?8'h02:
+			(cnt == 32'd4 )?8'd31:  // additional length: 36-byte standard response
+			((cnt >= 32'd8) && (cnt <= 32'd15)) ? SCSI_VENDOR_ID[(15 - cnt)*8 +: 8] :
 			(cnt == 32'd16)?"C":(cnt == 32'd17)?"D":
 			(cnt == 32'd18)?"-":(cnt == 32'd19)?"R":
 			(cnt == 32'd20)?"O":(cnt == 32'd21)?"M":
@@ -452,15 +457,9 @@ function [7:0] cd_inquiry_byte;
 			(cnt == 32'd24)?"D":(cnt == 32'd25)?"U":
 			(cnt == 32'd26)?"-":(cnt == 32'd27)?"8":
 			(cnt == 32'd28)?"0":(cnt == 32'd29)?"0":
-			(cnt == 32'd30)?"2":(cnt == 32'd31)?" ":
+			(cnt == 32'd30)?"4":(cnt == 32'd31)?" ":
 			(cnt == 32'd32)?"1":(cnt == 32'd33)?".":
-			(cnt == 32'd34)?"8":(cnt == 32'd35)?"g":
-			(cnt == 32'd39)?8'hd0:(cnt == 32'd40)?8'h90:
-			(cnt == 32'd41)?8'h27:(cnt == 32'd42)?8'h3e:
-			(cnt == 32'd43)?8'h01:(cnt == 32'd44)?8'h04:
-			(cnt == 32'd45)?8'h91:(cnt == 32'd47)?8'h18:
-			(cnt == 32'd48)?8'h06:(cnt == 32'd49)?8'hf0:
-			(cnt == 32'd50)?8'hfe:
+			(cnt == 32'd34)?"9":(cnt == 32'd35)?"a":
 			8'h00;
 	end
 endfunction
@@ -1038,7 +1037,10 @@ wire [31:0] sense_len = (tlen == 16'd256) ? 32'd4 : {16'd0, tlen};
 // floor(alloc/4) four-byte descriptors = alloc & ~3 (MAME: num_trks = size/4).
 // tlen here is the RAW 10-byte-CDB allocation ({cmd[7],cmd[8]}) — only READs
 // are <<2-scaled at latch time.
-localparam [31:0] INQUIRY_LEN = (CDROM != 0) ? 32'd54 : 32'd36;
+// Both device types serve the standard 36-byte INQUIRY (the CD's former
+// 54-byte AppleCD-150 ROM image went with the SONY identity, see
+// cd_inquiry_byte). data_len still clamps to the initiator's allocation.
+localparam [31:0] INQUIRY_LEN = 32'd36;
 wire        cd_ms30    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h30);
 // ops 00/01: MAME serves a fixed 4; clamp to the allocation as well so a
 // short alloc can never leave unserved bytes holding REQ (the 2026-06-10
