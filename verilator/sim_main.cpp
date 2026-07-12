@@ -164,6 +164,7 @@ SimBlockDevice blockdevice(console);
 // floppy -> ioctl download into SDRAM (QueueDownload). Set via --scsi0/1
 // and --floppy0/1 on the command line.
 std::string scsi_disk_files[2];
+std::string cdrom_file;        // --cdrom <iso> -> block-device slot 2 (SCSI ID 3 CD)
 std::string floppy_disk_files[2];
 
 // Input handling
@@ -701,6 +702,9 @@ void show_help() {
 	printf("  --stop-at-frame <frame>       Exit simulation after specified frame\n");
 	printf("  -v, --verbose                 Enable verbose bring-up diagnostics\n");
 	printf("                                (overlay/FC/march/RAMCFG/bus/CPU-trace spam)\n");
+	printf("  --scsi0 <file>                Mount SCSI-6 hard disk image (.img/.vhd/.hda)\n");
+	printf("  --scsi1 <file>                Mount SCSI-5 hard disk image\n");
+	printf("  --cdrom <file>                Mount CD-ROM image (.iso/.toast, 2048-byte sectors) on SCSI-3\n");
 	printf("\n");
 	printf("Examples:\n");
 	printf("  ./Vemu                        Run simulator in windowed mode\n");
@@ -817,6 +821,8 @@ int main(int argc, char** argv, char** env) {
 			scsi_disk_files[0] = argv[++i];   // SCSI-6 (.img/.vhd) -> block device
 		} else if (strcmp(argv[i], "--scsi1") == 0 && i + 1 < argc) {
 			scsi_disk_files[1] = argv[++i];   // SCSI-5
+		} else if (strcmp(argv[i], "--cdrom") == 0 && i + 1 < argc) {
+			cdrom_file = argv[++i];           // CD-ROM (.iso/.toast, 2048-byte sectors) -> SCSI-3
 		} else if (strcmp(argv[i], "--floppy0") == 0 && i + 1 < argc) {
 			floppy_disk_files[0] = argv[++i]; // primary floppy (.dsk) -> SDRAM download
 		} else if (strcmp(argv[i], "--floppy1") == 0 && i + 1 < argc) {
@@ -841,6 +847,7 @@ int main(int argc, char** argv, char** env) {
 	// Hookup block device for SCSI (2 devices for MacLC)
 	blockdevice.sd_lba[0] = &VERTOPINTERN->sd_lba[0];
 	blockdevice.sd_lba[1] = &VERTOPINTERN->sd_lba[1];
+	blockdevice.sd_lba[2] = &VERTOPINTERN->sd_lba[2];
 	blockdevice.sd_rd = &VERTOPINTERN->sd_rd;
 	blockdevice.sd_wr = &VERTOPINTERN->sd_wr;
 	blockdevice.sd_ack = &VERTOPINTERN->sd_ack;
@@ -848,6 +855,7 @@ int main(int argc, char** argv, char** env) {
 	blockdevice.sd_buff_dout = &VERTOPINTERN->sd_buff_dout;
 	blockdevice.sd_buff_din[0] = &VERTOPINTERN->sd_buff_din[0];
 	blockdevice.sd_buff_din[1] = &VERTOPINTERN->sd_buff_din[1];
+	blockdevice.sd_buff_din[2] = &VERTOPINTERN->sd_buff_din[2];
 	blockdevice.sd_buff_wr = &VERTOPINTERN->sd_buff_wr;
 	blockdevice.img_mounted = &VERTOPINTERN->img_mounted;
 	blockdevice.img_size = &VERTOPINTERN->img_size;

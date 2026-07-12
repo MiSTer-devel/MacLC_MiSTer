@@ -83,6 +83,7 @@ These must stay identical; they were checked and match today.
 | Debug HUD / ports | absent | Row-M overlay, `*_dbg_*`, `selectUnmapped`, `synthesis keep` taps | FPGA-only observability; harmless |
 | Framework | bespoke C++ harness (`sim_main.cpp`) | `sys/` (HPS I/O, HDMI/scaler, OSD, audio out) | sim has no HPS/HDMI/scaler |
 | PRAM NVRAM persistence | `dataController_top` `pram_*` ports tied off (`pram_load_wr=0`, `pram_save_addr=0`, outputs open) | FSM in `MacLC.sv` (SD slot 2 save image, load-on-mount / flush-on-OSD / Reset PRAM&Core) drives them | **PRAM save/restore is FPGA-only**; sim still boots with `egret.pram` (zeros). The Egret `pram[]` mirror + `pram_load_*/save_*` ports in `egret_wrapper.sv` are shared and identical. |
+| CD-ROM (SCSI ID 3) block-device slot | sim block-device **slot 2** (`--cdrom <iso>`; `sd_*[2]`, `img_mounted[2]`), `cd_enable` hardwired 1 | hps_io **slot `VD_CDROM`=4** (`SC4` OSD entry), `cd_enable = ~status[18]` (OSD "CD-ROM Drive") | Same `dataController_top` `cd_*` ports both sides; only the slot index and the enable source differ. Sim boots with the disc-less CD target answering the ROM SCSI scan (regression for the 2026-06-10 empty-CD wedge class). |
 
 ## 🔴 Inherent gap — keep in mind
 
