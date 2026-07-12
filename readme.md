@@ -17,6 +17,9 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 - Boots **Mac OS 6.0.8, 7.1, and 7.5.5** from SCSI to the Finder desktop
 - **68020 CPU** via TG68K (with core-specific tweaks), running at the LC's native ~15.67 MHz
 - **SCSI hard disk** on ID 6 (read/write, boot). Multiple drives untested.
+- **CD-ROM drive** on SCSI ID 3 (read-only, data discs). ISO images verified on hardware
+  (July 2026); needs a CD driver in the guest System — see
+  [CD-ROM support](#cd-rom-support-scsi).
 - **Display:** 512×384 (12" RGB) or 640×480 (VGA), **1bpp and 2bpp black & white only**
 - **Memory:** 2 MB or 10 MB configurations
 - **PRAM/NVRAM:** save (on entering the OSD), automatic load at core start (or forced load),
@@ -65,6 +68,31 @@ A tool to create hard-disk images (with driver and partition table) is available
 [here](https://diskjockey.onegeekarmy.eu/).
 
 > Multiple simultaneous SCSI drives have not been tested. Expect data loss — keep backups.
+
+## CD-ROM support (SCSI)
+
+The core emulates an Apple-compatible CD-ROM drive on **SCSI ID 3**:
+
+- **Mount CD-ROM** — mounts a disc image (the disc auto-remounts at core start)
+- **CD-ROM Drive** (Enabled/Disabled) — removes the drive from the SCSI bus entirely
+  when disabled
+
+**The guest System must have a CD driver installed** — the stock Apple *CD-ROM* extension
+works: the drive presents the AppleCD 150 identity (`SONY CD-ROM CDU-8002`, byte-exact
+from real hardware), which the stock driver requires — a generic identity was tried and
+the driver refuses to attach. Third-party CD drivers should also work. Without a driver
+the disc mounts nothing on the desktop.
+
+Image format support:
+
+| Format | Status |
+|---|---|
+| `.iso` / `.toast` / `.bin` (2048-byte sectors) | **Working** — verified on hardware, stock MiSTer Main |
+| `.cue`+`.bin` (2352-byte raw), `.chd` | Experimental — requires a [forked Main_MiSTer](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC) build (untested) |
+
+Data discs only (HFS and ISO 9660/hybrid). **CD audio is not implemented yet** — audio
+tracks are ignored. Ejecting from the Finder (drag to Trash) is honored; use the OSD to
+insert a different disc.
 
 ## Floppy disk support
 

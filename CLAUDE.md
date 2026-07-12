@@ -119,7 +119,12 @@ Standard MiSTer framework files (video scaling, HPS I/O, audio output). Generall
 
 - `files.qip` - Lists all RTL source files for Quartus
 - `MacLC.qsf` - Quartus project settings
-- `releases/` - Pre-built RBF files and ROM images
+- `releases/` - Pre-built RBF files and ROM images. Only release-quality and
+  provenance artifacts belong here (dated `MacLC_YYYYMMDD.rbf` releases and the
+  hash-named build they were copied from) — probe/A-B/experiment RBFs do not.
+- `scratch/` - **(gitignored) ALL session scratch goes here**: screenshots,
+  build/launch logs, probe RBFs, captures, analysis dumps. Never leave scratch
+  work in the repo root and never commit it.
 
 ## CPU Conversion Notes
 
@@ -164,3 +169,8 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 - SCSI writes work but are experimental
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
+- CD-ROM (SCSI ID 3, OSD slot `SC4`): data discs only, no CD audio yet.
+  Flat 2048-byte images (ISO/TOAST) work on a stock Main_MiSTer; CUE/BIN
+  (2352) and CHD need the Main fork's `support/maclc/maclc_cd` layer
+  (branch `add-bluescsi-toolbox-for-MacLC`). The guest System needs the
+  Apple CD-ROM extension (or a third-party CD driver) to mount discs.

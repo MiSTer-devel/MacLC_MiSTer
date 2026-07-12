@@ -64,6 +64,13 @@ module emu
 		"SC1,IMGVHDHDA,Mount SCSI-5;",
 		"SC2,NVR,Mount PRAM;",
 		"-;",
+		// CD-ROM (SCSI ID 3). ISO/TOAST (TO* matches .toast) are raw
+		// 2048-byte images and work today; CUE/BIN/CHD are listed for the
+		// Main_MiSTer translation layer (docs/plan_scsi_cdrom.md Phase 2) —
+		// on a stock Main a 2048-byte-sector .bin also works mounted directly.
+		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
+		"OI,CD-ROM Drive,Enabled,Disabled;",
+		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
@@ -147,7 +154,8 @@ module emu
 	localparam SCSI_DEVS = 2;          // SCSI block devices -> hps_io slots 0,1
 	localparam VD_PRAM    = 2;         // PRAM NVRAM save image -> hps_io slot 2
 	localparam VD_TOOLBOX = 3;         // BlueSCSI Toolbox shared folder -> hps_io slot 3
-	localparam VDNUM      = 4;         // total hps_io block devices
+	localparam VD_CDROM   = 4;         // CD-ROM image (SCSI ID 3) -> hps_io slot 4
+	localparam VDNUM      = 5;         // total hps_io block devices
 
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
@@ -191,6 +199,23 @@ module emu
 	assign sd_buff_din[VD_TOOLBOX] = tb_buff_din;
 	wire        tb_ack     = sd_ack[VD_TOOLBOX];
 	wire        tb_mounted = img_mounted[VD_TOOLBOX];
+
+	// CD-ROM (SCSI ID 3) dedicated slot (4): read-only block device driven by
+	// the cdrom target through dataController. cd_wr is tied off — the target
+	// never issues writes (read-only device, WRITE commands CHECK).
+	wire [31:0] cd_lba;
+	wire        cd_rd;
+	wire [15:0] cd_buff_din;
+	assign sd_lba[VD_CDROM]      = cd_lba;
+	assign sd_rd [VD_CDROM]      = cd_rd;
+	assign sd_wr [VD_CDROM]      = 1'b0;
+	assign sd_buff_din[VD_CDROM] = cd_buff_din;
+	wire        cd_ack     = sd_ack[VD_CDROM];
+	wire        cd_mounted = img_mounted[VD_CDROM];
+	// OSD "CD-ROM Drive" option (OI / status[18], 0 = Enabled). Disabling
+	// makes ID 3 vanish from the bus entirely — the pre-CD baseline, kept as
+	// a hardware A/B lever given the SCSI wedge history.
+	wire        cd_enable  = ~status[18];
 	wire        ioctl_write;
 	reg         ioctl_wait = 0;
 	wire [10:0] ps2_key;
@@ -1507,6 +1532,15 @@ module emu
 		.tb_wr(tb_wr),
 		.tb_ack(tb_ack),
 		.tb_buff_din(tb_buff_din),
+
+		// CD-ROM target (SCSI ID 3) block interface (slot VD_CDROM).
+		.cd_enable(cd_enable),
+		.cd_img_mounted(cd_mounted),
+		.cd_io_lba(cd_lba),
+		.cd_io_rd(cd_rd),
+		.cd_io_wr(),           // read-only target: never writes
+		.cd_io_ack(cd_ack),
+		.cd_sd_buff_din(cd_buff_din),
 
 		// PRAM persistence (NVRAM) — driven by the FSM above
 		.pram_load_wr(pram_load_wr),

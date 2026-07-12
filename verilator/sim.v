@@ -39,16 +39,18 @@ module emu
 	input [7:0]   ioctl_index,
 	output reg    ioctl_wait = 1'b0,
 
-	// SCSI block device interface
-	output [31:0] sd_lba[2],
-	output [1:0]  sd_rd,
-	output [1:0]  sd_wr,
-	input  [1:0]  sd_ack,
+	// SCSI block device interface. Slots: 0,1 = disks (SCSI 6/5),
+	// 2 = CD-ROM (SCSI 3; FPGA top uses hps_io slot 4 for it — the sim
+	// block-device model has no PRAM/Toolbox slots so the CD sits at 2).
+	output [31:0] sd_lba[3],
+	output [2:0]  sd_rd,
+	output [2:0]  sd_wr,
+	input  [2:0]  sd_ack,
 	input  [7:0]  sd_buff_addr,
 	input  [15:0] sd_buff_dout,
-	output [15:0] sd_buff_din[2],
+	output [15:0] sd_buff_din[3],
 	input         sd_buff_wr,
-	input  [1:0]  img_mounted,
+	input  [2:0]  img_mounted,
 	input  [63:0] img_size,
 
 	// CPU debug outputs
@@ -740,6 +742,26 @@ module emu
 	end
 `endif
 
+	// SCSI slot fan-out: disks drive array slots 0,1; the CD-ROM target
+	// drives slot 2 (read-only — sd_wr[2] tied off). Mirrors the MacLC.sv
+	// stitching so the shared dataController sees identical port shapes.
+	wire [31:0] scsi_lba[2];
+	wire [1:0]  scsi_rd, scsi_wr;
+	wire [15:0] scsi_buff_din[2];
+	wire [31:0] cd_lba;
+	wire        cd_rd;
+	wire [15:0] cd_buff_din;
+	assign sd_lba[0] = scsi_lba[0];
+	assign sd_lba[1] = scsi_lba[1];
+	assign sd_lba[2] = cd_lba;
+	assign sd_rd[1:0] = scsi_rd;
+	assign sd_rd[2]   = cd_rd;
+	assign sd_wr[1:0] = scsi_wr;
+	assign sd_wr[2]   = 1'b0;
+	assign sd_buff_din[0] = scsi_buff_din[0];
+	assign sd_buff_din[1] = scsi_buff_din[1];
+	assign sd_buff_din[2] = cd_buff_din;
+
 	dataController_top #(SCSI_DEVS) dc0
 	(
 		.clk32(clk_sys),
@@ -816,17 +838,28 @@ module emu
 		.diskMotor(diskMotor),
 		.diskAct(diskAct),
 
-		.img_mounted(img_mounted),
+		.img_mounted(img_mounted[1:0]),
 		.img_size(img_size[40:9]),
-		.io_lba(sd_lba),
-		.io_rd(sd_rd),
-		.io_wr(sd_wr),
-		.io_ack(sd_ack),
+		.io_lba(scsi_lba),
+		.io_rd(scsi_rd),
+		.io_wr(scsi_wr),
+		.io_ack(sd_ack[1:0]),
 
 		.sd_buff_addr(sd_buff_addr),
 		.sd_buff_dout(sd_buff_dout),
-		.sd_buff_din(sd_buff_din),
+		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),
+
+		// CD-ROM target (SCSI ID 3) block interface — sim slot 2.
+		// cd_enable tied on: the sim boot regression now exercises the
+		// disc-less CD target during the ROM SCSI scan.
+		.cd_enable(1'b1),
+		.cd_img_mounted(img_mounted[2]),
+		.cd_io_lba(cd_lba),
+		.cd_io_rd(cd_rd),
+		.cd_io_wr(),           // read-only target: never writes
+		.cd_io_ack(sd_ack[2]),
+		.cd_sd_buff_din(cd_buff_din),
 
 		// PRAM persistence — tied off (step 1); FSM wired in step 2
 		.pram_load_wr(1'b0),

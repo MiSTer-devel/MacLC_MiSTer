@@ -88,6 +88,18 @@ module ncr5380
 	input         tb_ack,
 	output [15:0] tb_buff_din,
 
+	// ---- CD-ROM target (SCSI ID 3) dedicated block interface ----------------
+	// Own hps_io slot; read-only. cd_enable = OSD "CD-ROM Drive" option: when
+	// off the target never answers selection (bus looks exactly like pre-CD
+	// builds — the A/B lever if the new target ever misbehaves on HW).
+	input         cd_enable,
+	input         cd_img_mounted,
+	output [31:0] cd_io_lba,
+	output        cd_io_rd,
+	output        cd_io_wr,
+	input         cd_io_ack,
+	output [15:0] cd_sd_buff_din,
+
 	// JTAG debug: selection/arbitration state for the hardware hang
 	output      [15:0] dbg_scsi,
 	// JTAG debug: post-selection phase + HPS disk handshake
@@ -124,7 +136,11 @@ module ncr5380
 	output      [31:0] dbg_wr
 );
 	parameter DEVS = 2;
-	parameter ENABLE_EMPTY_CD = 0;
+	// Read-prefetch ring depth for the CD target. 3 => 8 sectors / 4KB = two
+	// 2048-byte CD blocks buffered. Kept smaller than the disks' RING_LOG=5:
+	// the sector-buffer M10K budget is nearly full (scsi.v RING_LOG notes) and
+	// the CD is never the boot device, so latency-hiding matters less.
+	parameter CD_RING_LOG = 3;
 
 	reg  [7:0] mr;        /* Mode Register */
 	reg  [7:0] icr;       /* Initiator Command Register */
@@ -482,10 +498,10 @@ module ncr5380
    /* --- Simulated SCSI Signals --- */
 
    /* BSY logic (simplified arbitration, see notes) */
-	wire scsi_bsy = 
+	wire scsi_bsy =
 	    icr[`ICR_A_BSY] |
 	    |target_bsy |
-	    empty_cd_active |
+	    cd_bsy |
 	    //scsi2_bsy |
 	    //scsi6_bsy |
 	    mr[`MR_ARB];
@@ -528,15 +544,15 @@ module ncr5380
 			end
 		end
 
-		if (empty_cd_active) begin
-			scsi_cd = empty_cd_cd;
-			scsi_io = empty_cd_io;
-			scsi_msg = empty_cd_msg;
-			scsi_req = empty_cd_req;
-			scsi_req_bus = empty_cd_req_bus;
-			din = empty_cd_dout;
-			din_pair = empty_cd_dout_pair;
-			din_pair_next = empty_cd_dout_pair_next;
+		if (cd_bsy) begin
+			scsi_cd = cd_cd;
+			scsi_io = cd_io;
+			scsi_msg = cd_msg;
+			scsi_req = cd_req;
+			scsi_req_bus = cd_req_bus;
+			din = cd_dout;
+			din_pair = cd_dout_pair;
+			din_pair_next = cd_dout_pair_next;
 		end
 	end
 
@@ -582,37 +598,82 @@ module ncr5380
 	reg      [15:0] din_pair;
 	reg      [15:0] din_pair_next;
 
-	wire empty_cd_bsy;
-	wire empty_cd_msg;
-	wire empty_cd_io;
-	wire empty_cd_cd;
-	wire empty_cd_req;
-	wire empty_cd_req_bus;
-	wire [7:0] empty_cd_dout;
-	wire [15:0] empty_cd_dout_pair;
-	wire [15:0] empty_cd_dout_pair_next;
-	wire empty_cd_active = ENABLE_EMPTY_CD && empty_cd_bsy;
+	wire cd_bsy;
+	wire cd_msg;
+	wire cd_io;
+	wire cd_cd;
+	wire cd_req;
+	wire cd_req_bus;
+	wire [7:0] cd_dout;
+	wire [15:0] cd_dout_pair;
+	wire [15:0] cd_dout_pair_next;
 
-	scsi_empty_cd #(.ID(3'd3)) empty_cd
+	// CD-ROM target (SCSI ID 3, MAME maclc.cpp attaches NSCSI_CDROM_APPLE
+	// there). Same wedge-hardened scsi.v target as the disks, in CDROM mode:
+	// read-only, 2048-byte logical blocks over hps_io slot VD_CDROM, AppleCD
+	// command set. Supersedes the scsi_empty_cd stub (kept in scsi.v,
+	// no longer instantiated). Responds to selection whenever cd_enable —
+	// media-less selection returns the AppleCD no-disc sense, which is how
+	// the driver's insertion poll works.
+	scsi #(.ID(3'd3), .CDROM(1), .RING_LOG(CD_RING_LOG)) cdrom_target
 	(
 		.clk    ( clk ),
 		.rst    ( scsi_rst ),
-		.sel    ( ENABLE_EMPTY_CD ? scsi_sel : 1'b0 ),
+		.sel    ( scsi_sel ),
+		.cd_enable ( cd_enable ),
 		// Selection requires a free bus — a wedged-BUSY device must not let a
 		// second selection create two active targets sharing the broadcast ACK
 		// stream (LBMacTwo corruption fix 4376c8f).
 		.bus_busy ( |target_bsy ),
+		.atn    ( scsi_atn ),
+
 		.ack    ( scsi_ack ),
-		.bsy    ( empty_cd_bsy  ),
-		.msg    ( empty_cd_msg  ),
-		.cd     ( empty_cd_cd   ),
-		.io     ( empty_cd_io   ),
-		.req    ( empty_cd_req  ),
-		.req_bus( empty_cd_req_bus ),
-		.dout   ( empty_cd_dout ),
-		.dout_pair ( empty_cd_dout_pair ),
-		.dout_pair_next ( empty_cd_dout_pair_next ),
-		.din    ( scsi_bus_data )
+		.host_csr_rd ( csr_rd ),
+		.host_data_rd ( i_dma_rd ),
+
+		.bsy    ( cd_bsy  ),
+		.msg    ( cd_msg  ),
+		.cd     ( cd_cd   ),
+		.io     ( cd_io   ),
+		.req    ( cd_req  ),
+		.req_bus( cd_req_bus ),
+		.dout   ( cd_dout ),
+		.dout_pair ( cd_dout_pair ),
+		.dout_pair_next ( cd_dout_pair_next ),
+
+		.din    ( scsi_bus_data ),
+
+		.img_mounted( cd_img_mounted ),
+		.img_blocks( img_size ),
+		.io_lba ( cd_io_lba ),
+		.io_rd  ( cd_io_rd ),
+		.io_wr  ( cd_io_wr ),
+		.io_ack ( cd_io_ack & cd_bsy ),
+
+		.sd_buff_addr( sd_buff_addr ),
+		.sd_buff_dout( sd_buff_dout ),
+		.sd_buff_din( cd_sd_buff_din ),
+		.sd_buff_wr( sd_buff_wr & cd_bsy ),
+
+		// No Toolbox on the CD target.
+		.tb_mounted ( 1'b0 ),
+		.tb_lba     ( ),
+		.tb_rd      ( ),
+		.tb_wr      ( ),
+		.tb_ack     ( 1'b0 ),
+		.tb_buff_din( ),
+
+		.dbg_mounted( ),
+		.dbg_phase( ),
+		.dbg_hs( ),
+		.dbg_hs2( ),
+		.dbg_cmd( ),
+		.dbg_dma_word( dma_word_latched ),
+		.dbg_dma_long( dma_longword_latched ),
+		.dbg_dma_lowbyte( dma_write_low_byte ),
+		.dbg_wrsnap( ),
+		.dbg_selsnap( ),
+		.dbg_wrstall( )
 	);
 
 	generate
@@ -624,9 +685,10 @@ module ncr5380
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
 				.sel    ( scsi_sel ),
+				.cd_enable ( 1'b0 ),   // disk target: CDROM=0, selection uses mounted
 				// Free-bus selection gate (4376c8f); own bsy bit is harmless —
 				// the gate is only evaluated in the target's IDLE phase.
-				.bus_busy ( (|target_bsy) | empty_cd_active ),
+				.bus_busy ( (|target_bsy) | cd_bsy ),
 				.atn    ( scsi_atn ),
 
 				.ack    ( scsi_ack ),
