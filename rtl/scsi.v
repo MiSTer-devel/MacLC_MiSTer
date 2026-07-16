@@ -834,14 +834,14 @@ wire [7:0] tb_b_d1    = (tb_state == TBS_LOAD) ? tb_load_b1 : din;   // CDB odd 
 
 wire [7:0] tb0_dout, tb0_dout_next, tb0_dout_next2;
 wire [7:0] tb1_dout, tb1_dout_next, tb1_dout_next2;
-scsi_dpram #(.ADDRWIDTH(8)) tb_buf0 (
+scsi_dpram_m10k #(.ADDRWIDTH(8)) tb_buf0 (
 	.clock(clk),
 	.address_a(sd_buff_addr), .data_a(tb_buf0_da), .wren_a(tb_hps_wr), .q_a(tb_buf0_qa),
 	.address_b(tb_b_addr), .data_b(tb_b_d0), .wren_b(tb_b_wr0), .q_b(tb0_dout),
 	.address_c(tb_b_addr + 1'b1), .q_c(tb0_dout_next),
 	.address_d(tb_b_addr + 2'd2), .q_d(tb0_dout_next2)
 );
-scsi_dpram #(.ADDRWIDTH(8)) tb_buf1 (
+scsi_dpram_m10k #(.ADDRWIDTH(8)) tb_buf1 (
 	.clock(clk),
 	.address_a(sd_buff_addr), .data_a(tb_buf1_da), .wren_a(tb_hps_wr), .q_a(tb_buf1_qa),
 	.address_b(tb_b_addr), .data_b(tb_b_d1), .wren_b(tb_b_wr1), .q_b(tb1_dout),
@@ -2009,6 +2009,72 @@ module scsi_dpram #(parameter DATAWIDTH=8, ADDRWIDTH=9)
 reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
 reg [DATAWIDTH-1:0] ram_c [0:(1<<ADDRWIDTH)-1];
 reg [DATAWIDTH-1:0] ram_d [0:(1<<ADDRWIDTH)-1];
+
+wire                  mirror_we    = wren_a | wren_b;
+wire [ADDRWIDTH-1:0]  mirror_waddr = wren_a ? address_a : address_b;
+wire [DATAWIDTH-1:0]  mirror_wdata = wren_a ? data_a    : data_b;
+
+always @(posedge clock) begin
+	if(wren_a) begin
+		ram_ab[address_a] <= data_a;
+		q_a <= data_a;
+	end else begin
+		q_a <= ram_ab[address_a];
+	end
+end
+
+always @(posedge clock) begin
+	if(wren_b) begin
+		ram_ab[address_b] <= data_b;
+		q_b <= data_b;
+	end else begin
+		q_b <= ram_ab[address_b];
+	end
+end
+
+always @(posedge clock) begin
+	if(mirror_we) ram_c[mirror_waddr] <= mirror_wdata;
+	q_c <= ram_c[address_c];
+end
+
+always @(posedge clock) begin
+	if(mirror_we) ram_d[mirror_waddr] <= mirror_wdata;
+	q_d <= ram_d[address_d];
+end
+
+endmodule
+
+// scsi_dpram_m10k: same 4-port contract as scsi_dpram, with vram_bram's
+// forced-M10K inference recipe. Small (2 Kbit) instances of the plain
+// scsi_dpram silently become ~1000-1600 LUTs of register fabric each
+// (Quartus 17 small-RAM heuristic; discovered 2026-07-16 via the cd_audio
+// LAB-overflow hunt — the Toolbox tb_buf0/1 had been fabric since June).
+// Used by the Toolbox buffers only; the wedge-proven disk ring buffers keep
+// the original module untouched.
+module scsi_dpram_m10k #(parameter DATAWIDTH=8, ADDRWIDTH=9)
+(
+	input	                clock,
+
+	input	[ADDRWIDTH-1:0] address_a,
+	input	[DATAWIDTH-1:0] data_a,
+	input	                wren_a,
+	output reg [DATAWIDTH-1:0] q_a,
+
+	input	[ADDRWIDTH-1:0] address_b,
+	input	[DATAWIDTH-1:0] data_b,
+	input	                wren_b,
+	output reg [DATAWIDTH-1:0] q_b,
+
+	input	[ADDRWIDTH-1:0] address_c,
+	output reg [DATAWIDTH-1:0] q_c,
+
+	input	[ADDRWIDTH-1:0] address_d,
+	output reg [DATAWIDTH-1:0] q_d
+);
+
+(* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
+(* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_c [0:(1<<ADDRWIDTH)-1];
+(* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_d [0:(1<<ADDRWIDTH)-1];
 
 wire                  mirror_we    = wren_a | wren_b;
 wire [ADDRWIDTH-1:0]  mirror_waddr = wren_a ? address_a : address_b;
