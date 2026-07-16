@@ -92,7 +92,12 @@ cd_sdp #(.DW(16), .AW(9)) blob_ram (
 wire [7:0] blob_b0 = blob_q[7:0];      // even byte (LE lane order on FPGA)
 wire [7:0] blob_b1 = blob_q[15:8];
 
-// 0xC1 response: two byte planes x 256, two read ports each = 4 serve lanes
+// 0xC1 response: two byte planes x 256, two read ports each = 4 serve lanes.
+// Four mirrored 1w1r cd_sdp instances (same write, distinct read address)
+// rather than scsi_dpram: with a constant-zero wren on one port, Quartus 17
+// drops the TDP template and silently falls back to ~2000 LUTs of register
+// fabric per plane (the 2026-07-07 BRAM-inference lesson; verified in
+// map.rpt on the first fit attempt of this file).
 reg        resp_we;
 reg  [8:0] resp_wa;
 reg  [7:0] resp_wd;
@@ -101,21 +106,25 @@ wire [7:0] re_q0, re_q1, ro_q0, ro_q1;
 // odd  byte at/after addr x lives at plane index  x >> 1
 wire [8:0] tb0 = toc_base;
 wire [8:0] tb2 = toc_base + 9'd2;
-scsi_dpram #(.DATAWIDTH(8), .ADDRWIDTH(8)) resp_even (
-	.clock(clk),
-	.address_a(resp_wa[8:1]), .data_a(resp_wd),
-	.wren_a(resp_we && !resp_wa[0]), .q_a(),
-	.address_b((tb0 + {8'd0, tb0[0]}) >> 1), .data_b(8'd0), .wren_b(1'b0), .q_b(re_q0),
-	.address_c((tb2 + {8'd0, tb2[0]}) >> 1), .q_c(re_q1),
-	.address_d(8'd0), .q_d()
+wire       resp_we_e = resp_we && !resp_wa[0];
+wire       resp_we_o = resp_we &&  resp_wa[0];
+wire [8:0] tb0_e = (tb0 + {8'd0, tb0[0]}) >> 1;
+wire [8:0] tb2_e = (tb2 + {8'd0, tb2[0]}) >> 1;
+cd_sdp #(.DW(8), .AW(8)) resp_e0 (
+	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_e),
+	.raddr(tb0_e[7:0]), .q(re_q0)
 );
-scsi_dpram #(.DATAWIDTH(8), .ADDRWIDTH(8)) resp_odd (
-	.clock(clk),
-	.address_a(resp_wa[8:1]), .data_a(resp_wd),
-	.wren_a(resp_we && resp_wa[0]), .q_a(),
-	.address_b(tb0[8:1]), .data_b(8'd0), .wren_b(1'b0), .q_b(ro_q0),
-	.address_c(tb2[8:1]), .q_c(ro_q1),
-	.address_d(8'd0), .q_d()
+cd_sdp #(.DW(8), .AW(8)) resp_e1 (
+	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_e),
+	.raddr(tb2_e[7:0]), .q(re_q1)
+);
+cd_sdp #(.DW(8), .AW(8)) resp_o0 (
+	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_o),
+	.raddr(tb0[8:1]), .q(ro_q0)
+);
+cd_sdp #(.DW(8), .AW(8)) resp_o1 (
+	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_o),
+	.raddr(tb2[8:1]), .q(ro_q1)
 );
 assign toc_q0 = tb0[0] ? ro_q0 : re_q0;
 assign toc_q1 = tb0[0] ? re_q0 : ro_q0;   // byte at tb0+1: opposite plane, same pair
