@@ -52,7 +52,14 @@ module asc(
 	// Sample rate: MAME streams the ASC at 22257 Hz. 32.5 MHz / 22257 ≈ 1460.
 	localparam SAMPLE_DIV = 16'd1460;
 
-	reg [7:0]  fifo_a [0:1023];
+	// FIFO A storage in forced-M10K BRAM (cd_sdp, rtl/cd_audio.sv). As a plain
+	// register array Quartus 17's small-RAM heuristic silently built it from
+	// ~8K registers + mux fabric (discovered in the 2026-07-16 LAB-overflow
+	// hunt). Read side: fifo_a_q continuously tracks fifo_a[rptr_a] with a
+	// 1-cycle lag — invisible at the 22 kHz pop cadence (1460 idle clocks
+	// between pops), and a push can only land on the read slot when the FIFO
+	// is empty (sample path skipped) or full (push blocked), both guarded.
+	wire [7:0] fifo_a_q;
 	reg [9:0]  wptr_a, rptr_a;
 	reg [10:0] count_a;          // 0..1024
 	reg [15:0] sample_div;
@@ -79,6 +86,12 @@ module asc(
 		else if (cpu_as_n) asc_armed <= 1'b1; // bus cycle ended → re-arm
 		else if (we_stb)   asc_armed <= 1'b0; // captured this cycle's write
 	end
+
+	cd_sdp #(.DW(8), .AW(10)) fifo_a_ram (
+		.clock(clk),
+		.waddr(wptr_a), .wdata(data_in), .wr(fifo_a_push),
+		.raddr(rptr_a), .q(fifo_a_q)
+	);
 
 	wire fifo_a_write = we_stb && (addr < 12'h400);
 	// FIFO B ($400-$7FF) writes are ignored on the V8.
@@ -118,8 +131,8 @@ module asc(
 				sample_div  <= 0;
 				sample_tick <= 1'b1;
 				if (count_a != 0) begin
-					sample_l <= {~fifo_a[rptr_a][7], fifo_a[rptr_a][6:0], 8'h00};
-					sample_r <= {~fifo_a[rptr_a][7], fifo_a[rptr_a][6:0], 8'h00};
+					sample_l <= {~fifo_a_q[7], fifo_a_q[6:0], 8'h00};
+					sample_r <= {~fifo_a_q[7], fifo_a_q[6:0], 8'h00};
 				end
 				// when empty, hold the last sample (matches MAME asc_v8)
 			end else begin
@@ -131,7 +144,6 @@ module asc(
 				wptr_a <= 0; rptr_a <= 0; count_a <= 0;
 			end else begin
 				if (fifo_a_push) begin
-					fifo_a[wptr_a] <= data_in;
 					wptr_a <= wptr_a + 1'b1;
 				end
 				if (pop_a)
