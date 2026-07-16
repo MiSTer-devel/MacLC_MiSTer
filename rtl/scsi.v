@@ -30,11 +30,15 @@ module scsi
 	output [15:0] dout_pair,
 	output [15:0] dout_pair_next,
 
+	// CD audio PCM (CDROM targets only; zeros on disks). Mixed at the top.
+	output signed [15:0] cd_snd_l,
+	output signed [15:0] cd_snd_r,
+
 	// interface to io controller
 	input         img_mounted,
 	input  [31:0] img_blocks,
 	output [31:0] io_lba,
-	output reg 	  io_rd,
+	output        io_rd,
 	output reg 	  io_wr,
 	input         io_ack,
 
@@ -184,7 +188,7 @@ scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer0
 
 	.address_a(hps_addr),
 	.data_a(buf0_data_a),
-	.wren_a(sd_buff_wr),
+	.wren_a(sd_buff_wr && !ca_io_active),
 	.q_a(buf0_q_a),
 
 	.address_b(mac_addr),
@@ -240,7 +244,7 @@ scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer1
 
 	.address_a(hps_addr),
 	.data_a(buf1_data_a),
-	.wren_a(sd_buff_wr),
+	.wren_a(sd_buff_wr && !ca_io_active),
 	.q_a(buf1_q_a),
 
 	.address_b(mac_addr),
@@ -296,7 +300,7 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // being filled" test. WRITE + non-data clauses unchanged.
 wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_blk)) ||
                  (phase == PHASE_DATA_IN  && (io_wr | io_ack) && data_cnt[9] == sd_buff_sel) ||
-                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd | io_wr | io_ack));
+                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
 	// WRITE with transfer length 0) must complete immediately: data_complete
 	// only sets on an ACK edge, which never comes when the initiator expects
@@ -555,100 +559,80 @@ wire [7:0] read_capacity_dout_next3 =
 // =====================================================================
 // CDROM response synthesis (folds away on disk targets).
 //
-// Apple READ TOC (0xC1, MAME nscsi_cdrom_apple_device): BCD values, MSF
-// addresses, op = CDB[9][7:6]:
-//   00 -> {first track 01, last track 01, 0, 0}
-//   01 -> lead-out start {M, S, F, 0}
-//   10 -> per-track 4-byte descriptors {ADR/control, M, S, F}, repeating the
-//         last track past the end. One data track at LBA 0 => every
-//         descriptor is {0x14, 00, 00, 00} (MAME to_msf() has NO +150 pregap
-//         offset in the Apple handler — matched deliberately).
-// The only computed field is the lead-out MSF: a tiny FSM converts capacity
-// to BCD M/S/F once per mount (~160 clks), so the serve path stays pure
-// combinational constants — no divider near the REQ/ACK machinery.
+// The cd_audio engine (rtl/cd_audio.sv) owns the real multi-track TOC
+// (fetched from the HPS MCDA blob window, with a synthesized single-track
+// fallback for stock Main / sim / flat images), the AppleCD playback state
+// machine and the live position registers. This section only wires its
+// precomputed 0xC1 response RAM and live 0xCC/0xC2 registers into the
+// serve lanes — the serve path stays free of any live arithmetic.
+// Oracle: MAME nscsi_cdrom_apple_device, as before.
 // =====================================================================
-reg [7:0] cd_lead_m = 8'h00, cd_lead_s = 8'h00, cd_lead_f = 8'h00;  // BCD
-
-function [7:0] cd_to_bcd;
-	input [6:0] v;   // 0..99
-	reg [6:0] tens;
-	reg [6:0] ones;
-	begin
-		tens = v / 7'd10;
-		ones = v % 7'd10;
-		cd_to_bcd = {tens[3:0], ones[3:0]};
-	end
+function [7:0] cd_bcd2bin;
+	input [7:0] b;
+	cd_bcd2bin = {4'd0, b[7:4]} * 8'd10 + {4'd0, b[3:0]};
 endfunction
 
-reg [19:0] cd_msf_val;
-reg  [6:0] cd_msf_m;
-reg  [5:0] cd_msf_s;
-reg  [1:0] cd_msf_st = 2'd0;
-always @(posedge clk) begin
-	if ((CDROM != 0) && img_mounted && |img_blocks) begin
-		cd_msf_val <= img_blocks[21:2];   // lead-out LBA = total 2048-byte blocks
-		cd_msf_m   <= 7'd0;
-		cd_msf_s   <= 6'd0;
-		cd_msf_st  <= 2'd1;
-	end else if (CDROM != 0) begin
-		case (cd_msf_st)
-		2'd1: if ((cd_msf_val >= 20'd4500) && (cd_msf_m != 7'd99)) begin
-				cd_msf_val <= cd_msf_val - 20'd4500;   // minutes (saturate at BCD 99)
-				cd_msf_m   <= cd_msf_m + 1'd1;
-			end else cd_msf_st <= 2'd2;
-		2'd2: if (cd_msf_val >= 20'd75) begin
-				cd_msf_val <= cd_msf_val - 20'd75;     // seconds
-				cd_msf_s   <= cd_msf_s + 1'd1;
-			end else cd_msf_st <= 2'd3;
-		2'd3: begin
-				cd_lead_m <= cd_to_bcd(cd_msf_m);
-				cd_lead_s <= cd_to_bcd({1'b0, cd_msf_s});
-				cd_lead_f <= cd_to_bcd(cd_msf_val[6:0]);
-				cd_msf_st <= 2'd0;
-			end
-		default: ;
-		endcase
-	end
-end
+// cd_audio interface wires (driven by the generate block near the io logic)
+wire        ca_io_active, ca_io_rd_w;
+wire [31:0] ca_io_lba;
+wire  [7:0] ca_ast_code, ca_cur_ctrl, ca_cur_trk;
+wire  [7:0] ca_abs_m, ca_abs_s, ca_abs_f, ca_rel_m, ca_rel_s, ca_rel_f;
+wire  [7:0] ca_toc_q0, ca_toc_q1, ca_toc_q2, ca_toc_q3;
+wire        ca_toc_ready;
+reg         ca_cmd_stb = 1'b0, ca_read_stb = 1'b0, ca_eject_stb = 1'b0;
 
-function [7:0] cd_toc_byte;
-	input [31:0] cnt;
-	begin
-		case (cmd[9][7:6])
-		2'b00:   cd_toc_byte = (cnt == 32'd0) ? 8'h01 :         // first track (BCD)
-		                       (cnt == 32'd1) ? 8'h01 : 8'h00;  // last track (BCD)
-		2'b01:   cd_toc_byte = (cnt == 32'd0) ? cd_lead_m :
-		                       (cnt == 32'd1) ? cd_lead_s :
-		                       (cnt == 32'd2) ? cd_lead_f : 8'h00;
-		2'b10:   cd_toc_byte = (cnt[1:0] == 2'd0) ? 8'h14 : 8'h00;
-		default: cd_toc_byte = 8'h00;
-		endcase
-	end
-endfunction
+// Apple 0xC1 serve addressing into the engine's response RAM:
+//   layout [0..3] header, [4..7] lead-out, [8+4k..] track k+1 descriptors.
+// Mode (CDB[9][7:6]) selects the base; track mode indexes by BCD CDB[5].
+// Reads past the 99 precomputed descriptors clamp to the last one
+// (byte-in-descriptor preserved) — MAME "keep returning the last track".
+wire [7:0] ca_toc_trk_bin = cd_bcd2bin(cmd[5]);
+wire [8:0] ca_toc_trk_k   = (ca_toc_trk_bin == 8'd0) ? 9'd0 :
+                            (ca_toc_trk_bin >  8'd99) ? 9'd98 :
+                            {1'b0, ca_toc_trk_bin} - 9'd1;
+wire [8:0] ca_toc_base =
+	(cmd[9][7:6] == 2'b01) ? 9'd4 :
+	(cmd[9][7:6] == 2'b10) ? (9'd8 + {ca_toc_trk_k[6:0], 2'b00}) :
+	                         9'd0;
+wire [8:0] ca_toc_raw  = ca_toc_base + data_cnt[8:0];
+wire [8:0] ca_toc_addr = (ca_toc_raw < 9'd404) ? ca_toc_raw
+                       : (9'd400 + {7'd0, ca_toc_raw[1:0]});
 
-// READ Q SUBCODE (0xC2, 9 bytes): idle deck — track 01 (BCD), index 01,
-// relative and absolute position 00:00:00.
+wire [7:0] cd_toc_dout         = ca_toc_ready ? ca_toc_q0 : 8'h00;
+wire [7:0] cd_toc_dout_next    = ca_toc_ready ? ca_toc_q1 : 8'h00;
+wire [7:0] cd_toc_dout_next2   = ca_toc_ready ? ca_toc_q2 : 8'h00;
+wire [7:0] cd_toc_dout_next3   = ca_toc_ready ? ca_toc_q3 : 8'h00;
+
+// READ Q SUBCODE (0xC2, 9 bytes): control, track BCD, index 01, relative
+// M/S/F, absolute M/S/F — live registers from the engine.
 function [7:0] cd_subq_byte;
 	input [31:0] cnt;
 	begin
-		cd_subq_byte = ((cnt == 32'd1) || (cnt == 32'd2)) ? 8'h01 : 8'h00;
+		cd_subq_byte = (cnt == 32'd1) ? ca_cur_trk :
+		               (cnt == 32'd2) ? 8'h01 :
+		               (cnt == 32'd3) ? ca_rel_m :
+		               (cnt == 32'd4) ? ca_rel_s :
+		               (cnt == 32'd5) ? ca_rel_f :
+		               (cnt == 32'd6) ? ca_abs_m :
+		               (cnt == 32'd7) ? ca_abs_s :
+		               (cnt == 32'd8) ? ca_abs_f : 8'h00;
 	end
 endfunction
 
-// AUDIO STATUS (0xCC, 6 bytes): status 5 = VOID/idle (m_stopped reset state),
-// ADR/control of the current (data) track, position 00:00:00.
+// AUDIO STATUS (0xCC, 6 bytes): {status, 0, ADR/control, abs M, S, F};
+// type 1 (CDB[3]==1) reports channel volumes instead (0xFF = full).
 function [7:0] cd_astat_byte;
 	input [31:0] cnt;
 	begin
-		cd_astat_byte = (cnt == 32'd0) ? 8'h05 :
-		                (cnt == 32'd2) ? 8'h14 : 8'h00;
+		cd_astat_byte = (cnt == 32'd0) ? ((cmd[3] == 8'd1) ? 8'hFF : ca_ast_code) :
+		                (cnt == 32'd1) ? ((cmd[3] == 8'd1) ? 8'hFF : 8'h00) :
+		                (cnt == 32'd2) ? ca_cur_ctrl :
+		                (cnt == 32'd3) ? ca_abs_m :
+		                (cnt == 32'd4) ? ca_abs_s :
+		                (cnt == 32'd5) ? ca_abs_f : 8'h00;
 	end
 endfunction
 
-wire [7:0] cd_toc_dout         = cd_toc_byte(data_cnt);
-wire [7:0] cd_toc_dout_next    = cd_toc_byte(data_cnt_next);
-wire [7:0] cd_toc_dout_next2   = cd_toc_byte(data_cnt_next2);
-wire [7:0] cd_toc_dout_next3   = cd_toc_byte(data_cnt_next3);
 wire [7:0] cd_subq_dout        = cd_subq_byte(data_cnt);
 wire [7:0] cd_subq_dout_next   = cd_subq_byte(data_cnt_next);
 wire [7:0] cd_subq_dout_next2  = cd_subq_byte(data_cnt_next2);
@@ -926,7 +910,8 @@ end
 
 /* ----------------------- request data from/to io controller ----------------------- */
 
-assign io_lba = lba;
+// CD-audio/TOC fetches own the address bus while their request is live
+assign io_lba = ca_io_active ? ca_io_lba : lba;
 
 // READ prefetch (ring): keep issuing sequential sector fetches while sectors
 // remain (rd_hps_blk < tlen) and the ring has space (fetched no more than
@@ -949,6 +934,14 @@ wire req_rd = (phase == PHASE_DATA_OUT) && cmd_read && (data_len != 32'd0) &&
 // sector-buffer block (the previous READ's data) to the command's LBA.
 wire req_wr = ((((phase == PHASE_DATA_IN) && (data_cnt[8:0] == 0) && (data_cnt != 0)) || (phase == PHASE_STATUS_OUT)) && cmd_write && (data_len != 32'd0));
 
+// Data-path io_rd (the ring engine's own request). The module output is the
+// OR with the CD-audio engine's request; the engine only runs while the
+// target is bus-idle with no data io pending (ca_grant below), so the two
+// requestors never overlap — and a pending req_rd naturally waits for the
+// audio block in flight via the !io_rd guard on the shared wire.
+reg io_rd_d;
+assign io_rd = io_rd_d | ca_io_rd_w;
+
 always @(posedge clk) begin
 	reg old_wr;
 	reg wr_pending;
@@ -961,7 +954,7 @@ always @(posedge clk) begin
 	// command never transfers, the Mac times out and resets again -> the
 	// intermittent reset/re-scan loop observed on hardware.
 	if(rst) begin
-		io_rd <= 1'b0;
+		io_rd_d <= 1'b0;
 		io_wr <= 1'b0;
 		wr_pending <= 0;
 		old_wr <= 0;
@@ -975,8 +968,10 @@ always @(posedge clk) begin
 		// the ring filled ahead of the Mac. rd_busy holds across a fetch until
 		// rd_hps_blk advances on the io_ack falling edge, so exactly one fetch
 		// is issued per sector and the next can start immediately after.
-		if(io_ack) io_rd <= 1'b0;
-		else if(req_rd && !io_rd && !rd_busy) begin io_rd <= 1'b1; rd_busy <= 1'b1; end
+		// (io_rd in the guard is the shared wire: a CD-audio block in flight
+		// defers the ring's next fetch by one HPS block, nothing more.)
+		if(io_ack) io_rd_d <= 1'b0;
+		else if(req_rd && !io_rd && !rd_busy) begin io_rd_d <= 1'b1; rd_busy <= 1'b1; end
 		if(old_io_ack & ~io_ack) rd_busy <= 1'b0;
 
 		// WRITE flush engine — unchanged two-slot double-buffer behavior.
@@ -984,6 +979,50 @@ always @(posedge clk) begin
 		else if(wr_pending && !io_wr) begin io_wr <= 1'b1; wr_pending <= 0; end
 	end
 end
+
+// =====================================================================
+// CD audio engine (CDROM targets only; every ca_* wire folds to a constant
+// on disks). Owns the AppleCD playback state machine, the real TOC, and
+// the audio-frame streaming from the HPS windows. It may use the io
+// channel only while the target is bus-idle with no data io pending.
+// =====================================================================
+wire ca_grant = (phase == PHASE_IDLE) && !io_rd_d && !io_wr && !io_ack && mounted;
+
+generate if (CDROM != 0) begin : g_cd_audio
+	cd_audio #(.CLK_HZ(32'd32_500_000)) cd_audio_i (   // clk_sys rate; audio pitch verifies it
+		.clk(clk), .rst(rst),
+		.mounted(mounted), .img_mounted(img_mounted), .img_blocks(img_blocks),
+		.cmd_stb(ca_cmd_stb), .cmd_op(cmd[0]),
+		.cdb1(cmd[1]), .cdb2(cmd[2]), .cdb3(cmd[3]), .cdb4(cmd[4]),
+		.cdb5(cmd[5]), .cdb6(cmd[6]), .cdb7(cmd[7]), .cdb9(cmd[9]),
+		.read_stb(ca_read_stb), .eject_stb(ca_eject_stb),
+		.ch_grant(ca_grant),
+		.ca_io_active(ca_io_active), .ca_io_rd(ca_io_rd_w), .ca_io_lba(ca_io_lba),
+		.io_ack(io_ack),
+		.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
+		.ast_code(ca_ast_code), .cur_ctrl(ca_cur_ctrl), .cur_trk_bcd(ca_cur_trk),
+		.abs_m(ca_abs_m), .abs_s(ca_abs_s), .abs_f(ca_abs_f),
+		.rel_m(ca_rel_m), .rel_s(ca_rel_s), .rel_f(ca_rel_f),
+		.toc_base(ca_toc_addr),
+		.toc_q0(ca_toc_q0), .toc_q1(ca_toc_q1), .toc_q2(ca_toc_q2), .toc_q3(ca_toc_q3),
+		.toc_ready(ca_toc_ready),
+		.snd_l(cd_snd_l), .snd_r(cd_snd_r)
+	);
+end else begin : g_no_cd_audio
+	assign ca_io_active = 1'b0;
+	assign ca_io_rd_w   = 1'b0;
+	assign ca_io_lba    = 32'd0;
+	assign ca_ast_code  = 8'h05;
+	assign ca_cur_ctrl  = 8'h14;
+	assign ca_cur_trk   = 8'h01;
+	assign ca_abs_m = 8'h00; assign ca_abs_s = 8'h00; assign ca_abs_f = 8'h00;
+	assign ca_rel_m = 8'h00; assign ca_rel_s = 8'h00; assign ca_rel_f = 8'h00;
+	assign ca_toc_q0 = 8'h00; assign ca_toc_q1 = 8'h00;
+	assign ca_toc_q2 = 8'h00; assign ca_toc_q3 = 8'h00;
+	assign ca_toc_ready = 1'b0;
+	assign cd_snd_l = 16'sd0;
+	assign cd_snd_r = 16'sd0;
+end endgenerate
 
 reg  stb_ack;
 reg  stb_adv;
@@ -1395,7 +1434,10 @@ wire [15:0] tlen10 = { cmd[7], cmd[8] };
 always @(posedge clk) begin
 	if(rst) begin
 		phase <= PHASE_IDLE;
+		ca_cmd_stb <= 1'b0; ca_read_stb <= 1'b0; ca_eject_stb <= 1'b0;
 	end else begin
+		// CD-audio engine strobes: 1-clk pulses on command acceptance below
+		ca_cmd_stb <= 1'b0; ca_read_stb <= 1'b0; ca_eject_stb <= 1'b0;
 		if(phase == PHASE_IDLE) begin
 			// Own id on bus during selection? Real SCSI selection requires a
 			// FREE bus (SEL asserted, BSY false): while another device holds
@@ -1420,6 +1462,11 @@ always @(posedge clk) begin
 				if(cmd_ok && !cd_no_media) begin
 					// yes, continue
 					status <= (cmd_cd_eject && cd_prevent) ? `STATUS_CHECK_CONDITION : `STATUS_OK;
+
+					// notify the CD-audio engine (all constant 0 on disks)
+					ca_cmd_stb   <= cmd_cd_audio_nop;
+					ca_read_stb  <= cmd_read && (CDROM != 0);
+					ca_eject_stb <= cmd_cd_eject && !cd_prevent;
 
 					// continue according to command
 

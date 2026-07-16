@@ -88,6 +88,10 @@ module ncr5380
 	input         tb_ack,
 	output [15:0] tb_buff_din,
 
+	// CD audio PCM from the CDROM target's playback engine
+	output signed [15:0] cd_snd_l,
+	output signed [15:0] cd_snd_r,
+
 	// ---- CD-ROM target (SCSI ID 3) dedicated block interface ----------------
 	// Own hps_io slot; read-only. cd_enable = OSD "CD-ROM Drive" option: when
 	// off the target never answers selection (bus looks exactly like pre-CD
@@ -619,6 +623,8 @@ module ncr5380
 	(
 		.clk    ( clk ),
 		.rst    ( scsi_rst ),
+		.cd_snd_l ( cd_snd_l ),
+		.cd_snd_r ( cd_snd_r ),
 		.sel    ( scsi_sel ),
 		.cd_enable ( cd_enable ),
 		// Selection requires a free bus — a wedged-BUSY device must not let a

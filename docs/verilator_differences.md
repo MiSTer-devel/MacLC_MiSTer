@@ -101,6 +101,14 @@ These must stay identical; they were checked and match today.
   motion/left-click → `ps2_mouse` with X/Y sign bits set. Arrow keys + A/B are a
   fallback when not captured. On FPGA these come from the HPS (USB) instead.
 
+## CD audio (2026-07-16)
+
+`dataController_top` gained `cd_snd_l/r` (CD-audio PCM from the SCSI CDROM
+target's cd_audio engine). `MacLC.sv` mixes them into AUDIO_L/R (half gain,
+saturating); `sim.v` leaves them unconnected (PINMISSING is waived) — sim CD
+mounts also read garbage from the TOC-blob window (the sim blockdevice has no
+HPS windows), so the engine takes its synthesized single-track fallback there.
+
 ## Maintenance checklist (when editing the core)
 
 1. Touching CPU/bus glue (BERR/VPA/DTACK/overlay/IPL)? Edit **both** `sim.v` and

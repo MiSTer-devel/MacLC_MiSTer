@@ -116,6 +116,10 @@ module dataController_top(
 	input                   tb_ack,
 	output           [15:0] tb_buff_din,
 
+	// CD audio PCM (from the SCSI CDROM target's playback engine)
+	output signed    [15:0] cd_snd_l,
+	output signed    [15:0] cd_snd_r,
+
 	// ---- CD-ROM target (SCSI ID 3) dedicated block interface ----
 	input                   cd_enable,
 	input                   cd_img_mounted,
@@ -420,6 +424,8 @@ module dataController_top(
 		.tb_wr(tb_wr),
 		.tb_ack(tb_ack),
 		.tb_buff_din(tb_buff_din),
+		.cd_snd_l(cd_snd_l),
+		.cd_snd_r(cd_snd_r),
 
 		// CD-ROM target (SCSI ID 3) pass-through.
 		.cd_enable(cd_enable),

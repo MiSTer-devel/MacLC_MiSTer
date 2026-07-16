@@ -576,9 +576,18 @@ module emu
 		v8_hblank_s <= hbl_meta;
 	end
 
-	// ASC samples drive AUDIO_L/R directly (Commit C). Legacy DMA gone.
-	assign AUDIO_L = asc_sample_l;
-	assign AUDIO_R = asc_sample_r;
+	// ASC samples drive AUDIO_L/R, with CD audio (SCSI CD-ROM playback
+	// engine) mixed in at half gain, saturating. cd_snd_* are silent
+	// (exact zeros) whenever the drive isn't playing.
+	wire signed [15:0] cd_snd_l, cd_snd_r;
+	wire signed [16:0] audio_mix_l = {asc_sample_l[15], asc_sample_l}
+	                               + {{2{cd_snd_l[15]}}, cd_snd_l[15:1]};
+	wire signed [16:0] audio_mix_r = {asc_sample_r[15], asc_sample_r}
+	                               + {{2{cd_snd_r[15]}}, cd_snd_r[15:1]};
+	assign AUDIO_L = (audio_mix_l > 17'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_l < -17'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
+	assign AUDIO_R = (audio_mix_r > 17'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_r < -17'sd32768) ? -16'sd32768 : audio_mix_r[15:0];
 	assign AUDIO_S = 1;
 	assign AUDIO_MIX = 0;
 
@@ -1580,6 +1589,8 @@ module emu
 		.tb_wr(tb_wr),
 		.tb_ack(tb_ack),
 		.tb_buff_din(tb_buff_din),
+		.cd_snd_l(cd_snd_l),
+		.cd_snd_r(cd_snd_r),
 
 		// CD-ROM target (SCSI ID 3) block interface (slot VD_CDROM).
 		.cd_enable(cd_enable),
