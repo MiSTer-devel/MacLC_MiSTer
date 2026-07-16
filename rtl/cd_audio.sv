@@ -737,9 +737,11 @@ module cd_sdp #(parameter DW = 16, AW = 12)
 	input  [AW-1:0] raddr,
 	output reg [DW-1:0] q
 );
-reg [DW-1:0] ram [0:(1<<AW)-1];
-always @(posedge clock) begin
-	if (wr) ram[waddr] <= wdata;
-	q <= ram[raddr];
-end
+// vram_bram's hardware-proven inference recipe (see rtl/vram_bram.sv):
+// forced "M10K" (overrides the small-RAM heuristic that silently turned the
+// 2 Kbit response planes into ~2000 registers each — fit attempts #1-#3 of
+// this file) + no_rw_check, with write and read in SEPARATE always blocks.
+(* ramstyle = "M10K,no_rw_check" *) reg [DW-1:0] ram [0:(1<<AW)-1];
+always @(posedge clock) if (wr) ram[waddr] <= wdata;
+always @(posedge clock) q <= ram[raddr];
 endmodule
