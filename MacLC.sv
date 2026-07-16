@@ -261,9 +261,17 @@ module emu
 	reg        old_pack, old_osd, old_mnt2, old_rstpram;
 	reg        pram_ready;        // -> Egret: pram[] loaded (or no image / timed out)
 	reg [31:0] pram_rdy_cnt;      // ready backstop so a missing image never hangs boot
+	reg        pram_restart_after_load; // load landed after CPU release -> clean restart
+	reg [26:0] pram_ld_wd;        // load watchdog: re-kick a stalled SD read
+	reg  [1:0] pram_ld_try;       // retries before giving up (boot with defaults)
 
 	localparam [3:0] P_IDLE=0, P_LD_RD=1, P_LD_DAT=2, P_LD_CPY=3,
-	                 P_FILL=4, P_SV_WR=5, P_SV_DAT=6, P_CLR=7, P_RST=8;
+	                 P_FILL=4, P_SV_WR=5, P_SV_DAT=6, P_CLR=7, P_RST=8, P_LD_KICK=9;
+	// ~1 s at 65 MHz clk_sys (~2 s at 32.5 MHz): long enough for a busy HPS.
+	// If the ready backstop fires while retries are still running, the CPU
+	// boots on defaults and a subsequently-successful load auto-restarts the
+	// machine with the real PRAM (pram_restart_after_load) — both orders safe.
+	localparam [26:0] PRAM_LD_WD_MAX = 27'd65_000_000;
 	reg  [3:0] pst;
 	reg  [8:0] pcnt;
 	reg  [6:0] rst_hold;
@@ -275,6 +283,7 @@ module emu
 			pram_load_pending <= 0; pram_flush_pending <= 0; pram_clr_pending <= 0;
 			old_pack <= 0; old_osd <= 0; old_mnt2 <= 0; old_rstpram <= 0; rst_hold <= 0;
 			pram_ready <= 0; pram_rdy_cnt <= 0;
+			pram_restart_after_load <= 0; pram_ld_wd <= 0; pram_ld_try <= 0;
 		end else begin
 			old_pack    <= pram_ack;
 			old_osd     <= OSD_STATUS;
@@ -301,17 +310,21 @@ module emu
 			if (status[6] && !old_rstpram) pram_clr_pending <= 1'b1;
 
 			// PRAM-ready gate. The Egret's boot-copy seeds the 68k's working PRAM from
-			// pram[] the instant this asserts (and the 68k is held in reset until then),
-			// so it must NOT assert until the slot-2 mount status is known: a real image
-			// releases it via the load FSM (P_LD_CPY); a no-image (size==0) report
-			// releases it in the mount handler above. MiSTer's auto-mount of the save
-			// image can take many seconds, so we do NOT use a short timeout: the OLD
-			// blind ~1.5s gate (mislabelled "3s @ 32MHz"; clk_sys is ~65MHz) fired before
-			// the mount and seeded the all-zero default -> ROM InitUtil wiped PRAM every
-			// boot. This long backstop only covers the impossible "no mount status ever"
-			// case so boot can't hang (~65MHz: 3.9e9 cyc ~= 60s).
-			if (!pram_ready) begin
-				if (pram_rdy_cnt >= 32'd3_900_000_000) pram_ready <= 1'b1;
+			// pram[] the instant this asserts (and the 68k is held in reset until then):
+			// a real image releases it via the load FSM (P_LD_CPY); a no-image (size==0)
+			// report releases it in the mount handler above. The backstop below bounds
+			// the hold when neither happens (no mount status, or a load stalled past its
+			// retries) so a fresh core load can never sit on a black screen for minutes —
+			// the 2026-07-16 field symptom (only cured by a manual .nvr re-mount).
+			// The OLD 3.9e9-cycle (~60-120 s) backstop existed because a short blind
+			// timeout used to cause zero-PRAM boots when the auto-mount was slow; that
+			// hazard is gone now that a LATE load auto-restarts the machine with the
+			// loaded PRAM (pram_restart_after_load below), so short is safe again.
+			// ~3 s at 65 MHz clk_sys (~6 s at 32.5 MHz). Paused during P_LD_CPY so
+			// it can't release the Egret boot-copy against a half-written pram[]
+			// (the copy sets pram_ready itself on completion).
+			if (!pram_ready && pst != P_LD_CPY) begin
+				if (pram_rdy_cnt >= 32'd200_000_000) pram_ready <= 1'b1;
 				else pram_rdy_cnt <= pram_rdy_cnt + 1'b1;
 			end
 
@@ -326,20 +339,55 @@ module emu
 				if (pram_clr_pending) begin
 					pram_clr_pending <= 0; pcnt <= 0; pst <= P_CLR;
 				end else if (pram_load_pending) begin
-					pram_load_pending <= 0; pram_rd <= 1'b1; pst <= P_LD_RD;
+					pram_load_pending <= 0; pram_rd <= 1'b1;
+					pram_ld_wd <= 0; pram_ld_try <= 0; pst <= P_LD_RD;
 				end else if (pram_flush_pending) begin
 					pram_flush_pending <= 0; pram_rst_after <= 0; pcnt <= 0; pst <= P_FILL;
 				end
 			end
 
 			// ---- LOAD: SD sector -> pram_buf -> Egret pram[] ----
-			P_LD_RD:  if (pram_ack) begin pram_rd <= 1'b0; pst <= P_LD_DAT; end
-			P_LD_DAT: if (old_pack && !pram_ack) begin pcnt <= 0; pst <= P_LD_CPY; end
+			// Watchdogged: a request the HPS never services (busiest exactly at
+			// core start: ROM download + every disk slot mounting) is re-kicked
+			// up to 3 times, then abandoned so the machine boots with defaults
+			// instead of hanging — the 2026-07-16 black/white-screen class.
+			P_LD_RD:
+				if (pram_ack) begin pram_rd <= 1'b0; pram_ld_wd <= 0; pst <= P_LD_DAT; end
+				else if (pram_ld_wd == PRAM_LD_WD_MAX) begin
+					pram_ld_wd <= 0;
+					if (pram_ld_try == 2'd3) begin  // give up: release the boot
+						pram_rd <= 1'b0; pram_ready <= 1'b1; pst <= P_IDLE;
+					end else begin                  // drop + re-arm the request
+						pram_ld_try <= pram_ld_try + 1'b1;
+						pram_rd <= 1'b0; pst <= P_LD_KICK;
+					end
+				end
+				else pram_ld_wd <= pram_ld_wd + 1'b1;
+			P_LD_KICK: begin pram_rd <= 1'b1; pst <= P_LD_RD; end
+			P_LD_DAT:
+				if (old_pack && !pram_ack) begin
+					pcnt <= 0;
+					// Copy landing after the CPU was released (slow/stalled mount,
+					// or a manual re-mount) can't seed the Egret's working PRAM —
+					// the boot-copy window is gone. Restart cleanly after the copy
+					// so the machine comes up ON the loaded PRAM (automates the
+					// old manual mount-then-reset ritual).
+					pram_restart_after_load <= pram_ready;
+					pst <= P_LD_CPY;
+				end
+				else if (pram_ld_wd == PRAM_LD_WD_MAX) begin
+					pram_ld_wd <= 0; pram_ready <= 1'b1; pst <= P_IDLE;  // wedged ack: boot as-is
+				end
+				else pram_ld_wd <= pram_ld_wd + 1'b1;
 			P_LD_CPY: begin
 				pram_load_wr   <= 1'b1;
 				pram_load_addr <= pcnt[7:0];
 				pram_load_data <= pram_buf[pcnt[7:0]];
-				if (pcnt == 9'd255) begin pram_dirty <= 0; pram_ena <= 1; pram_ready <= 1'b1; pst <= P_IDLE; end
+				if (pcnt == 9'd255) begin
+					pram_dirty <= 0; pram_ena <= 1; pram_ready <= 1'b1;
+					if (pram_restart_after_load) begin pram_restart_after_load <= 0; pst <= P_RST; end
+					else pst <= P_IDLE;
+				end
 				else pcnt <= pcnt + 1'b1;
 			end
 
