@@ -88,7 +88,7 @@ Image format support:
 | Format | Status |
 |---|---|
 | `.iso` / `.toast` / `.bin` (2048-byte sectors) | **Working** — verified on hardware, stock MiSTer Main |
-| `.cue`+`.bin` (2352-byte raw), `.chd` | Experimental — requires a [forked Main_MiSTer](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC) build (untested) |
+| `.cue`+`.bin` (2352-byte raw), `.chd` | **Working** — verified on hardware (July 2026); requires a [forked Main_MiSTer](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC) build |
 
 Data discs only (HFS and ISO 9660/hybrid). **CD audio is not implemented yet** — audio
 tracks are ignored. Ejecting from the Finder (drag to Trash) is honored; use the OSD to
