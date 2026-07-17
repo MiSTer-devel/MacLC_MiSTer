@@ -665,12 +665,20 @@ module ncr5380
 		.io_lba ( cd_io_lba ),
 		.io_rd  ( cd_io_rd ),
 		.io_wr  ( cd_io_wr ),
-		.io_ack ( cd_io_ack & cd_bsy ),
+		// io_ack/sd_buff_wr are framed by the SLOT's HPS session (cd_io_ack),
+		// NOT the SCSI bus state: the CD-audio TOC/frame fetches run while the
+		// target is bus-IDLE (cd_bsy=0 is the CA grant condition), so the old
+		// '& cd_bsy' gates starved the blob capture of every write strobe —
+		// blob RAM stayed zeros, MCDA magic never matched (HW 2026-07-17;
+		// fill() provably served 4D 43 44 41). Harmless for data ops: ack
+		// frames those transfers too. scsi.v's idle-phase consumers are safe
+		// (sd_buff_sel held in PHASE_IDLE; rd_hps_blk cmd_read-guarded).
+		.io_ack ( cd_io_ack ),
 
 		.sd_buff_addr( sd_buff_addr ),
 		.sd_buff_dout( sd_buff_dout ),
 		.sd_buff_din( cd_sd_buff_din ),
-		.sd_buff_wr( sd_buff_wr & cd_bsy ),
+		.sd_buff_wr( sd_buff_wr & cd_io_ack ),
 
 		// No Toolbox on the CD target.
 		.tb_mounted ( 1'b0 ),
