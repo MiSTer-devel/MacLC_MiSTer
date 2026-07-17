@@ -84,7 +84,7 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # rtl/adb_device.sv. Read live in Tools > In-System Sources and Probes Editor
 # (instance "ADB"): last ADB command, mouse/kbd address, last Listen-R3 payload.
 # Keep COMMENTED for release builds.
-set_global_assignment -name VERILOG_MACRO "USE_ADB_ISSP=1"
+# set_global_assignment -name VERILOG_MACRO "USE_ADB_ISSP=1"
 
 # DEBUG (JTAG): uncomment to add an In-System Sources & Probes instance "AUD" in
 # MacLC.sv on the ASC sample + a sample-tick counter, to confirm on hardware

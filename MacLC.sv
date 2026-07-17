@@ -1166,149 +1166,16 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_psd3 (.probe(sdma_snap_wr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
-	// --- PRST: reset-source recorder (#3 spontaneous-reboot-after-Happy-Mac) ----
-	// The reboot is a NON-bus-error CPU reset (PBER berr->reset=0 proved it). The
-	// CPU reset (_cpuReset, dataController_top.sv:189) is forced by exactly two
-	// things: _systemReset (n_reset) low, OR the Egret HC05 asserting
-	// egret_reset_680x0. This latches WHICH source pulled the line on the FIRST
-	// reset AFTER the CPU started running (armed once n_reset releases), so the
-	// cold-boot reset itself is skipped. reset_src bit = that source demanding
-	// reset at the _cpuReset falling edge:
-	//   [7]=egret_reset_680x0 (Egret firmware — prime suspect)
-	//   [6]=~pll_locked_s [5]=~rom_loaded [4]=status[0](OSD) [3]=buttons[1]
-	//   [2]=pram_force_reset [1]=RESET [0]=ROM-download(index0)
-	// first_src==0x80 ⟹ the Egret rebooted it; any [6:0] bit ⟹ a system reset.
-	wire [7:0] reset_src = { egret_reset_680x0_w, ~pll_locked_s, ~rom_loaded,
-	                         status[0], buttons[1], pram_force_reset, RESET,
-	                         (dio_download && dio_index == 0) };
-	reg        prst_armed     = 1'b0;
-	reg        cpuReset_d_p   = 1'b1;
-	reg [7:0]  reboot_cnt     = 8'd0;
-	reg [7:0]  first_src      = 8'd0;
-	reg        first_rst_seen = 1'b0;
-	reg        first_nreset   = 1'b1;
-	always @(posedge clk_sys) begin
-		cpuReset_d_p <= _cpuReset;
-		if (n_reset) prst_armed <= 1'b1;                    // CPU out of cold-boot reset
-		if (prst_armed && cpuReset_d_p && !_cpuReset) begin // _cpuReset fell while armed
-			if (reboot_cnt != 8'hFF) reboot_cnt <= reboot_cnt + 8'd1;
-			if (!first_rst_seen) begin
-				first_rst_seen <= 1'b1;
-				first_src      <= reset_src;
-				first_nreset   <= n_reset;    // 1 ⟹ Egret reset (n_reset still high)
-			end
-		end
-	end
-	altsource_probe #(
-		.instance_id ("PRST"), .probe_width (32), .source_width(1),
-		.sld_auto_instance_index ("YES")
-	) cp_prst (.probe({reboot_cnt, first_src, reset_src,
-	                   prst_armed, first_rst_seen, first_nreset, n_reset, 4'd0}),
-	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
-
-	// --- PFL0/PFL1: floppy (internal drive) read-path diagnostics -------------
-	// Ported from lbmactwo's PFLP/PIWM deck (the counters that root-caused its
-	// 800K bug). PFL0 = {byte_cnt[15:0], miss_cnt[15:0]}: bytes delivered vs
-	// byte slots starved WHILE the OS is positioned to read (phases on RDDATA,
-	// drive enabled). Healthy 800K read ≈ 3,900 bytes/s of byte_cnt delta and a
-	// static miss_cnt. PFL1 = {track[6:0], side, iwm_latch[7:0], step_cnt[7:0],
-	// disk_data[7:0]}: head position, seek activity, live IWM latch + live
-	// SDRAM-fed encoder byte (a stream of legal GCR bytes ≥ $96 when reading).
-	altsource_probe #(
-		.instance_id ("PFL0"), .probe_width (32), .source_width(1),
-		.sld_auto_instance_index ("YES")
-	) cp_pfl0 (.probe({dbg_flp_byte_cnt, dbg_flp_miss_cnt}),
-	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
-	// --- PFL1 byte-capture ring (800K content-bug hunt, 2026-07-06) -----------
-	// v2 raw-fetch instrument (2026-07-07). The v1 enc-only capture proved every
-	// data-field payload reaches the IWM ALL-ZERO while address fields are
-	// perfect — i.e. the encoder nibblizes zeros. This repack records, per
-	// delivered byte, WHAT the SDRAM fetch returned and FROM WHERE:
-	//   ring word = {gcrReadAddr[15:0], raw fetch latch[7:0], delivered enc[7:0]}
-	// 256 strobes per arm; re-arm for more windows. One capture separates:
-	// zero SDRAM content (raw==0 at a correct 0..6143 track-0 addr), a fetch
-	// address-walk fault (addr wrong/stuck), or an encoder fault (raw!=0).
-	//
-	// No new hub nodes (the ~40-node deck's name table already reads back
-	// corrupted — see rtl/dbg_probes.sv PBH0): PFL1 is widened into a dual-mode
-	// probe instead. source = {arm[10], sel[9:8], addr[7:0]}:
-	//   sel 0 = live PFL1 layout (default 0 after config — tooling-compatible)
-	//   sel 1 = ring word[addr] = {addr[15:0], raw[7:0], enc[7:0]} of strobe #addr
-	//   sel 2 = status {8'hB5, done, capturing, 2'b00, arm_cnt[3:0], 6'd0, wptr[9:0]}
-	//   sel 3 = floppy-download counters (sub-addressed by addr[1:0]):
-	//       0: {8'hD1, 4'd0, dl_words[19:0]}    accepted index-1 write slots
-	//       1: {8'hD2, 4'd0, dl_nonzero[19:0]}  ...of those, dio_data != 0
-	//       2: {8'hD3, ds, ss, mfm, hd, dio_addr[19:0]}  size-latch + last addr
-	//       3: {8'hD4, 8'd0, dl_xor[15:0]}      XOR of accepted dio_data words
-	//     Expected for a good 800K mount: dl_words = 409600 (0x64000),
-	//     dl_nonzero = the image's nonzero-word count and dl_xor = the image's
-	//     word-XOR (both computed offline by scripts/raw_compare.py).
-	// arm rising edge restarts the capture (re-armable per mount attempt).
-	// Reader: scripts/floppy_ring.tcl (arm / status / dump — bounded, one session).
-	wire [10:0] pfl1_src;
-	reg  [31:0] flp_ring [0:255];           // 1 M10K: 256 x {addr16, raw8, enc8}
-	reg  [9:0]  flp_wptr      = 10'd0;      // strobe pointer; 256 = full
-	reg         flp_capturing = 1'b0;
-	reg         flp_done      = 1'b0;
-	reg  [3:0]  flp_arm_cnt   = 4'd0;
-	reg  [1:0]  flp_arm_sync  = 2'b00;      // JTAG-domain arm bit -> clk_sys
-	reg         flp_arm_d     = 1'b0;
-	wire        flp_arm_edge  = flp_arm_sync[1] & ~flp_arm_d;
-	always @(posedge clk_sys) begin
-		flp_arm_sync <= {flp_arm_sync[0], pfl1_src[10]};
-		flp_arm_d    <= flp_arm_sync[1];
-		if (flp_arm_edge) begin
-			flp_wptr      <= 10'd0;
-			flp_capturing <= 1'b1;
-			flp_done      <= 1'b0;
-			flp_arm_cnt   <= flp_arm_cnt + 4'd1;
-		end
-		else if (flp_capturing && dbg_flp_byte_stb) begin
-			flp_ring[flp_wptr[7:0]] <= {dbg_flp_gcr_addr[15:0], dbg_flp_raw,
-			                            dbg_flp_disk_data};
-			flp_wptr <= flp_wptr + 10'd1;
-			if (flp_wptr == 10'd255) begin
-				flp_capturing <= 1'b0;
-				flp_done      <= 1'b1;
-			end
-		end
-	end
-	// readout port (address is static during a JTAG read; sync flops for form)
-	reg [7:0]  flp_raddr = 8'd0;
-	reg [31:0] flp_ring_q;
-	always @(posedge clk_sys) begin
-		flp_raddr  <= pfl1_src[7:0];
-		flp_ring_q <= flp_ring[flp_raddr];
-	end
-	wire [31:0] pfl1_live   = {dbg_flp_track, dbg_flp_side, dbg_iwm_latch,
-	                           dbg_flp_step_cnt[7:0], dbg_flp_disk_data};
-	wire [31:0] pfl1_status = {8'hB5, flp_done, flp_capturing, 2'b00,
-	                           flp_arm_cnt, 6'd0, flp_wptr};
-	// sel 3: floppy-download counters (driven next to the download handler below)
-	wire [31:0] pfl1_dl =
-		(pfl1_src[1:0] == 2'd0) ? {8'hD1, 4'd0, flp_dl_words}   :
-		(pfl1_src[1:0] == 2'd1) ? {8'hD2, 4'd0, flp_dl_nonzero} :
-		(pfl1_src[1:0] == 2'd2) ? {8'hD3, dsk_int_ds, dsk_int_ss, dsk_int_mfm,
-		                           dsk_int_hd, dio_addr[19:0]}  :
-		                          {8'hD4, 8'd0, flp_dl_xor};
-	reg  [31:0] pfl1_probe_r;
-	always @(posedge clk_sys)
-		pfl1_probe_r <= (pfl1_src[9:8] == 2'b01) ? flp_ring_q   :
-		                (pfl1_src[9:8] == 2'b10) ? pfl1_status  :
-		                (pfl1_src[9:8] == 2'b11) ? pfl1_dl      : pfl1_live;
-
-	altsource_probe #(
-		.instance_id ("PFL1"), .probe_width (32), .source_width(11),
-		.sld_auto_instance_index ("YES")
-	) cp_pfl1 (.probe(pfl1_probe_r), .source(pfl1_src),
-	           .source_clk(clk_sys), .source_ena(1'b1));
+	// (PRST reset-source recorder and PFL0/PFL1 floppy probes + capture ring
+	// removed 2026-07-16 — #3 is root-caused/resolved and the 800K floppy
+	// mission is parked on its own probe-bearing build (e322926 seed 3).
+	// Recover from git history if either resurfaces. The trim also frees the
+	// ring's M10K and returns the JTAG deck below the ~20-node hub ceiling
+	// whose name table read back corrupted at ~40 nodes.)
 
 	dbg_probes probes(
 		.clk(clk_sys),
 		.cpuAddr(cpuAddr[23:0]),
-		.cpuAddrHi(cpuAddrFullHi),
-		.cpuReset_n(_cpuReset),
-		.resetInstr_n(tg68_reset_n),
 		.cpuFC(cpuFC),
 		.cpuAS_n(_cpuAS),
 		.cpuRW(_cpuRW),
@@ -1342,16 +1209,8 @@ module emu
 		.sd_rd(sd_rd[1:0]),
 		.sd_wr(sd_wr[1:0]),
 		.sd_ack(sd_ack[1:0]),
-		.asc_irq(asc_irq),
-		.asc_sample_l(asc_sample_l),
 		.pvia_video_config(pvia_video_config),
-		.v8_vblank(v8_vblank_s),
-		// BERR investigation (#3 cold-boot reboot loop): the ACTUAL bus-error
-		// signals, not the vector-read inference PEXC/PFR use.
-		.cpu_berr(cpu_berr),
-		.fc7_berr(fc7_berr && !_cpuAS),
-		.sdma_berr(sdma_berr),
-		.memoryOverlayOn(memoryOverlayOn)
+		.v8_vblank(v8_vblank_s)
 	);
 
 	maclc_v8_video v8_video(
@@ -1749,34 +1608,8 @@ module emu
 		if(old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
 	end
 
-	// --- Floppy-download acceptance counters (PFL1 sel-3 readout) -------------
-	// One count per accepted index-1 word: the same slot-exit event that clears
-	// ioctl_wait above, so this counts words that actually GOT a write slot.
-	// After an 800K mount: dl_words < 409600 means write slots are being lost
-	// core-side; dl_words full but dl_nonzero far below the image's own
-	// nonzero-word count means the HPS stream itself carried zeros.
-	reg [19:0] flp_dl_words   = 20'd0;
-	reg [19:0] flp_dl_nonzero = 20'd0;
-	reg [15:0] flp_dl_xor     = 16'd0;   // XOR of accepted dio_data words —
-	                                     // compare against the image's own XOR
-	                                     // (data-integrity check of the stream)
-	always @(posedge clk_sys) begin
-		reg dl_old_cyc  = 1'b0;
-		reg dl_old_down = 1'b0;
-		if (dio_download && !dl_old_down && dio_index[1:0] == 2'b01) begin
-			flp_dl_words   <= 20'd0;
-			flp_dl_nonzero <= 20'd0;
-			flp_dl_xor     <= 16'd0;
-		end
-		else if (dio_download && dio_index[1:0] == 2'b01 &&
-		         dl_old_cyc && !dioBusControl && dio_write) begin
-			flp_dl_words <= flp_dl_words + 20'd1;
-			flp_dl_xor   <= flp_dl_xor ^ dio_data;
-			if (dio_data != 16'h0000) flp_dl_nonzero <= flp_dl_nonzero + 20'd1;
-		end
-		dl_old_cyc  <= dioBusControl;
-		dl_old_down <= dio_download;
-	end
+	// (Floppy-download acceptance counters removed 2026-07-16 with their PFL1
+	// sel-3 readout — recover from git history with the floppy probes.)
 
 
 	// sdram used for ram/rom maps directly into 68k address space
