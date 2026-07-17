@@ -163,11 +163,11 @@ function [7:0] bin2bcd;                // 0..99
 	          v >= 8'd20 ? {4'd2, v - 8'd20} :
 	          v >= 8'd10 ? {4'd1, v - 8'd10} : v;
 endfunction
-function [31:0] msf2lba;               // BCD M/S/F -> LBA
+function [19:0] msf2lba;               // BCD M/S/F -> LBA (max 99:59:74 < 2^20)
 	input [7:0] m, s, f;
-	msf2lba = {24'd0, bcd2bin(m)} * 32'd4500
-	        + {24'd0, bcd2bin(s)} * 32'd75
-	        + {24'd0, bcd2bin(f)};
+	msf2lba = {12'd0, bcd2bin(m)} * 20'd4500
+	        + {12'd0, bcd2bin(s)} * 20'd75
+	        + {12'd0, bcd2bin(f)};
 endfunction
 
 // ============================================================================
@@ -190,7 +190,7 @@ wire ack_fall = old_ack & ~io_ack;
 // ============================================================================
 localparam ST_IDLE = 2'd0, ST_PLAY = 2'd1, ST_PAUSE = 2'd2, ST_END = 2'd3;
 reg  [1:0]  pstate;
-reg [31:0]  cur_lba, stop_lba;
+reg [19:0]  cur_lba, stop_lba;   // disc frames: 20 bits cover any CD
 reg         flush;                     // 1-clk: position changed, requeue audio
 wire        frame_done;                // sample engine finished a frame
 
@@ -224,27 +224,27 @@ reg [4:0] mst;
 
 reg  [2:0] step;                        // word-stream step within a state
 reg  [6:0] t_idx;
-reg [31:0] t_start;
+reg [19:0] t_start;
 reg  [7:0] t_ctrl;
-reg [31:0] div_v;                       // shared iterative M/S/F divider
+reg [19:0] div_v;                       // shared iterative M/S/F divider
 reg  [6:0] div_m, div_s;
 reg  [1:0] emit_k;
 
 reg        toc_valid;
 reg  [6:0] n_tracks;
-reg [31:0] leadout_lba;
+reg [19:0] leadout_lba;
 
 reg  [7:0] c_op, c_1, c_2, c_3, c_4, c_5, c_6, c_7, c_9;
 reg        cmd_pend;
-reg [31:0] c_addr;                      // resolved target address
-reg [31:0] c_next;                      // start of following track (track mode)
+reg [19:0] c_addr;                      // resolved target address
+reg [19:0] c_next;                      // start of following track (track mode)
 reg  [6:0] c_trk;                       // 0-based requested track
 
-reg [31:0] ref_abs, ref_rel;
-reg [31:0] scan_start;
+reg [19:0] ref_abs, ref_rel;
+reg [19:0] scan_start;
 reg  [6:0] scan_idx, scan_best_trk;
 reg  [7:0] scan_ctrl_c, scan_best_ctrl;
-reg [31:0] scan_best_start;
+reg [19:0] scan_best_start;
 reg  [6:0] refm_hold, refs_hold;
 reg [15:0] ref_cnt;
 
@@ -279,11 +279,11 @@ always @(posedge clk) begin
 
 		// playhead advance, one frame at a time
 		if (frame_done) begin
-			if (cur_lba + 32'd1 >= stop_lba) begin
+			if (cur_lba + 20'd1 >= stop_lba) begin
 				cur_lba <= stop_lba;
 				pstate  <= ST_END;
 			end
-			else cur_lba <= cur_lba + 32'd1;
+			else cur_lba <= cur_lba + 20'd1;
 		end
 
 		case (mst)
@@ -345,10 +345,10 @@ always @(posedge clk) begin
 			end
 			3'd6: if (toc_valid) leadout_lba[15:0]  <= blob_q;             // word4
 			3'd7: begin                                                    // word5
-				if (toc_valid) leadout_lba[31:16] <= blob_q;
+				if (toc_valid) leadout_lba[19:16] <= blob_q[3:0];
 				else begin
 					n_tracks    <= 7'd1;
-					leadout_lba <= {2'd0, img_blocks[31:2]};               // 2048-blocks
+					leadout_lba <= img_blocks[21:2];                       // 2048-blocks
 				end
 				step <= 0; emit_k <= 0;
 				mst <= M_EMIT_H;
@@ -373,11 +373,11 @@ always @(posedge clk) begin
 			endcase
 		end
 		M_LO_DIV: begin
-			if ((div_v >= 32'd4500) && (div_m != 7'd99)) begin
-				div_v <= div_v - 32'd4500; div_m <= div_m + 7'd1;
+			if ((div_v >= 20'd4500) && (div_m != 7'd99)) begin
+				div_v <= div_v - 20'd4500; div_m <= div_m + 7'd1;
 			end
-			else if (div_v >= 32'd75) begin
-				div_v <= div_v - 32'd75; div_s <= div_s + 7'd1;
+			else if (div_v >= 20'd75) begin
+				div_v <= div_v - 20'd75; div_s <= div_s + 7'd1;
 			end
 			else begin emit_k <= 0; mst <= M_EMIT_LO; end
 		end
@@ -412,8 +412,8 @@ always @(posedge clk) begin
 				3'd2: begin t_ctrl        <= blob_b0; blob_ra <= blob_ra + 9'd1; end
 				3'd3: t_start[15:0]  <= blob_q;
 				default: begin
-					t_start[31:16] <= blob_q;
-					div_v <= {blob_q, t_start[15:0]};
+					t_start[19:16] <= blob_q[3:0];
+					div_v <= {blob_q[3:0], t_start[15:0]};
 					div_m <= 0; div_s <= 0; step <= 0;
 					mst <= M_TRK_DIV;
 				end
@@ -421,11 +421,11 @@ always @(posedge clk) begin
 			end
 		end
 		M_TRK_DIV: begin
-			if ((div_v >= 32'd4500) && (div_m != 7'd99)) begin
-				div_v <= div_v - 32'd4500; div_m <= div_m + 7'd1;
+			if ((div_v >= 20'd4500) && (div_m != 7'd99)) begin
+				div_v <= div_v - 20'd4500; div_m <= div_m + 7'd1;
 			end
-			else if (div_v >= 32'd75) begin
-				div_v <= div_v - 32'd75; div_s <= div_s + 7'd1;
+			else if (div_v >= 20'd75) begin
+				div_v <= div_v - 20'd75; div_s <= div_s + 7'd1;
 			end
 			else begin emit_k <= 0; mst <= M_EMIT_TRK; end
 		end
@@ -476,7 +476,7 @@ always @(posedge clk) begin
 					end
 				end
 				default: begin                             // LBA (big-endian 2..5)
-					c_addr <= {c_2, c_3, c_4, c_5};
+					c_addr <= {c_3[3:0], c_4, c_5};   // low 20 bits
 					mst <= M_APPLY;
 				end
 				endcase
@@ -497,12 +497,12 @@ always @(posedge clk) begin
 				blob_ra <= 9'd9 + {((c_trk + 7'd1) < n_tracks ? (c_trk + 7'd1) : n_tracks - 7'd1), 2'b00};
 			end
 			3'd3: begin
-				c_addr[31:16] <= blob_q;                   // start(k) hi
+				c_addr[19:16] <= blob_q[3:0];              // start(k) hi
 				blob_ra <= blob_ra + 9'd1;
 			end
 			3'd4: c_next[15:0] <= blob_q;                  // start(k+1) lo
 			default: begin
-				c_next[31:16] <= blob_q;                   // start(k+1) hi
+				c_next[19:16] <= blob_q[3:0];              // start(k+1) hi
 				if ((c_trk + 7'd1) >= n_tracks) c_next <= leadout_lba;
 				step <= 0;
 				mst <= M_APPLY;
@@ -550,8 +550,8 @@ always @(posedge clk) begin
 			3'd2: begin scan_ctrl_c <= blob_b0; blob_ra <= blob_ra + 9'd1; end
 			3'd3: scan_start[15:0] <= blob_q;
 			default: begin
-				if ({blob_q, scan_start[15:0]} <= ref_abs) begin
-					scan_best_start <= {blob_q, scan_start[15:0]};
+				if ({blob_q[3:0], scan_start[15:0]} <= ref_abs) begin
+					scan_best_start <= {blob_q[3:0], scan_start[15:0]};
 					scan_best_trk   <= scan_idx;
 					scan_best_ctrl  <= scan_ctrl_c;
 				end
@@ -571,11 +571,11 @@ always @(posedge clk) begin
 				div_v <= ref_abs; div_m <= 0; div_s <= 0;
 				step <= 3'd1;
 			end
-			else if ((div_v >= 32'd4500) && (div_m != 7'd99)) begin
-				div_v <= div_v - 32'd4500; div_m <= div_m + 7'd1;
+			else if ((div_v >= 20'd4500) && (div_m != 7'd99)) begin
+				div_v <= div_v - 20'd4500; div_m <= div_m + 7'd1;
 			end
-			else if (div_v >= 32'd75) begin
-				div_v <= div_v - 32'd75; div_s <= div_s + 7'd1;
+			else if (div_v >= 20'd75) begin
+				div_v <= div_v - 20'd75; div_s <= div_s + 7'd1;
 			end
 			else begin
 				refm_hold <= div_m; refs_hold <= div_s;
@@ -587,11 +587,11 @@ always @(posedge clk) begin
 			end
 		end
 		M_REF_DIVR: begin
-			if ((div_v >= 32'd4500) && (div_m != 7'd99)) begin
-				div_v <= div_v - 32'd4500; div_m <= div_m + 7'd1;
+			if ((div_v >= 20'd4500) && (div_m != 7'd99)) begin
+				div_v <= div_v - 20'd4500; div_m <= div_m + 7'd1;
 			end
-			else if (div_v >= 32'd75) begin
-				div_v <= div_v - 32'd75; div_s <= div_s + 7'd1;
+			else if (div_v >= 20'd75) begin
+				div_v <= div_v - 20'd75; div_s <= div_s + 7'd1;
 			end
 			else begin
 				abs_m <= bin2bcd({1'b0, refm_hold});
@@ -615,7 +615,7 @@ end
 reg  [1:0] fr_valid;
 reg        fr_half_r;                  // half being played (owned by sample engine? no: here)
 reg  [1:0] fst;
-reg [31:0] fetch_lba;
+reg [19:0] fetch_lba;
 reg        fetch_sync;                 // reload fetch_lba from cur_lba
 localparam F_IDLE = 2'd0, F_REQ = 2'd1, F_WAIT = 2'd2;
 
@@ -645,7 +645,7 @@ always @(posedge clk) begin
 		F_REQ: begin
 			if (flush) fst <= F_IDLE;
 			else if (ch_grant && !toc_act && !toc_rd && !fr_rd && (mst == M_IDLE)) begin
-				fr_lba <= AUDIO_BLK + (fetch_lba * 32'd5) + {29'd0, fr_blk};
+				fr_lba <= AUDIO_BLK + ({12'd0, fetch_lba} << 2) + {12'd0, fetch_lba} + {29'd0, fr_blk};
 				fr_rd  <= 1'b1;
 				fr_act <= 1'b1;
 				fr_cap <= 1'b1;
@@ -659,7 +659,7 @@ always @(posedge clk) begin
 				fr_cap <= 1'b0;
 				if (fr_blk == 3'd4) begin
 					fr_valid[fr_half_w] <= 1'b1;
-					fetch_lba <= fetch_lba + 32'd1;
+					fetch_lba <= fetch_lba + 20'd1;
 					fst <= F_IDLE;
 				end else begin
 					fr_blk <= fr_blk + 3'd1;
