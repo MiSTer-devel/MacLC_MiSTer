@@ -350,4 +350,17 @@ set_global_assignment -name VERILOG_FILE rtl/mfm_track_encoder.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/vram_bram.sv
 set_global_assignment -name VERILOG_FILE rtl/pll_video.v
 set_global_assignment -name QIP_FILE sys/pll_cfg.qip
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
+
+# --- m10k-repack tier 1: stop tiny delay-line shifters from eating M10K blocks.
+# The fitter maps these altshift_taps (42-324 bits each) into whole M10K blocks
+# at 1-3% utilization (fit census 2026-07-17: ~6-8 blocks across shadowmask,
+# vga_out, osd rdout, yc phase, sys_top dv_de). Per-INSTANCE recognition-off
+# turns each back into plain registers (<1K regs total) — framework constrained
+# from OUR qsf; sys/ files stay stock. The big ascal shifters (4-6Kbit) are
+# deliberately NOT listed (register cost too high).
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*|rdout2*"
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*vga_scaler_out|din1*"
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*HDMI_shadowmask|vid*"
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*yc_out|phase*"
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*dv_de1*"
