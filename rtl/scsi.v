@@ -834,14 +834,14 @@ wire [7:0] tb_b_d1    = (tb_state == TBS_LOAD) ? tb_load_b1 : din;   // CDB odd 
 
 wire [7:0] tb0_dout, tb0_dout_next, tb0_dout_next2;
 wire [7:0] tb1_dout, tb1_dout_next, tb1_dout_next2;
-scsi_dpram_m10k #(.ADDRWIDTH(8)) tb_buf0 (
+scsi_dpram #(.ADDRWIDTH(8)) tb_buf0 (
 	.clock(clk),
 	.address_a(sd_buff_addr), .data_a(tb_buf0_da), .wren_a(tb_hps_wr), .q_a(tb_buf0_qa),
 	.address_b(tb_b_addr), .data_b(tb_b_d0), .wren_b(tb_b_wr0), .q_b(tb0_dout),
 	.address_c(tb_b_addr + 1'b1), .q_c(tb0_dout_next),
 	.address_d(tb_b_addr + 2'd2), .q_d(tb0_dout_next2)
 );
-scsi_dpram_m10k #(.ADDRWIDTH(8)) tb_buf1 (
+scsi_dpram #(.ADDRWIDTH(8)) tb_buf1 (
 	.clock(clk),
 	.address_a(sd_buff_addr), .data_a(tb_buf1_da), .wren_a(tb_hps_wr), .q_a(tb_buf1_qa),
 	.address_b(tb_b_addr), .data_b(tb_b_d1), .wren_b(tb_b_wr1), .q_b(tb1_dout),
