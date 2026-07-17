@@ -318,6 +318,19 @@ always @(posedge clk) begin
 				pstate <= ST_IDLE;
 				mst <= M_ACQ_REQ;
 			end
+			else if (mounted && !toc_ready) begin
+				// Need-driven (re)acquisition — HW root cause 2026-07-17, probe
+				// CDA0 showed mounted=1/toc_ready=0/toc_fetches=1/mst=IDLE: the
+				// PRAM late-load AUTO-RESTART resets this FSM mid-acquisition;
+				// the scsi.v mounted latch survives the restart but the
+				// img_mounted PULSE never repeats, so the pulse-driven trigger
+				// above never re-fires and every 0xC1 serves a zeroed TOC ("one
+				// track", PLAY rejected). Also covers the first-mount ordering
+				// fragility (pulse vs latch update). Terminates: acquisition
+				// always ends in toc_ready=1 (real blob or synthesized).
+				toc_valid <= 1'b0; blob_blk <= 1'b0;
+				mst <= M_ACQ_REQ;
+			end
 			else if (cmd_pend) begin
 				cmd_pend <= 1'b0;
 				mst <= M_CMD;
