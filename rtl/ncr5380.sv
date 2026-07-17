@@ -167,7 +167,7 @@ module ncr5380
 	reg reg_wr;
 	reg dma_ack;
 	reg [2:0] dma_ack_holdoff;
-	reg [2:0] dma_settle;
+	reg [3:0] dma_settle;
 	reg dma_word_latched;
 	reg dma_longword_latched;
 	reg dma_second_word_latched;
@@ -183,7 +183,9 @@ module ncr5380
 	 * data_cnt two clocks after each ACK falling edge (old_ack/stb_adv
 	 * pipeline in scsi.v) and its sector-buffer dpram q outputs update one
 	 * clock after that, so the byte pair presented on din_pair/din_pair_next
-	 * is stale for 3 clocks after the last ACK of a train retires. DREQ used
+	 * is stale for 3 clocks after the last ACK of a train retires (and the
+	 * scsi_dpram look-ahead prefetch controller needs up to 3 more port-B
+	 * cycles to refresh q_c/q_d after the advance — see scsi_dpram). DREQ used
 	 * to re-assert inside that window; the TG68 bus samples DTACK(=~DREQ) on
 	 * the phi2 grid and latches data two clocks later, which lands INSIDE the
 	 * stale window on one of the two phase parities — the host then re-reads
@@ -192,7 +194,7 @@ module ncr5380
 	 * settle window makes DREQ mean "presented data is valid", for every
 	 * host sampling alignment. (verilator/scsi_bench reproduces all three.)
 	 */
-	wire dma_ack_busy = dma_ack | (dma_ack_holdoff != 3'd0) | (dma_settle != 3'd0);
+	wire dma_ack_busy = dma_ack | (dma_ack_holdoff != 3'd0) | (dma_settle != 4'd0);
 	assign dreq = scsi_req & dma_en & !dma_ack_busy;
 
 	wire i_dma_rd = bus_cs &  dack & ior;
@@ -229,13 +231,16 @@ module ncr5380
 			reg_wr <= 0;
 
 			/* Re-arm the settle window on every ACK pulse; after the last
-			 * pulse of a train it counts down 4,3,2,1 so dma_ack_busy (and
+			 * pulse of a train it counts down 8..1 so dma_ack_busy (and
 			 * therefore !DREQ) covers the target's data_cnt+dpram update
-			 * pipeline (see dma_settle declaration). 4 = 1 (ACK-fall detect
-			 * in scsi.v) + 2 (stb_adv -> data_cnt) + 1 (dpram q).
+			 * pipeline (see dma_settle declaration). 8 = 1 (ACK-fall detect
+			 * in scsi.v) + 2 (stb_adv -> data_cnt) + 1 (dpram q) + 3
+			 * (scsi_dpram look-ahead prefetch: read addr+1, read addr+2,
+			 * restore port B — the pdma-prefetch redesign that replaced the
+			 * ram_c/ram_d mirror arrays) + 1 margin.
 			 */
-			if (dma_ack) dma_settle <= 3'd4;
-			else if (dma_settle != 3'd0) dma_settle <= dma_settle - 3'd1;
+			if (dma_ack) dma_settle <= 4'd8;
+			else if (dma_settle != 4'd0) dma_settle <= dma_settle - 4'd1;
 
 			if(~old_dma_rd & i_dma_rd) begin
 				dma_word_latched <= dma_word;
