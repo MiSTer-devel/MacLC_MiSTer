@@ -2006,9 +2006,16 @@ module scsi_dpram #(parameter DATAWIDTH=8, ADDRWIDTH=9)
 // ports on those arrays. Using a single ram array with >2 reads fails
 // Quartus's TDP inference and produces "multiple constant drivers"
 // errors on the ram net.
-reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
-reg [DATAWIDTH-1:0] ram_c [0:(1<<ADDRWIDTH)-1];
-reg [DATAWIDTH-1:0] ram_d [0:(1<<ADDRWIDTH)-1];
+// The mirrors carry the forced-M10K attribute: Quartus 17's small-RAM
+// inference is netlist-luck-sensitive and target[1]'s ram_c silently fell
+// to ~55K registers/25K ALUTs on an unrelated netlist change (2026-07-16,
+// LAB overflow 6803/4191). Same recipe as scsi_dpram_m10k below, which has
+// run HW-validated on the Toolbox buffers since eadc802. ram_ab pinned too
+// (2026-07-16, same sweep as osd/ascal): the attribute only constrains the
+// block type — the per-port write-first bypass (q<=data) stays in logic.
+(* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
+(* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_c [0:(1<<ADDRWIDTH)-1];
+(* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_d [0:(1<<ADDRWIDTH)-1];
 
 wire                  mirror_we    = wren_a | wren_b;
 wire [ADDRWIDTH-1:0]  mirror_waddr = wren_a ? address_a : address_b;
