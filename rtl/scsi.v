@@ -9,6 +9,7 @@ module scsi
 
 	// scsi interface
 	input 	  rst, // bus reset from initiator
+	input 	  sys_rst, // system reset (CD engine state survives bus resets)
 	input 	  sel,
 	input 	  bus_busy, // another device currently holds the bus (its BSY)
 	input 	  atn, // initiator requests to send a message
@@ -992,7 +993,7 @@ wire ca_grant = (phase == PHASE_IDLE) && !io_rd_d && !io_wr && !io_ack && mounte
 
 generate if (CDROM != 0) begin : g_cd_audio
 	cd_audio #(.CLK_HZ(32'd32_500_000)) cd_audio_i (   // clk_sys rate; audio pitch verifies it
-		.clk(clk), .rst(rst),
+		.clk(clk), .rst(sys_rst), .bus_rst(rst),
 		.mounted(mounted), .img_mounted(img_mounted), .img_blocks(img_blocks),
 		.cmd_stb(ca_cmd_stb), .cmd_op(cmd[0]),
 		.cdb1(cmd[1]), .cdb2(cmd[2]), .cdb3(cmd[3]), .cdb4(cmd[4]),

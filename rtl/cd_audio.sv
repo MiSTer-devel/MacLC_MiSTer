@@ -29,7 +29,8 @@ module cd_audio #(
 	parameter CLK_HZ = 32'd32_500_000   // clk rate, for the 44.1 kHz cadence
 )(
 	input             clk,
-	input             rst,
+	input             rst,       // SYSTEM reset only (survives SCSI bus resets)
+	input             bus_rst,   // SCSI bus reset: stops playback, TOC/engine state SURVIVES
 
 	input             mounted,
 	input             img_mounted,      // mount pulse: (re)acquire the TOC
@@ -297,7 +298,7 @@ always @(posedge clk) begin
 			cmd_pend <= 1'b1;
 		end
 		// oracle: a data READ (or eject / unmount) stops playback
-		if ((read_stb || eject_stb || !mounted) && pstate != ST_IDLE)
+		if ((read_stb || eject_stb || bus_rst || !mounted) && pstate != ST_IDLE)
 			pstate <= ST_IDLE;
 
 		// playhead advance, one frame at a time

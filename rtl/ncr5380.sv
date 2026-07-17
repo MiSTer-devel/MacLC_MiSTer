@@ -631,6 +631,7 @@ module ncr5380
 	(
 		.clk    ( clk ),
 		.rst    ( scsi_rst ),
+		.sys_rst( reset ),
 		.cd_snd_l ( cd_snd_l ),
 		.cd_snd_r ( cd_snd_r ),
 		.dbg_cda0 ( dbg_cda0 ),
