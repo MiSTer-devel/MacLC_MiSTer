@@ -37,6 +37,8 @@ module dataController_top(
 	output [15:0] dbg_scsi4,  // bus-reset count + per-target completion flags
 	output [15:0] dbg_scsi5,  // per-target last-opcode bitmap
 	output [31:0] dbg_ncr,    // host-side pseudo-DMA state + DACK beat count
+	output [31:0] dbg_cda0,   // CD-audio engine TOC/state (JTAG CDA0)
+	output [31:0] dbg_cda1,   // CD target command visibility (JTAG CDA1)
 	output [31:0] dbg_ncr2,   // req_deferred/req_bus + IRQ machine + counters
 	output [31:0] dbg_wr,     // write-stall snapshot (DATA_IN target)
 	input selectSCC,
@@ -443,6 +445,8 @@ module dataController_top(
 		.dbg_scsi4(dbg_scsi4),
 		.dbg_scsi5(dbg_scsi5),
 		.dbg_ncr(dbg_ncr),
+		.dbg_cda0(dbg_cda0),
+		.dbg_cda1(dbg_cda1),
 		.dbg_ncr2(dbg_ncr2),
 		.dbg_wr(dbg_wr)
 	);

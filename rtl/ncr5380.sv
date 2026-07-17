@@ -137,7 +137,10 @@ module ncr5380
 	// OSD-mounted disk usually lands there). Layout = scsi.v dbg_wrstall:
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen [31]=req
-	output      [31:0] dbg_wr
+	output      [31:0] dbg_wr,
+	// JTAG CDA0/CDA1: CD-audio engine + CD target command visibility
+	output      [31:0] dbg_cda0,
+	output      [31:0] dbg_cda1
 );
 	parameter DEVS = 2;
 	// Read-prefetch ring depth for the CD target. 3 => 8 sectors / 4KB = two
@@ -630,6 +633,8 @@ module ncr5380
 		.rst    ( scsi_rst ),
 		.cd_snd_l ( cd_snd_l ),
 		.cd_snd_r ( cd_snd_r ),
+		.dbg_cda0 ( dbg_cda0 ),
+		.dbg_cda1 ( dbg_cda1 ),
 		.sel    ( scsi_sel ),
 		.cd_enable ( cd_enable ),
 		// Selection requires a free bus — a wedged-BUSY device must not let a

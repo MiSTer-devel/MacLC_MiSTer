@@ -68,7 +68,15 @@ module cd_audio #(
 	output reg        toc_ready,
 
 	output reg signed [15:0] snd_l,
-	output reg signed [15:0] snd_r
+	output reg signed [15:0] snd_r,
+
+	// JTAG probe feed (CDA0): TOC/engine state, composed here so the whole
+	// hierarchy passes one opaque word.
+	//   [0]=mounted [1]=toc_ready [2]=toc_valid [9:3]=n_tracks
+	//   [14:10]=mst [16:15]=pstate [18:17]=fst
+	//   [26:19]=toc_fetch_cnt (M_ACQ_REQ fires, wraps)
+	//   [31:27]=frame_fetch_cnt[4:0] (F_REQ fires, wraps)
+	output     [31:0] dbg_cda0
 );
 
 // HPS window contract (Main_MiSTer support/maclc/maclc_cd.h)
@@ -242,6 +250,11 @@ reg  [1:0] emit_k;
 
 reg        toc_valid;
 reg  [6:0] n_tracks;
+
+// probe counters (CDA0): how many blob-block fetches / audio-frame fetches
+// actually fired — distinguishes "fetch never ran" from "ran, parse failed".
+reg  [7:0] dbg_toc_fetch_cnt = 8'd0;
+reg  [4:0] dbg_fr_fetch_cnt  = 5'd0;
 reg [31:0] leadout_lba;
 
 reg  [7:0] c_op, c_1, c_2, c_3, c_4, c_5, c_6, c_7, c_9;
@@ -327,6 +340,7 @@ always @(posedge clk) begin
 			toc_rd   <= 1'b1;
 			toc_act  <= 1'b1;
 			blob_cap <= 1'b1;
+			dbg_toc_fetch_cnt <= dbg_toc_fetch_cnt + 8'd1;
 			mst <= M_ACQ_WAIT;
 		end
 		M_ACQ_WAIT: begin
@@ -625,6 +639,10 @@ end
 reg  [1:0] fr_valid;
 reg        fr_half_r;                  // half being played (owned by sample engine? no: here)
 reg  [1:0] fst;
+
+// CDA0 probe word (all fields declared above by here; layout in the port list)
+assign dbg_cda0 = { dbg_fr_fetch_cnt, dbg_toc_fetch_cnt,
+                    fst, pstate, mst, n_tracks, toc_valid, toc_ready, mounted };
 reg [31:0] fetch_lba;
 reg        fetch_sync;                 // reload fetch_lba from cur_lba
 localparam F_IDLE = 2'd0, F_REQ = 2'd1, F_WAIT = 2'd2;
@@ -659,6 +677,7 @@ always @(posedge clk) begin
 				fr_rd  <= 1'b1;
 				fr_act <= 1'b1;
 				fr_cap <= 1'b1;
+				dbg_fr_fetch_cnt <= dbg_fr_fetch_cnt + 5'd1;
 				fst <= F_WAIT;
 			end
 		end

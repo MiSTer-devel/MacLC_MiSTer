@@ -795,6 +795,8 @@ module emu
 		.dbg_scsi4(),
 		.dbg_scsi5(),
 		.dbg_ncr(),
+		.dbg_cda0(),
+		.dbg_cda1(),
 		.dbg_ncr2(),
 		.dbg_wr(),
 		.selectSCC(selectSCC),

@@ -681,6 +681,7 @@ module emu
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
+	wire [31:0] dbg_cda0_w, dbg_cda1_w;
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
 
@@ -1145,6 +1146,22 @@ module emu
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
 	// PSDT: pseudo-DMA stall timeout visibility — {fires[7:0], max_stall[22:0]}
+	// CDA0/CDA1: CD-audio engine + CD target visibility (2026-07-17, the
+	// "one track / PLAY fails" hunt). Decode:
+	//   CDA0 [0]=mounted [1]=toc_ready [2]=toc_valid [9:3]=n_tracks
+	//        [14:10]=mst [16:15]=pstate [18:17]=fst [26:19]=toc_fetch_cnt
+	//        [31:27]=frame_fetch_cnt
+	//   CDA1 [7:0]=last_op [15:8]=cmd_cnt [19:16]=sense_key [27:20]=sense_asc
+	//        [28]=last_cmd_ok [29]=mounted [30]=cd_no_media [31]=toc_ready
+	altsource_probe #(
+		.instance_id ("CDA0"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_cda0 (.probe(dbg_cda0_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("CDA1"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_cda1 (.probe(dbg_cda1_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
 	altsource_probe #(
 		.instance_id ("PSDT"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
@@ -1379,6 +1396,8 @@ module emu
 		.dbg_scsi4(dbg_scsi4_w),
 		.dbg_scsi5(dbg_scsi5_w),
 		.dbg_ncr(dbg_ncr_w),
+		.dbg_cda0(dbg_cda0_w),
+		.dbg_cda1(dbg_cda1_w),
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
 		.selectSCC(selectSCC),

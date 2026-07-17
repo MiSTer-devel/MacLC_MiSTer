@@ -70,6 +70,8 @@ module scsi
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen[5:0] [31]=req
 	output [31:0] dbg_wrstall,
+	output [31:0] dbg_cda0,     // JTAG CDA0: cd_audio TOC/engine state (see cd_audio.sv)
+	output [31:0] dbg_cda1,     // JTAG CDA1: {toc_rdy,no_media,mounted,ok, sense_asc, sense_key, cmd_cnt, last_op}
 
 	// ===== BlueSCSI Toolbox dedicated block interface (TOOLBOX_ENABLE only) ====
 	// Isolated from the disk block interface above so the disk read/write path is
@@ -1006,7 +1008,8 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.toc_base(ca_toc_addr),
 		.toc_q0(ca_toc_q0), .toc_q1(ca_toc_q1), .toc_q2(ca_toc_q2), .toc_q3(ca_toc_q3),
 		.toc_ready(ca_toc_ready),
-		.snd_l(cd_snd_l), .snd_r(cd_snd_r)
+		.snd_l(cd_snd_l), .snd_r(cd_snd_r),
+		.dbg_cda0(dbg_cda0)
 	);
 end else begin : g_no_cd_audio
 	assign ca_io_active = 1'b0;
@@ -1022,6 +1025,7 @@ end else begin : g_no_cd_audio
 	assign ca_toc_ready = 1'b0;
 	assign cd_snd_l = 16'sd0;
 	assign cd_snd_r = 16'sd0;
+	assign dbg_cda0 = 32'd0;
 end endgenerate
 
 reg  stb_ack;
@@ -1364,6 +1368,14 @@ wire  cd_eject_pulse = cd_new_cmd && cmd_cd_eject && !cd_prevent;
 // cleared by the next successful non-REQUEST-SENSE command (SCSI-1 semantics).
 reg [3:0] cd_sense_key = 4'd0;
 reg [7:0] cd_sense_asc = 8'd0;
+// JTAG CDA1 probe regs: every dispatched command latches its opcode; the
+// accept/reject flag tells whether cmd_ok took it (a rejected PLAY is the
+// interesting datum). Driven from the main phase FSM block only.
+reg [7:0] dbg_last_op = 8'd0;
+reg [7:0] dbg_cmd_cnt = 8'd0;
+reg       dbg_last_ok = 1'b0;
+assign dbg_cda1 = { ca_toc_ready, cd_no_media, mounted, dbg_last_ok,
+                    cd_sense_asc, cd_sense_key, dbg_cmd_cnt, dbg_last_op };
 reg       cd_prevent   = 1'b0;
 always @(posedge clk) begin
 	if (rst) begin
@@ -1465,6 +1477,9 @@ always @(posedge clk) begin
 
 					// notify the CD-audio engine (all constant 0 on disks)
 					ca_cmd_stb   <= cmd_cd_audio_nop;
+					dbg_last_op <= op_code;
+					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
+					dbg_last_ok <= 1'b1;
 					ca_read_stb  <= cmd_read && (CDROM != 0);
 					ca_eject_stb <= cmd_cd_eject && !cd_prevent;
 
@@ -1481,6 +1496,9 @@ always @(posedge clk) begin
 					else phase <= PHASE_STATUS_OUT;
 				end else begin
 					// no, report failure
+					dbg_last_op <= op_code;
+					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
+					dbg_last_ok <= 1'b0;
 					status <= `STATUS_CHECK_CONDITION;
 					phase <= PHASE_STATUS_OUT;
 				end
