@@ -76,3 +76,15 @@ set_clock_groups -asynchronous -group [get_clocks {emu|pllv|*|divclk}]
 # clock group above, harmless).
 set_false_path -to [get_keepers {*vmode_meta* *monid_meta* *tbyp_meta* *tsel_meta*}]
 set_false_path -to [get_keepers {*vidrst_meta* *vbl_meta* *hbl_meta*}]
+
+# --- ascal 8bpp-framebuffer palette lookup: unreachable on MacLC -----------
+# MacLC has no MISTER_FB, so ascal's fb mode is never enabled and the
+# palette cone (o_acpt4/o_shift -> shift_opack -> pal1_mem -> o_fb_pal_dr_x2)
+# can never carry live pixels. ascal's PALETTE generic defaults true though,
+# so the cone exists and was the ENTIRE pll_hdmi setup-violation family at
+# 148.5 MHz (worst -1.19, 2026-07-17). Setting PALETTE("false") instead
+# removed the logic but broke ascal's frame output on HW (0c68725: STA met
+# +0.065 yet Main could not grab a single frame; menu core grabbed fine) —
+# so keep ascal's shipped structure and exclude the dead cone here.
+set_false_path -to [get_registers {*ascal|o_fb_pal_dr_x2[*]}]
+set_false_path -to [get_registers {*ascal|o_fb_pal_dr[*] *ascal|o_fb_pal_dr2[*]}]
