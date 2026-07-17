@@ -720,6 +720,12 @@ wire         bob_deint;
 		.RAMSIZE(32'h00800000),
 	`endif
 	`ifndef MISTER_FB
+		// No core framebuffer -> the 8bpp FB palette can never be used, but
+		// ascal's PALETTE generic defaults true, so pal1_mem + its
+		// shift_opack->pal_idx read cone still synthesize. On MacLC that dead
+		// cone was the ENTIRE pll_hdmi setup-violation family at 148.5 MHz
+		// (o_acpt4/o_shift -> o_fb_pal_dr_x2, worst -1.19; 2026-07-17).
+		.PALETTE("false"),
 		.PALETTE2("false"),
 	`else
 		`ifndef MISTER_FB_PALETTE
