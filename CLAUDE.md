@@ -72,6 +72,22 @@ Full process + gotchas: **`docs/mame_compare.md`** (memory tap, maincpu trace,
 PC-stream divergence diff; macOS has no `timeout`, debugger defaults to the Egret
 HC05 not the 68020, MAME PCs are 8-digit `00Axxxxx`, etc.).
 
+## Framework Files Are OFF-LIMITS (`sys/`)
+
+**NEVER modify files under `sys/` (the MiSTer framework: sys_top.v, ascal.vhd,
+osd.v, hps_io, pll_hdmi, .sdc files, etc.).** The only permitted change is a
+wholesale update of framework files taken directly from the upstream MiSTer
+template repo. If a fit, timing, or resource problem traces into the framework,
+reconcile it from OUR side — `rtl/`, `MacLC.sv`, `MacLC.qsf`, `MacLC.sdc` —
+never by patching the framework in place.
+
+Why (learned 2026-07-17): a night of framework edits (RAM attributes in
+ascal.vhd/osd.v, a PALETTE generic in sys_top.v) produced STA-met builds with
+dead video and confounded every hardware A/B for hours. Framework internals
+(scaler pipeline, clock-domain handoffs) have invariants that are not visible
+from this repo; local edits there create failure modes that pass STA and only
+show up on hardware.
+
 ## Architecture
 
 ### Top-Level Module
