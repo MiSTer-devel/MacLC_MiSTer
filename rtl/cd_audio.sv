@@ -98,16 +98,15 @@ cd_sdp #(.DW(16), .AW(9)) blob_ram (
 	.wr(blob_cap && sd_buff_wr),
 	.raddr(blob_ra), .q(blob_q_ram)
 );
-// Every blob-consuming FSM below is written against a 2-cycle read pipeline
-// ("step k: blob_q holds word k-2"); cd_sdp is a 1-cycle RAM. Without this
-// output stage every consumer reads one word EARLY: the M_HDR_RD magic check
-// compares "MC" against word 1 ("DA"), toc_valid can never set, and every
-// disc degrades to the synthesized single data track with PLAY rejected —
-// the exact HW symptom found 2026-07-17 (first hardware exercise of this
-// path; the sim has no CD/TOC harness). One register here aligns the
-// hardware with the contract for ALL blob readers at once.
-reg [15:0] blob_q;
-always @(posedge clk) blob_q <= blob_q_ram;
+// cd_sdp is a ONE-cycle-read RAM (raddr in cycle N -> q in cycle N+1) and
+// every blob reader is aligned to that: M_TRK_RD / M_CTRK_RD / M_REF_SCAN
+// were 1-cycle-correct as written, and M_HDR_RD is aligned below (HW
+// 2026-07-17: it was the one reader coded for a 2-cycle pipeline, so the
+// MCDA magic compared against word 1 and toc_valid could never set. An
+// interim global +1 register stage fixed the header but skewed the three
+// track readers — garbage start LBAs ground the MSF divider for seconds
+// per track and toc_ready never rose. One uniform 1-cycle contract now.)
+wire [15:0] blob_q = blob_q_ram;
 wire [7:0] blob_b0 = blob_q[7:0];      // even byte (LE lane order on FPGA)
 wire [7:0] blob_b1 = blob_q[15:8];
 
@@ -368,21 +367,22 @@ always @(posedge clk) begin
 		end
 
 		// ------------------------------------------ header words 0..5 stream
-		// step k: blob_q holds word k-2 (addr set at k-1); capture accordingly
+		// 1-cycle RAM: ra=0 presented on entry, so word k is in blob_q at
+		// step k+1 (ra advances every cycle). Same contract as M_TRK_RD.
 		M_HDR_RD: begin
 			blob_ra <= blob_ra + 9'd1;
 			step <= step + 3'd1;
 			case (step)
-			3'd2: toc_valid <= (blob_b0 == "M") && (blob_b1 == "C");       // word0
-			3'd3: if (!((blob_b0 == "D") && (blob_b1 == "A"))) toc_valid <= 1'b0; // word1
-			3'd4: ;                                                        // word2: version/first
-			3'd5: begin                                                    // word3: {data_trk, last}
+			3'd1: toc_valid <= (blob_b0 == "M") && (blob_b1 == "C");       // word0
+			3'd2: if (!((blob_b0 == "D") && (blob_b1 == "A"))) toc_valid <= 1'b0; // word1
+			3'd3: ;                                                        // word2: version/first
+			3'd4: begin                                                    // word3: {data_trk, last}
 				if (toc_valid)
 					n_tracks <= (blob_b0 == 8'd0) ? 7'd1 :
 					            (blob_b0 > 8'd99) ? 7'd99 : blob_b0[6:0];
 			end
-			3'd6: if (toc_valid) leadout_lba[15:0]  <= blob_q;             // word4
-			3'd7: begin                                                    // word5
+			3'd5: if (toc_valid) leadout_lba[15:0]  <= blob_q;             // word4
+			3'd6: begin                                                    // word5
 				if (toc_valid) leadout_lba[31:16] <= blob_q;
 				else begin
 					n_tracks    <= 7'd1;
