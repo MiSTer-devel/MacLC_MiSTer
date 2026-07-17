@@ -1948,25 +1948,31 @@ module scsi_dpram #(parameter DATAWIDTH=8, ADDRWIDTH=9)
 	output reg [DATAWIDTH-1:0] q_d
 );
 
-// ram_ab is a true dual-port RAM serving the existing q_a/q_b read paths
-// (each read at its port's write address). ram_c and ram_d are simple
-// dual-port mirrors used for the look-ahead read ports q_c/q_d.
+// ram_ab is the ONLY storage array (pdma-prefetch redesign, 2026-07-17).
+// The former ram_c/ram_d arrays were full mirror COPIES of the buffer whose
+// only job was serving same-cycle look-ahead reads at address_c/address_d
+// (mac_addr+1/+2 for the pseudo-DMA word/longword assembly). Across the six
+// ring instances they cost ~48 M10K blocks and drove the device to 553/553
+// saturation. They are replaced by a prefetch controller that reads the
+// look-ahead bytes through IDLE port-B cycles into q_c/q_d holding registers.
 //
-// wren_a and wren_b are mutually exclusive in this design (wren_a is
-// driven by the SD->buffer path during PHASE_DATA_OUT, wren_b by the
-// SCSI->buffer path during PHASE_DATA_IN), so muxing them into a single
-// SDP write port keeps the mirrors coherent without needing two write
-// ports on those arrays. Using a single ram array with >2 reads fails
-// Quartus's TDP inference and produces "multiple constant drivers"
-// errors on the ram net.
+// TIMING CONTRACT (what makes this legal): ncr5380 samples dout/dout_pair/
+// dout_pair_next ONLY at DREQ-gated instants, and holds DREQ down for
+// dma_settle cycles after every ACK train (= after every data_cnt advance).
+// The controller needs at most 3 port-B cycles after an address change
+// (read addr_c, read addr_d, restore address_b) — q_b/q_c/q_d are all
+// consistent no later than 7 clocks after the advance; dma_settle is
+// widened to 8 in ncr5380.sv to cover it. Port-B WRITES always win
+// arbitration (the controller defers and retries), so write cycles are
+// never disturbed and never mis-addressed.
+//
+// COHERENCY: a write on either port that lands on a prefetched (or
+// in-flight) look-ahead address marks the prefetch stale; the controller
+// refetches, and the post-write read returns the fresh data. No forwarding
+// paths — the RAM is always the single source of truth.
 reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
-reg [DATAWIDTH-1:0] ram_c [0:(1<<ADDRWIDTH)-1];
-reg [DATAWIDTH-1:0] ram_d [0:(1<<ADDRWIDTH)-1];
 
-wire                  mirror_we    = wren_a | wren_b;
-wire [ADDRWIDTH-1:0]  mirror_waddr = wren_a ? address_a : address_b;
-wire [DATAWIDTH-1:0]  mirror_wdata = wren_a ? data_a    : data_b;
-
+// ---- port A: HPS side (behavior unchanged) -------------------------------
 always @(posedge clock) begin
 	if(wren_a) begin
 		ram_ab[address_a] <= data_a;
@@ -1976,23 +1982,79 @@ always @(posedge clock) begin
 	end
 end
 
+// ---- look-ahead prefetch controller --------------------------------------
+localparam PF_IDLE = 2'd0, PF_RDC = 2'd1, PF_RDD = 2'd2;
+reg [1:0]           pf_st      = PF_IDLE;
+reg [ADDRWIDTH-1:0] pf_c_addr  = {ADDRWIDTH{1'b1}}; // addresses q_c/q_d hold
+reg [ADDRWIDTH-1:0] pf_d_addr  = {ADDRWIDTH{1'b1}};
+reg [ADDRWIDTH-1:0] pf_c_tgt, pf_d_tgt;             // addresses in flight
+reg                 pf_valid   = 1'b0;
+reg                 pf_snooped = 1'b0;
+
+wire pf_snoop_hit =
+	(wren_a && (address_a == pf_c_addr || address_a == pf_d_addr ||
+	            (pf_st != PF_IDLE && (address_a == pf_c_tgt || address_a == pf_d_tgt)))) ||
+	(wren_b && (address_b == pf_c_addr || address_b == pf_d_addr ||
+	            (pf_st != PF_IDLE && (address_b == pf_c_tgt || address_b == pf_d_tgt))));
+
+wire pf_stale = !pf_valid || pf_snooped ||
+                (address_c != pf_c_addr) || (address_d != pf_d_addr);
+
+// Port-B address mux: a stolen read presents the look-ahead address for one
+// cycle; its result lands in q_b (port B's read register) and is copied into
+// q_c/q_d in the following state. Writes always use the real address_b.
+wire pf_steal_c = (pf_st == PF_IDLE) && pf_stale && !wren_b;
+wire pf_steal_d = (pf_st == PF_RDC)  && !wren_b;
+wire [ADDRWIDTH-1:0] address_b_eff =
+	pf_steal_c ? address_c :
+	pf_steal_d ? pf_d_tgt  :
+	             address_b;
+
+// ---- port B: Mac side + stolen prefetch reads ----------------------------
+// Single-address TDP port: write and read MUST share one address or Quartus
+// refuses RAM inference (Error 276003, all rings -> ~300K registers). The
+// steal mux guarantees address_b_eff == address_b whenever wren_b is high
+// (both steal conditions carry !wren_b), so writing at address_b_eff is
+// bit-identical to writing at address_b.
 always @(posedge clock) begin
 	if(wren_b) begin
-		ram_ab[address_b] <= data_b;
+		ram_ab[address_b_eff] <= data_b;
 		q_b <= data_b;
 	end else begin
-		q_b <= ram_ab[address_b];
+		q_b <= ram_ab[address_b_eff];
 	end
 end
 
+// ---- controller sequencing + q_c/q_d capture -----------------------------
 always @(posedge clock) begin
-	if(mirror_we) ram_c[mirror_waddr] <= mirror_wdata;
-	q_c <= ram_c[address_c];
-end
-
-always @(posedge clock) begin
-	if(mirror_we) ram_d[mirror_waddr] <= mirror_wdata;
-	q_d <= ram_d[address_d];
+	case (pf_st)
+		PF_IDLE: begin
+			if (pf_snoop_hit) pf_snooped <= 1'b1;
+			if (pf_steal_c) begin
+				pf_c_tgt <= address_c;
+				pf_d_tgt <= address_d;
+				pf_st    <= PF_RDC;
+			end
+		end
+		PF_RDC: begin
+			if (pf_snoop_hit) pf_snooped <= 1'b1;
+			q_c <= q_b;                    // ram[pf_c_tgt], read during PF_IDLE steal
+			pf_st <= pf_steal_d ? PF_RDD : PF_IDLE; // wren_b stole the D cycle: abort+retry
+		end
+		PF_RDD: begin
+			q_d <= q_b;                    // ram[pf_d_tgt], read during PF_RDC steal
+			if (!pf_snooped && !pf_snoop_hit) begin
+				pf_c_addr <= pf_c_tgt;
+				pf_d_addr <= pf_d_tgt;
+				pf_valid  <= 1'b1;
+			end
+			// A hit before/at this edge forced the discard above; the refetch
+			// it triggers will read post-write data, so the flag is consumed.
+			pf_snooped <= 1'b0;
+			pf_st      <= PF_IDLE;
+		end
+		default: pf_st <= PF_IDLE;
+	endcase
 end
 
 endmodule
