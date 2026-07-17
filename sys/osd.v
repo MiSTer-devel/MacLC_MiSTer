@@ -36,7 +36,7 @@ reg        osd_enable;
 // M10K pin added 2026-07-16 (local hardening over upstream): with only
 // no_rw_check, Quartus 17's inference dropped BOTH osd instances' buffers
 // to ~33K registers each on an unrelated netlist change (LAB overflow).
-(* ramstyle="M10K,no_rw_check" *) reg  [7:0] osd_buffer[OSD_HDR ? (4096+1024) : 4096];
+(* ramstyle="M10K" *) reg  [7:0] osd_buffer[OSD_HDR ? (4096+1024) : 4096];
 
 reg        info = 0;
 reg  [8:0] infoh;

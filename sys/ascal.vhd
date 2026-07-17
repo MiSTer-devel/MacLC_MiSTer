@@ -388,7 +388,7 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL i_reset_na : std_logic;
 	SIGNAL i_hnp,i_vnp : std_logic;
 	SIGNAL i_mem : arr_pix(0 TO IHRES-1); -- Downscale line buffer
-	ATTRIBUTE ramstyle OF i_mem : SIGNAL IS "M10K,no_rw_check"; -- see poly-mem note
+	ATTRIBUTE ramstyle OF i_mem : SIGNAL IS "M10K"; -- see poly-mem note
 	SIGNAL i_ohsize,i_ovsize : uint12;
 	SIGNAL i_vdivi   : unsigned(12 DOWNTO 0);
 	SIGNAL i_vdivr   : unsigned(24 DOWNTO 0);
@@ -497,10 +497,10 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_line0,o_line1,o_line2,o_line3 : arr_pix(0 TO OHRESL-1);
 	SIGNAL o_linf0,o_linf1,o_linf2,o_linf3 : arr_pix(0 TO OHRESM-1);
 
-	ATTRIBUTE ramstyle OF o_line0 : SIGNAL IS "M10K,no_rw_check";
-	ATTRIBUTE ramstyle OF o_line1 : SIGNAL IS "M10K,no_rw_check";
-	ATTRIBUTE ramstyle OF o_line2 : SIGNAL IS "M10K,no_rw_check";
-	ATTRIBUTE ramstyle OF o_line3 : SIGNAL IS "M10K,no_rw_check";
+	ATTRIBUTE ramstyle OF o_line0 : SIGNAL IS "M10K";
+	ATTRIBUTE ramstyle OF o_line1 : SIGNAL IS "M10K";
+	ATTRIBUTE ramstyle OF o_line2 : SIGNAL IS "M10K";
+	ATTRIBUTE ramstyle OF o_line3 : SIGNAL IS "M10K";
 	ATTRIBUTE ramstyle OF o_linf0 : SIGNAL IS "no_rw_check";
 	ATTRIBUTE ramstyle OF o_linf1 : SIGNAL IS "no_rw_check";
 	ATTRIBUTE ramstyle OF o_linf2 : SIGNAL IS "no_rw_check";
@@ -1023,9 +1023,9 @@ ARCHITECTURE rtl OF ascal IS
 	-- M10K pins added 2026-07-16 (local hardening): with plain no_rw_check,
 	-- Quartus 17 silently dropped all three poly tables to ~30K registers on
 	-- an unrelated netlist change (LAB overflow). Same for o_line*/i_mem.
-	ATTRIBUTE ramstyle OF o_h_poly_mem : SIGNAL IS "M10K,no_rw_check";
-	ATTRIBUTE ramstyle OF o_v_poly_mem : SIGNAL IS "M10K,no_rw_check";
-	ATTRIBUTE ramstyle OF o_a_poly_mem : SIGNAL IS "M10K,no_rw_check";
+	ATTRIBUTE ramstyle OF o_h_poly_mem : SIGNAL IS "M10K";
+	ATTRIBUTE ramstyle OF o_v_poly_mem : SIGNAL IS "M10K";
+	ATTRIBUTE ramstyle OF o_a_poly_mem : SIGNAL IS "M10K";
 	SIGNAL o_a_poly_addr, o_v_poly_addr : integer RANGE 0 TO 2**FRAC-1;
 	SIGNAL o_h_poly_phase_a,o_h_poly_phase_a2,o_h_poly_phase_a3, o_h_poly_phase_a4, o_h_poly_phase_a5 : poly_phase_t;
 	SIGNAL o_v_poly_phase_a,o_v_poly_phase_a2,o_v_poly_phase_a3, o_v_poly_phase_a4, o_v_poly_phase_a5 : poly_phase_t;
