@@ -82,13 +82,23 @@ localparam [31:0] AUDIO_BLK = 32'h4000_0000;
 reg          blob_cap;
 reg          blob_blk;
 reg  [8:0]   blob_ra;
-wire [15:0]  blob_q;
+wire [15:0]  blob_q_ram;
 cd_sdp #(.DW(16), .AW(9)) blob_ram (
 	.clock(clk),
 	.waddr({blob_blk, sd_buff_addr}), .wdata(sd_buff_dout),
 	.wr(blob_cap && sd_buff_wr),
-	.raddr(blob_ra), .q(blob_q)
+	.raddr(blob_ra), .q(blob_q_ram)
 );
+// Every blob-consuming FSM below is written against a 2-cycle read pipeline
+// ("step k: blob_q holds word k-2"); cd_sdp is a 1-cycle RAM. Without this
+// output stage every consumer reads one word EARLY: the M_HDR_RD magic check
+// compares "MC" against word 1 ("DA"), toc_valid can never set, and every
+// disc degrades to the synthesized single data track with PLAY rejected —
+// the exact HW symptom found 2026-07-17 (first hardware exercise of this
+// path; the sim has no CD/TOC harness). One register here aligns the
+// hardware with the contract for ALL blob readers at once.
+reg [15:0] blob_q;
+always @(posedge clk) blob_q <= blob_q_ram;
 wire [7:0] blob_b0 = blob_q[7:0];      // even byte (LE lane order on FPGA)
 wire [7:0] blob_b1 = blob_q[15:8];
 
