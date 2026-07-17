@@ -48,7 +48,8 @@ module adb_device(
 	reg [1:0] resp_len;
 
 	// ---- keyboard state (PS2 -> ADB key FIFO) ----
-	reg  [7:0] kbdFifo [0:7];
+	// MLAB: 64 bits was burning a full M10K block (m10k-repack 2026-07-17)
+	(* ramstyle = "MLAB" *) reg  [7:0] kbdFifo [0:7];
 	reg  [2:0] kbdFifoRd, kbdFifoWr;
 	wire       kbdFifoEmpty = (kbdFifoRd == kbdFifoWr);
 

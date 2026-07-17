@@ -110,7 +110,8 @@ module swim
 	reg [7:0]  ism_mode_reg;       // ISM mode register
 	reg [7:0]  ism_setup;          // ISM setup register
 	reg [7:0]  ism_error;          // ISM error register (cleared on read)
-	reg [7:0]  ism_param[0:15];    // 16-byte parameter RAM
+	// MLAB: 128 bits was burning a full M10K block (m10k-repack 2026-07-17)
+	(* ramstyle = "MLAB" *) reg [7:0]  ism_param[0:15];    // 16-byte parameter RAM
 	reg [3:0]  ism_param_idx;      // Auto-incrementing param index
 	reg [15:0] ism_fifo[0:1];      // 2-entry FIFO (data + mark/CRC flags)
 	reg [1:0]  ism_fifo_pos;       // FIFO fill level (0=empty, 1=one, 2=full)
