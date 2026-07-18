@@ -2046,7 +2046,12 @@ module scsi_dpram #(parameter DATAWIDTH=8, ADDRWIDTH=9)
 // in-flight) look-ahead address marks the prefetch stale; the controller
 // refetches, and the post-write read returns the fresh data. No forwarding
 // paths — the RAM is always the single source of truth.
-reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
+// M10K pin per the migrating fabric-fallback law (bae8fd8 on add-cd-audio;
+// this redesign was authored from master and the 2544a1f merge took it
+// wholesale, silently dropping the pin — found 2026-07-18 by the MacIIvi
+// port review). ram_ab has never flipped (TDP shape infers reliably), so
+// this is insurance, not a bug fix; expect zero delta in the map audit.
+(* ramstyle = "M10K,no_rw_check" *) reg [DATAWIDTH-1:0] ram_ab[0:(1<<ADDRWIDTH)-1];
 
 // ---- port A: HPS side (behavior unchanged) -------------------------------
 always @(posedge clock) begin
