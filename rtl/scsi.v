@@ -306,7 +306,12 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // serve data combinationally with no HPS fetch (rd_hps_blk stays 0), so they
 // must NOT take this stall. Depth-independent; replaces the old 2-slot "half
 // being filled" test. WRITE + non-data clauses unchanged.
-wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_blk)) ||
+// '&& mounted' in the read clause: media loss mid-READ (guest eject) stops
+// the ring refill, and holding DTACK on data that will never arrive ground
+// the whole OS at the 8ms watchdog ceiling per poll (HW 2026-07-17). With
+// the medium gone the read completes with stale bytes and the driver gets
+// its error through the normal status path instead.
+wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted && (rd_cur_blk >= rd_hps_blk)) ||
                  (phase == PHASE_DATA_IN  && (io_wr | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
                  (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a

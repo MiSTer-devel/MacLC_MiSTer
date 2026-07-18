@@ -348,7 +348,11 @@ always @(posedge clk) begin
 		end
 
 		// -------------------------------------------------- TOC blob fetch
-		M_ACQ_REQ: if (ch_grant && !fr_act) begin
+		M_ACQ_REQ:
+			// unmount escape: ca_grant requires mounted, so an eject here would
+			// park the engine forever (HW 2026-07-17: guest 0xC0 mid-session).
+			if (!mounted) mst <= M_IDLE;
+			else if (ch_grant && !fr_act) begin
 			toc_lba  <= TOC_BLK + {31'd0, blob_blk};
 			toc_rd   <= 1'b1;
 			toc_act  <= 1'b1;
@@ -357,6 +361,7 @@ always @(posedge clk) begin
 			mst <= M_ACQ_WAIT;
 		end
 		M_ACQ_WAIT: begin
+			if (!mounted && !toc_act) begin toc_rd <= 1'b0; blob_cap <= 1'b0; mst <= M_IDLE; end
 			if (io_ack) toc_rd <= 1'b0;
 			if (ack_fall && toc_act) begin
 				toc_act  <= 1'b0;
