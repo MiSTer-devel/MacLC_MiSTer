@@ -268,7 +268,12 @@ always @(posedge clk) begin
 	if (phase == PHASE_IDLE)
 		sd_buff_sel <= 0;
 	else
-		if (old_io_ack & ~io_ack) sd_buff_sel <= !sd_buff_sel;
+		// ~ca_io_active: a CD-audio channel transfer started at bus-idle can
+		// still be in flight when the Mac's next command reaches a data phase;
+		// its ack falling here toggled the write double-buffer and bumped the
+		// ring counter below - wrong sectors served (HW 2026-07-17: artifacted
+		// CD icons, then a wedged READ). Same scope the io_busy term always had.
+		if (old_io_ack & ~io_ack & ~ca_io_active) sd_buff_sel <= !sd_buff_sel;
 
 	// READ ring fetch counter: # of sectors the HPS has delivered this command.
 	// Reset alongside data_cnt (any non-transfer phase); bump on each io_ack
@@ -276,7 +281,7 @@ always @(posedge clk) begin
 	if (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN &&
 	    phase != PHASE_STATUS_OUT && phase != PHASE_MESSAGE_OUT)
 		rd_hps_blk <= 23'd0;
-	else if (old_io_ack & ~io_ack & cmd_read)
+	else if (old_io_ack & ~io_ack & cmd_read & ~ca_io_active)
 		rd_hps_blk <= rd_hps_blk + 23'd1;
 end
 
@@ -302,7 +307,7 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // must NOT take this stall. Depth-independent; replaces the old 2-slot "half
 // being filled" test. WRITE + non-data clauses unchanged.
 wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && (rd_cur_blk >= rd_hps_blk)) ||
-                 (phase == PHASE_DATA_IN  && (io_wr | io_ack) && data_cnt[9] == sd_buff_sel) ||
+                 (phase == PHASE_DATA_IN  && (io_wr | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
                  (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
 	// WRITE with transfer length 0) must complete immediately: data_complete
