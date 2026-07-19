@@ -72,6 +72,7 @@ module scsi
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen[5:0] [31]=req
 	output [31:0] dbg_wrstall,
 	output [31:0] dbg_cda0,     // JTAG CDA0: cd_audio TOC/engine state (see cd_audio.sv)
+	output [31:0] dbg_cda2,     // JTAG CDA2: last 0xC1 CDB {op9, start5, alloc7, alloc8}
 	output [31:0] dbg_cda1,     // JTAG CDA1: {toc_rdy,no_media,mounted,ok, sense_asc, sense_key, cmd_cnt, last_op}
 
 	// ===== BlueSCSI Toolbox dedicated block interface (TOOLBOX_ENABLE only) ====
@@ -999,7 +1000,18 @@ end
 // the audio-frame streaming from the HPS windows. It may use the io
 // channel only while the target is bus-idle with no data io pending.
 // =====================================================================
-wire ca_grant = (phase == PHASE_IDLE) && !io_rd_d && !io_wr && !io_ack && mounted;
+// CA grant: the audio/TOC engine's fetches are HPS-channel-only (they never
+// touch the SCSI bus), so they may interleave with an ACTIVE READ command's
+// serving phase — requiring full bus-idle starved the frame stream to ~42
+// of the required 75 frames/s whenever the guest streamed game data from
+// the same disc (HW capture 2026-07-18: pstate=PLAY, fetch delta 17/400ms,
+// audible crackle = sample-hold at every late frame). The io-free terms
+// still serialize the channel per-op, and the ~ca_io_active scoping keeps
+// CA acks out of the data-path accounting (that isolation was built for
+// exactly this concurrency). DATA_IN (writes) stays excluded: the CD is
+// read-only, so it never occurs; all other phases remain excluded.
+wire ca_grant = (phase == PHASE_IDLE || (cmd_read && phase == PHASE_DATA_OUT))
+                && !io_rd_d && !io_wr && !io_ack && mounted;
 
 generate if (CDROM != 0) begin : g_cd_audio
 	cd_audio #(.CLK_HZ(32'd32_500_000)) cd_audio_i (   // clk_sys rate; audio pitch verifies it
@@ -1383,8 +1395,14 @@ reg [7:0] cd_sense_asc = 8'd0;
 // accept/reject flag tells whether cmd_ok took it (a rejected PLAY is the
 // interesting datum). Driven from the main phase FSM block only.
 reg [7:0] dbg_last_op = 8'd0;
+// CDA2: the exact 0xC1 READ TOC request the guest last issued —
+// {cdb9 (operation bits), cdb5 (start track BCD), cdb7:cdb8 (allocation)}.
+// The served bytes are fully determined by these + the resp plane, so this
+// pins down the "player shows 2 tracks" divergence (2026-07-18).
+reg [31:0] dbg_toc_cdb = 32'd0;
 reg [7:0] dbg_cmd_cnt = 8'd0;
 reg       dbg_last_ok = 1'b0;
+assign dbg_cda2 = dbg_toc_cdb;
 assign dbg_cda1 = { ca_toc_ready, cd_no_media, mounted, dbg_last_ok,
                     cd_sense_asc, cd_sense_key, dbg_cmd_cnt, dbg_last_op };
 reg       cd_prevent   = 1'b0;
@@ -1489,6 +1507,7 @@ always @(posedge clk) begin
 					// notify the CD-audio engine (all constant 0 on disks)
 					ca_cmd_stb   <= cmd_cd_audio_nop;
 					dbg_last_op <= op_code;
+					if (cmd_cd_toc) dbg_toc_cdb <= {cmd[9], cmd[5], cmd[7], cmd[8]};
 					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
 					dbg_last_ok <= 1'b1;
 					ca_read_stb  <= cmd_read && (CDROM != 0);
