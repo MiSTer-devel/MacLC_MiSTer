@@ -599,7 +599,26 @@ wire  [7:0] ca_ast_code, ca_cur_ctrl, ca_cur_trk;
 wire  [7:0] ca_abs_m, ca_abs_s, ca_abs_f, ca_rel_m, ca_rel_s, ca_rel_f;
 wire  [7:0] ca_t43_q0, ca_t43_q1, ca_t43_q2, ca_t43_q3;
 wire  [9:0] ca_t43_len;
-wire [8:0]  ca_t43_addr = data_cnt[8:0];
+// 0x43 start-track filter (serve-time address transform; the table stays
+// full-from-track-1): header bytes 0-3 serve as-is, descriptor bytes are
+// offset so the FIRST served descriptor is the requested start track;
+// start 0xAA = the lead-out row (the driver's very first ask on HW was
+// {start=0xAA, alloc=12} = header + leadout only). The header's u16be
+// length field is overridden to the filtered length. nreal is recovered
+// from the table length: len = (nreal+1)*8 + 6 -> nreal = (len-14)>>3 +1;
+// simpler: rows_total = (ca_t43_len - 10'd6) >> 3 (tracks + leadout).
+wire [6:0]  ca_t43_nreal = (ca_t43_len >= 10'd14) ? ((ca_t43_len - 10'd14) >> 3) + 7'd1 : 7'd1;
+wire [7:0]  ca_t43_start = cmd[6];
+wire [6:0]  ca_t43_soff  =
+	(ca_t43_start == 8'h00 || ca_t43_start == 8'h01) ? 7'd0 :
+	(ca_t43_start == 8'hAA) ? ca_t43_nreal :
+	(ca_t43_start > {1'b0, ca_t43_nreal}) ? ca_t43_nreal :
+	ca_t43_start[6:0] - 7'd1;
+// filtered data length (u16-be field value = bytes after the field = rows*8 + 2)
+wire [9:0]  ca_t43_flen  = {(7'd1 + ca_t43_nreal - ca_t43_soff), 3'b000} + 10'd2;
+wire [9:0]  ca_t43_tot   = ca_t43_flen + 10'd2;      // total serveable bytes
+wire [8:0]  ca_t43_addr  = (data_cnt < 32'd4) ? data_cnt[8:0]
+                         : (9'd4 + {ca_t43_soff, 3'b000} + (data_cnt[8:0] - 9'd4));
 // standard audio-status codes ([PIONEER] 2-27C via Snow): 0x11 play,
 // 0x12 paused, 0x13 completed/stopped (engine ast_code 0/1/3/5).
 wire  [7:0] ca_ast_std = (ca_ast_code == 8'd0) ? 8'h11 :
@@ -692,10 +711,18 @@ wire [7:0] cd_subq43_dout       = cd_subq43_byte(data_cnt);
 wire [7:0] cd_subq43_dout_next  = cd_subq43_byte(data_cnt_next);
 wire [7:0] cd_subq43_dout_next2 = cd_subq43_byte(data_cnt_next2);
 wire [7:0] cd_subq43_dout_next3 = cd_subq43_byte(data_cnt_next3);
-wire [7:0] cd_toc43_dout        = ca_toc_ready ? ca_t43_q0 : 8'h00;
-wire [7:0] cd_toc43_dout_next   = ca_toc_ready ? ca_t43_q1 : 8'h00;
-wire [7:0] cd_toc43_dout_next2  = ca_toc_ready ? ca_t43_q2 : 8'h00;
-wire [7:0] cd_toc43_dout_next3  = ca_toc_ready ? ca_t43_q3 : 8'h00;
+function [7:0] t43_hdr_fix;      // override bytes 0/1 with the filtered length
+	input [31:0] cnt;
+	input [7:0]  raw;
+	begin
+		t43_hdr_fix = (cnt == 32'd0) ? {6'd0, ca_t43_flen[9:8]} :
+		              (cnt == 32'd1) ? ca_t43_flen[7:0] : raw;
+	end
+endfunction
+wire [7:0] cd_toc43_dout        = ca_toc_ready ? t43_hdr_fix(data_cnt,       ca_t43_q0) : 8'h00;
+wire [7:0] cd_toc43_dout_next   = ca_toc_ready ? t43_hdr_fix(data_cnt_next,  ca_t43_q1) : 8'h00;
+wire [7:0] cd_toc43_dout_next2  = ca_toc_ready ? t43_hdr_fix(data_cnt_next2, ca_t43_q2) : 8'h00;
+wire [7:0] cd_toc43_dout_next3  = ca_toc_ready ? t43_hdr_fix(data_cnt_next3, ca_t43_q3) : 8'h00;
 
 wire [7:0] cd_astat_dout       = cd_astat_byte(data_cnt);
 wire [7:0] cd_astat_dout_next  = cd_astat_byte(data_cnt_next);
@@ -1181,8 +1208,8 @@ wire [31:0] data_len =
 		 cmd_read?{ 7'd0, tlen, 9'd0 }:   // read command length is in 512 bytes blocks
 		 cmd_write?{ 7'd0, tlen, 9'd0 }:  // write command length is in 512 bytes blocks
 		 cmd_cd_toc?cd_toc_len:           // Apple READ TOC (see cd_toc_len)
-		 cmd_cd_toc43?(({16'd0, cmd[7], cmd[8]} < {22'd0, ca_t43_len}) ?
-		               {16'd0, cmd[7], cmd[8]} : {22'd0, ca_t43_len}):
+		 cmd_cd_toc43?(({16'd0, cmd[7], cmd[8]} < {22'd0, ca_t43_tot}) ?
+		               {16'd0, cmd[7], cmd[8]} : {22'd0, ca_t43_tot}):
 		 cmd_cd_subq43?(({16'd0, cmd[7], cmd[8]} < 32'd16) ?
 		                {16'd0, cmd[7], cmd[8]} : 32'd16):
 		 cmd_cd_subq?32'd9:               // READ Q SUBCODE: fixed 9 bytes
