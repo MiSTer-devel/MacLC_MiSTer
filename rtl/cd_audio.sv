@@ -39,7 +39,7 @@ module cd_audio #(
 	// audio-family CDB, latched by scsi.v (status GOOD already returned)
 	input             cmd_stb,
 	input       [7:0] cmd_op,
-	input       [7:0] cdb1, cdb2, cdb3, cdb4, cdb5, cdb6, cdb7, cdb9,
+	input       [7:0] cdb1, cdb2, cdb3, cdb4, cdb5, cdb6, cdb7, cdb8, cdb9,
 	input             read_stb,         // data READ latched: stop playback
 	input             eject_stb,
 
@@ -56,8 +56,11 @@ module cd_audio #(
 	// live registers for AUDIO STATUS (0xCC) / READ Q SUBCODE (0xC2)
 	output reg  [7:0] ast_code,         // 0 play, 1 paused, 3 end, 5 idle
 	output reg  [7:0] cur_ctrl,
-	output reg  [7:0] cur_trk_bcd,
-	output reg  [7:0] abs_m, abs_s, abs_f,   // BCD, no +150 (oracle)
+	output reg  [7:0] cur_trk,               // BINARY, 1-based (dialect switch:
+	                                         // vendor 0xC2/0xCC serve bin2bcd()
+	                                         // of these at the scsi.v mux; the
+	                                         // standard 0x42 serves them raw)
+	output reg  [7:0] abs_m, abs_s, abs_f,   // BINARY, no +150
 	output reg  [7:0] rel_m, rel_s, rel_f,
 
 	// 0xC1 READ TOC response RAM: bytes at toc_base .. toc_base+3.
@@ -228,6 +231,14 @@ function [31:0] msf2lba;               // BCD M/S/F -> LBA
 	        + {24'd0, bcd2bin(s)} * 32'd75
 	        + {24'd0, bcd2bin(f)};
 endfunction
+function [31:0] msf2lba_std;           // BINARY M/S/F (+150 space) -> disc LBA
+	input [7:0] m, s, f;
+	reg [31:0] v;
+	begin
+		v = {24'd0, m} * 32'd4500 + {24'd0, s} * 32'd75 + {24'd0, f};
+		msf2lba_std = (v >= 32'd150) ? v - 32'd150 : 32'd0;
+	end
+endfunction
 
 // ============================================================================
 // io-channel request mux (each FSM owns its own request registers)
@@ -304,11 +315,13 @@ reg  [7:0] dbg_toc_fetch_cnt = 8'd0;
 reg  [4:0] dbg_fr_fetch_cnt  = 5'd0;
 reg [31:0] leadout_lba;
 
-reg  [7:0] c_op, c_1, c_2, c_3, c_4, c_5, c_6, c_7, c_9;
+reg  [7:0] c_op, c_1, c_2, c_3, c_4, c_5, c_6, c_7, c_8, c_9;
 reg        cmd_pend;
 reg [31:0] c_addr;                      // resolved target address
 reg [31:0] c_next;                      // start of following track (track mode)
 reg  [6:0] c_trk;                       // 0-based requested track
+reg  [6:0] c_trk2;                      // 0-based index whose START bounds the play
+                                        // (vendor: c_trk+1; 0x48: end-track+1)
 
 reg [31:0] ref_abs, ref_rel;
 reg [31:0] scan_start;
@@ -331,7 +344,7 @@ always @(posedge clk) begin
 		resp_we <= 0; resp_wa <= 0; resp_wd <= 0;
 		toc_valid <= 0; toc_ready <= 0; n_tracks <= 7'd1; leadout_lba <= 0;
 		cmd_pend <= 0; pstate <= ST_IDLE; cur_lba <= 0; stop_lba <= 0; flush <= 0;
-		cur_ctrl <= 8'h14; cur_trk_bcd <= 8'h01;
+		cur_ctrl <= 8'h14; cur_trk <= 8'h01;
 		abs_m <= 0; abs_s <= 0; abs_f <= 0; rel_m <= 0; rel_s <= 0; rel_f <= 0;
 		ref_cnt <= 0; t_idx <= 0;
 	end else begin
@@ -342,7 +355,7 @@ always @(posedge clk) begin
 		// command capture: never lost, executed from M_IDLE
 		if (cmd_stb) begin
 			c_op <= cmd_op; c_1 <= cdb1; c_2 <= cdb2; c_3 <= cdb3; c_4 <= cdb4;
-			c_5 <= cdb5; c_6 <= cdb6; c_7 <= cdb7; c_9 <= cdb9;
+			c_5 <= cdb5; c_6 <= cdb6; c_7 <= cdb7; c_8 <= cdb8; c_9 <= cdb9;
 			cmd_pend <= 1'b1;
 		end
 		// oracle: a data READ (or eject / unmount) stops playback
@@ -641,6 +654,7 @@ always @(posedge clk) begin
 						if (c_op != 8'hcb) pstate <= ST_IDLE;
 					end else begin
 						c_trk <= (bcd2bin(c_5) - 8'd1 < 8'd99) ? bcd2bin(c_5) - 8'd1 : 7'd98;
+						c_trk2 <= (bcd2bin(c_5) < 8'd99) ? bcd2bin(c_5) : 7'd99;
 						step  <= 0;
 						mst   <= toc_valid ? M_CTRK_RD : M_APPLY;
 						if (!toc_valid) begin c_addr <= 32'd0; c_next <= leadout_lba; end
@@ -652,6 +666,28 @@ always @(posedge clk) begin
 				end
 				endcase
 			end
+			// ---- standard SCSI-2 audio set (dialect switch 2026-07-19) ----
+			8'h47: begin                                   // PLAY AUDIO MSF (hex, +150)
+				c_addr <= msf2lba_std(c_3, c_4, c_5);
+				c_next <= msf2lba_std(c_6, c_7, c_8);
+				mst <= M_APPLY;
+			end
+			8'h48: begin                                   // PLAY AUDIO TRACK/INDEX (binary)
+				if (c_4 == 8'd0) pstate <= ST_IDLE;
+				else begin
+					c_trk  <= (c_4 - 8'd1 < 8'd99) ? c_4 - 8'd1 : 7'd98;
+					c_trk2 <= (c_7 < 8'd99) ? c_7[6:0] : 7'd99;   // stop at start of end+1
+					step   <= 0;
+					mst    <= toc_valid ? M_CTRK_RD : M_APPLY;
+					if (!toc_valid) begin c_addr <= 32'd0; c_next <= leadout_lba; end
+				end
+			end
+			8'h4b:                                         // PAUSE/RESUME (cdb8 bit0 = resume)
+				if (c_8[0]) begin
+					if (pstate == ST_PAUSE) pstate <= ST_PLAY;
+				end else if (pstate == ST_PLAY) pstate <= ST_PAUSE;
+			8'h4e:                                         // STOP PLAY
+				if (pstate != ST_IDLE) pstate <= ST_IDLE;
 			default: ;                                     // 0xCE handled in scsi.v
 			endcase
 		end
@@ -665,7 +701,7 @@ always @(posedge clk) begin
 			3'd1: blob_ra <= blob_ra + 9'd1;
 			3'd2: begin
 				c_addr[15:0] <= blob_q;                    // start(k) lo
-				blob_ra <= 9'd9 + {((c_trk + 7'd1) < n_tracks ? (c_trk + 7'd1) : n_tracks - 7'd1), 2'b00};
+				blob_ra <= 9'd9 + {(c_trk2 < n_tracks ? c_trk2 : n_tracks - 7'd1), 2'b00};
 			end
 			3'd3: begin
 				c_addr[31:16] <= blob_q;                   // start(k) hi
@@ -674,7 +710,7 @@ always @(posedge clk) begin
 			3'd4: c_next[15:0] <= blob_q;                  // start(k+1) lo
 			default: begin
 				c_next[31:16] <= blob_q;                   // start(k+1) hi
-				if ((c_trk + 7'd1) >= n_tracks) c_next <= leadout_lba;
+				if (c_trk2 >= n_tracks) c_next <= leadout_lba;
 				step <= 0;
 				mst <= M_APPLY;
 			end
@@ -701,6 +737,12 @@ always @(posedge clk) begin
 					if (c_9[7:6] == 2'b10) stop_lba <= leadout_lba;
 					else if (stop_lba <= c_addr) stop_lba <= leadout_lba;
 				end
+			end
+			8'h47, 8'h48: begin                            // standard range play
+				cur_lba  <= c_addr;
+				stop_lba <= c_next;
+				flush    <= 1'b1;
+				pstate   <= (c_addr < c_next) ? ST_PLAY : ST_IDLE;
 			end
 			default: begin                                 // SEARCH (0xC8) / SCAN (0xCD, v1 = seek)
 				cur_lba <= c_addr;
@@ -750,7 +792,7 @@ always @(posedge clk) begin
 			end
 			else begin
 				refm_hold <= div_m; refs_hold <= div_s;
-				abs_f <= bin2bcd(div_v[7:0]);
+				abs_f <= div_v[7:0];
 				ref_rel <= ref_abs - scan_best_start;
 				div_v <= ref_abs - scan_best_start; div_m <= 0; div_s <= 0;
 				step <= 0;
@@ -765,13 +807,13 @@ always @(posedge clk) begin
 				div_v <= div_v - 32'd75; div_s <= div_s + 7'd1;
 			end
 			else begin
-				abs_m <= bin2bcd({1'b0, refm_hold});
-				abs_s <= bin2bcd({1'b0, refs_hold});
-				rel_m <= bin2bcd({1'b0, div_m});
-				rel_s <= bin2bcd({1'b0, div_s});
-				rel_f <= bin2bcd(div_v[7:0]);
+				abs_m <= {1'b0, refm_hold};
+				abs_s <= {1'b0, refs_hold};
+				rel_m <= {1'b0, div_m};
+				rel_s <= {1'b0, div_s};
+				rel_f <= div_v[7:0];
 				cur_ctrl    <= scan_best_ctrl;
-				cur_trk_bcd <= bin2bcd({1'b0, scan_best_trk} + 8'd1);
+				cur_trk <= {1'b0, scan_best_trk} + 8'd1;
 				mst <= M_IDLE;
 			end
 		end

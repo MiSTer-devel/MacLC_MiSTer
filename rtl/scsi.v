@@ -374,7 +374,9 @@ wire [7:0] cmd_dout =
 		cmd_mode_sense?mode_sense_dout:
 		cmd_request_sense?request_sense_dout:
 		cmd_cd_toc?cd_toc_dout:
+		cmd_cd_toc43?cd_toc43_dout:
 		cmd_cd_subq?cd_subq_dout:
+		cmd_cd_subq43?cd_subq43_dout:
 		cmd_cd_astat?cd_astat_dout:
 		cmd_tb_devinfo?tb_devinfo_dout:
 		cmd_tb_debug?tb_debug_dout:
@@ -387,7 +389,9 @@ wire [15:0] cmd_dout_pair =
 		cmd_mode_sense?{mode_sense_dout, mode_sense_dout_next}:
 		cmd_request_sense?{request_sense_dout, request_sense_dout_next}:
 		cmd_cd_toc?{cd_toc_dout, cd_toc_dout_next}:
+		cmd_cd_toc43?{cd_toc43_dout, cd_toc43_dout_next}:
 		cmd_cd_subq?{cd_subq_dout, cd_subq_dout_next}:
+		cmd_cd_subq43?{cd_subq43_dout, cd_subq43_dout_next}:
 		cmd_cd_astat?{cd_astat_dout, cd_astat_dout_next}:
 		cmd_tb_devinfo?{tb_devinfo_dout, tb_devinfo_dout_next}:
 		cmd_tb_debug?{tb_debug_dout, tb_debug_dout_next}:
@@ -400,7 +404,9 @@ wire [15:0] cmd_dout_pair_next =
 		cmd_mode_sense?{mode_sense_dout_next2, mode_sense_dout_next3}:
 		cmd_request_sense?{request_sense_dout_next2, request_sense_dout_next3}:
 		cmd_cd_toc?{cd_toc_dout_next2, cd_toc_dout_next3}:
+		cmd_cd_toc43?{cd_toc43_dout_next2, cd_toc43_dout_next3}:
 		cmd_cd_subq?{cd_subq_dout_next2, cd_subq_dout_next3}:
+		cmd_cd_subq43?{cd_subq43_dout_next2, cd_subq43_dout_next3}:
 		cmd_cd_astat?{cd_astat_dout_next2, cd_astat_dout_next3}:
 		cmd_tb_devinfo?{tb_devinfo_dout_next2, tb_devinfo_dout_next3}:
 		cmd_tb_debug?{tb_debug_dout_next2, tb_debug_dout_next3}:
@@ -591,6 +597,17 @@ wire        ca_io_active, ca_io_rd_w;
 wire [31:0] ca_io_lba;
 wire  [7:0] ca_ast_code, ca_cur_ctrl, ca_cur_trk;
 wire  [7:0] ca_abs_m, ca_abs_s, ca_abs_f, ca_rel_m, ca_rel_s, ca_rel_f;
+wire  [7:0] ca_t43_q0, ca_t43_q1, ca_t43_q2, ca_t43_q3;
+wire  [9:0] ca_t43_len;
+wire [8:0]  ca_t43_addr = data_cnt[8:0];
+// standard audio-status codes ([PIONEER] 2-27C via Snow): 0x11 play,
+// 0x12 paused, 0x13 completed/stopped (engine ast_code 0/1/3/5).
+wire  [7:0] ca_ast_std = (ca_ast_code == 8'd0) ? 8'h11 :
+                         (ca_ast_code == 8'd1) ? 8'h12 : 8'h13;
+function [7:0] scsi_bin2bcd;           // 0..99 (vendor-dialect BCD serving)
+	input [7:0] v;
+	scsi_bin2bcd = {4'd0, (v / 8'd10)} << 4 | {4'd0, (v % 8'd10)};
+endfunction
 wire  [7:0] ca_toc_q0, ca_toc_q1, ca_toc_q2, ca_toc_q3;
 wire        ca_toc_ready;
 reg         ca_cmd_stb = 1'b0, ca_read_stb = 1'b0, ca_eject_stb = 1'b0;
@@ -622,14 +639,14 @@ wire [7:0] cd_toc_dout_next3   = ca_toc_ready ? ca_toc_q3 : 8'h00;
 function [7:0] cd_subq_byte;
 	input [31:0] cnt;
 	begin
-		cd_subq_byte = (cnt == 32'd1) ? ca_cur_trk :
+		cd_subq_byte = (cnt == 32'd1) ? scsi_bin2bcd(ca_cur_trk) :
 		               (cnt == 32'd2) ? 8'h01 :
-		               (cnt == 32'd3) ? ca_rel_m :
-		               (cnt == 32'd4) ? ca_rel_s :
-		               (cnt == 32'd5) ? ca_rel_f :
-		               (cnt == 32'd6) ? ca_abs_m :
-		               (cnt == 32'd7) ? ca_abs_s :
-		               (cnt == 32'd8) ? ca_abs_f : 8'h00;
+		               (cnt == 32'd3) ? scsi_bin2bcd(ca_rel_m) :
+		               (cnt == 32'd4) ? scsi_bin2bcd(ca_rel_s) :
+		               (cnt == 32'd5) ? scsi_bin2bcd(ca_rel_f) :
+		               (cnt == 32'd6) ? scsi_bin2bcd(ca_abs_m) :
+		               (cnt == 32'd7) ? scsi_bin2bcd(ca_abs_s) :
+		               (cnt == 32'd8) ? scsi_bin2bcd(ca_abs_f) : 8'h00;
 	end
 endfunction
 
@@ -641,9 +658,9 @@ function [7:0] cd_astat_byte;
 		cd_astat_byte = (cnt == 32'd0) ? ((cmd[3] == 8'd1) ? 8'hFF : ca_ast_code) :
 		                (cnt == 32'd1) ? ((cmd[3] == 8'd1) ? 8'hFF : 8'h00) :
 		                (cnt == 32'd2) ? ca_cur_ctrl :
-		                (cnt == 32'd3) ? ca_abs_m :
-		                (cnt == 32'd4) ? ca_abs_s :
-		                (cnt == 32'd5) ? ca_abs_f : 8'h00;
+		                (cnt == 32'd3) ? scsi_bin2bcd(ca_abs_m) :
+		                (cnt == 32'd4) ? scsi_bin2bcd(ca_abs_s) :
+		                (cnt == 32'd5) ? scsi_bin2bcd(ca_abs_f) : 8'h00;
 	end
 endfunction
 
@@ -651,6 +668,35 @@ wire [7:0] cd_subq_dout        = cd_subq_byte(data_cnt);
 wire [7:0] cd_subq_dout_next   = cd_subq_byte(data_cnt_next);
 wire [7:0] cd_subq_dout_next2  = cd_subq_byte(data_cnt_next2);
 wire [7:0] cd_subq_dout_next3  = cd_subq_byte(data_cnt_next3);
+// standard 0x42 READ SUB-CHANNEL, format 1 (current position), MSF form,
+// 16 bytes: {00, status, u16be len=12, 01, adr_ctrl, track, index=1,
+// {0,M,S,F} abs, {0,M,S,F} rel} — binary values (Snow is the reference).
+function [7:0] cd_subq43_byte;
+	input [31:0] cnt;
+	begin
+		cd_subq43_byte = (cnt == 32'd1)  ? ca_ast_std :
+		                 (cnt == 32'd3)  ? 8'd12 :
+		                 (cnt == 32'd4)  ? 8'h01 :
+		                 (cnt == 32'd5)  ? ca_cur_ctrl :
+		                 (cnt == 32'd6)  ? ca_cur_trk :
+		                 (cnt == 32'd7)  ? 8'h01 :
+		                 (cnt == 32'd9)  ? ca_abs_m :
+		                 (cnt == 32'd10) ? ca_abs_s :
+		                 (cnt == 32'd11) ? ca_abs_f :
+		                 (cnt == 32'd13) ? ca_rel_m :
+		                 (cnt == 32'd14) ? ca_rel_s :
+		                 (cnt == 32'd15) ? ca_rel_f : 8'h00;
+	end
+endfunction
+wire [7:0] cd_subq43_dout       = cd_subq43_byte(data_cnt);
+wire [7:0] cd_subq43_dout_next  = cd_subq43_byte(data_cnt_next);
+wire [7:0] cd_subq43_dout_next2 = cd_subq43_byte(data_cnt_next2);
+wire [7:0] cd_subq43_dout_next3 = cd_subq43_byte(data_cnt_next3);
+wire [7:0] cd_toc43_dout        = ca_toc_ready ? ca_t43_q0 : 8'h00;
+wire [7:0] cd_toc43_dout_next   = ca_toc_ready ? ca_t43_q1 : 8'h00;
+wire [7:0] cd_toc43_dout_next2  = ca_toc_ready ? ca_t43_q2 : 8'h00;
+wire [7:0] cd_toc43_dout_next3  = ca_toc_ready ? ca_t43_q3 : 8'h00;
+
 wire [7:0] cd_astat_dout       = cd_astat_byte(data_cnt);
 wire [7:0] cd_astat_dout_next  = cd_astat_byte(data_cnt_next);
 wire [7:0] cd_astat_dout_next2 = cd_astat_byte(data_cnt_next2);
@@ -1019,18 +1065,22 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.mounted(mounted), .img_mounted(img_mounted), .img_blocks(img_blocks),
 		.cmd_stb(ca_cmd_stb), .cmd_op(cmd[0]),
 		.cdb1(cmd[1]), .cdb2(cmd[2]), .cdb3(cmd[3]), .cdb4(cmd[4]),
-		.cdb5(cmd[5]), .cdb6(cmd[6]), .cdb7(cmd[7]), .cdb9(cmd[9]),
+		.cdb5(cmd[5]), .cdb6(cmd[6]), .cdb7(cmd[7]), .cdb8(cmd[8]), .cdb9(cmd[9]),
 		.read_stb(ca_read_stb), .eject_stb(ca_eject_stb),
 		.ch_grant(ca_grant),
 		.ca_io_active(ca_io_active), .ca_io_rd(ca_io_rd_w), .ca_io_lba(ca_io_lba),
 		.io_ack(io_ack),
 		.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
-		.ast_code(ca_ast_code), .cur_ctrl(ca_cur_ctrl), .cur_trk_bcd(ca_cur_trk),
+		.ast_code(ca_ast_code), .cur_ctrl(ca_cur_ctrl), .cur_trk(ca_cur_trk),
 		.abs_m(ca_abs_m), .abs_s(ca_abs_s), .abs_f(ca_abs_f),
 		.rel_m(ca_rel_m), .rel_s(ca_rel_s), .rel_f(ca_rel_f),
 		.toc_base(ca_toc_addr),
 		.toc_q0(ca_toc_q0), .toc_q1(ca_toc_q1), .toc_q2(ca_toc_q2), .toc_q3(ca_toc_q3),
 		.toc_ready(ca_toc_ready),
+		.toc43_base(ca_t43_addr),
+		.toc43_q0(ca_t43_q0), .toc43_q1(ca_t43_q1),
+		.toc43_q2(ca_t43_q2), .toc43_q3(ca_t43_q3),
+		.toc43_len(ca_t43_len),
 		.snd_l(cd_snd_l), .snd_r(cd_snd_r),
 		.dbg_cda0(dbg_cda0)
 	);
@@ -1045,6 +1095,9 @@ end else begin : g_no_cd_audio
 	assign ca_rel_m = 8'h00; assign ca_rel_s = 8'h00; assign ca_rel_f = 8'h00;
 	assign ca_toc_q0 = 8'h00; assign ca_toc_q1 = 8'h00;
 	assign ca_toc_q2 = 8'h00; assign ca_toc_q3 = 8'h00;
+	assign ca_t43_q0 = 8'h00; assign ca_t43_q1 = 8'h00;
+	assign ca_t43_q2 = 8'h00; assign ca_t43_q3 = 8'h00;
+	assign ca_t43_len = 10'd0;
 	assign ca_toc_ready = 1'b0;
 	assign cd_snd_l = 16'sd0;
 	assign cd_snd_r = 16'sd0;
@@ -1128,6 +1181,10 @@ wire [31:0] data_len =
 		 cmd_read?{ 7'd0, tlen, 9'd0 }:   // read command length is in 512 bytes blocks
 		 cmd_write?{ 7'd0, tlen, 9'd0 }:  // write command length is in 512 bytes blocks
 		 cmd_cd_toc?cd_toc_len:           // Apple READ TOC (see cd_toc_len)
+		 cmd_cd_toc43?(({16'd0, cmd[7], cmd[8]} < {22'd0, ca_t43_len}) ?
+		               {16'd0, cmd[7], cmd[8]} : {22'd0, ca_t43_len}):
+		 cmd_cd_subq43?(({16'd0, cmd[7], cmd[8]} < 32'd16) ?
+		                {16'd0, cmd[7], cmd[8]} : 32'd16):
 		 cmd_cd_subq?32'd9:               // READ Q SUBCODE: fixed 9 bytes
 		 cmd_cd_astat?32'd6:              // AUDIO STATUS: fixed 6 bytes
 		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
@@ -1293,7 +1350,12 @@ wire       cmd_cd_actl      = (CDROM != 0) && (op_code == 8'hce);  // AUDIO CONT
 // per plan §5.1; they only matter for CD-DA which has no PCM path yet).
 wire       cmd_cd_audio_nop = (CDROM != 0) && ((op_code == 8'hc8) || (op_code == 8'hc9) ||
                                                (op_code == 8'hca) || (op_code == 8'hcb) ||
-                                               (op_code == 8'hcd));
+                                               (op_code == 8'hcd) ||
+                                               // standard set (dialect switch):
+                                               (op_code == 8'h47) || (op_code == 8'h48) ||
+                                               (op_code == 8'h4b) || (op_code == 8'h4e));
+wire       cmd_cd_toc43  = (CDROM != 0) && (op_code == 8'h43);  // standard READ TOC
+wire       cmd_cd_subq43 = (CDROM != 0) && (op_code == 8'h42);  // standard READ SUB-CHANNEL
 wire       cmd_cd_prevent   = (CDROM != 0) && (op_code == 8'h1e);  // PREVENT/ALLOW MEDIUM REMOVAL
 wire       cmd_cd_startstop = (CDROM != 0) && (op_code == 8'h1b);  // START/STOP UNIT
 
@@ -1368,6 +1430,7 @@ wire  cmd_ok_cd = cmd_read || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_mode_sense ||
 		  cmd_request_sense || cmd_cd_eject || cmd_cd_toc || cmd_cd_subq ||
 		  cmd_cd_astat || cmd_cd_actl || cmd_cd_audio_nop ||
+		  cmd_cd_toc43 || cmd_cd_subq43 ||
 		  cmd_cd_prevent || cmd_cd_startstop;
 
 wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
@@ -1377,6 +1440,7 @@ wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
 // MacOS "hammer the drive asking the user to format it", cd.cpp:1214).
 wire  cd_needs_media = cmd_test_unit_ready || cmd_read || cmd_read_capacity ||
 		  cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_actl ||
+		  cmd_cd_toc43 || cmd_cd_subq43 ||
 		  cmd_cd_audio_nop;
 wire  cd_no_media = (CDROM != 0) && !mounted && cd_needs_media;
 
@@ -1514,7 +1578,9 @@ always @(posedge clk) begin
 					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
 					dbg_last_ok <= 1'b1;
 					ca_read_stb  <= cmd_read && (CDROM != 0);
-					ca_eject_stb <= cmd_cd_eject && !cd_prevent;
+					ca_eject_stb <= (cmd_cd_eject ||
+					                 (cmd_cd_startstop && cmd[4][1] && !cmd[4][0]))
+					                && !cd_prevent;
 
 					// continue according to command
 
@@ -1522,7 +1588,7 @@ always @(posedge clk) begin
 					if(cmd_tb_fs_in) phase <= PHASE_TB;   // toolbox DataIn fs op: HPS round-trip, then serve
 						else if(cmd_tb_send_end) phase <= PHASE_TB;       // SEND END: no payload, straight to round-trip
 						else if(cmd_tb_send_pay) phase <= PHASE_DATA_IN;  // SEND PREP/DATA: collect the DataOut payload first
-						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat) phase <= PHASE_DATA_OUT;
+						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_toc43 || cmd_cd_subq43) phase <= PHASE_DATA_OUT;
 					// these commands receive dataa
 					else if(cmd_write || cmd_mode_select || cmd_write_buffer || cmd_cd_actl) phase <= PHASE_DATA_IN;
 					// and all other valid commands are just "ok"
