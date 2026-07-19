@@ -1507,7 +1507,10 @@ always @(posedge clk) begin
 					// notify the CD-audio engine (all constant 0 on disks)
 					ca_cmd_stb   <= cmd_cd_audio_nop;
 					dbg_last_op <= op_code;
-					if (cmd_cd_toc) dbg_toc_cdb <= {cmd[9], cmd[5], cmd[7], cmd[8]};
+					// latch ONLY op-0x80 (per-track descriptor) asks: the player's
+					// launch-time track walk is the datum; the periodic op00/op40
+					// refresh was overwriting it before we could read (2026-07-19).
+					if (cmd_cd_toc && cmd[9][7:6] == 2'b10) dbg_toc_cdb <= {cmd[9], cmd[5], cmd[7], cmd[8]};
 					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
 					dbg_last_ok <= 1'b1;
 					ca_read_stb  <= cmd_read && (CDROM != 0);
