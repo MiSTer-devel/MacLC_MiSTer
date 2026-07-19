@@ -82,3 +82,49 @@ distortion (plausibly downstream of TOC/read issues).
   (fork + stderr DIAG) resident and healthy.
 - Per-fit marginality law in force: STA-met ≠ stable; +0.24-class slack
   + boot-probe (CPU alive, no req_drop saturation) before user soak.
+
+
+## STATE ADDENDUM (written mid-lottery, ~09:30 2026-07-19)
+
+**The implementation is DONE and pushed** — all four phases landed this
+morning in one driving session:
+
+| Commit | Content |
+|---|---|
+| 825876a | T43 table build (M_T43_* states + plane quartet, cap 60, +150 MSF hex) |
+| fdd6ce7 | 0x43/0x42 serving + 0x47/0x48/0x4B/0x4E onto the engine; binary live regs (vendor BCD at serve); 0x1B LoEj eject; c_trk2 generalization; cdb8 latch |
+| 202b07e | THE FLIP: INQUIRY CDU-8002/1.8g -> CDU-8004/1.9a + ANSI-2; CDA2 latches 0x43 asks {flags9, start6, alloc} |
+
+Audits clean at every step (final: 34,470 regs / 3,930,474 bits = exactly
++8,192 for the T43 planes; no flips).
+
+**Remaining: the fit lottery + the hardware verdict.**
+- seed 5: +0.105 — REJECTED (thinner than the +0.177 that boot-wedged;
+  per-fit marginality law). Never deployed.
+- seed 6: building at time of writing (scratch/build_dialect_s6.log).
+- Procedure: roll seeds until +0.24-class worst slack, stage hash-named,
+  deploy, BOOT-PROBE first (cd_probes.tcl + psdt_read.tcl: CPU alive,
+  no req_drop saturation, toc_ready=1/toc_valid=1/n_tracks=22 on the
+  auto-mounted CHD), THEN the user test:
+  1. AppleCD Audio Player -> expect ALL 22 TRACKS listed (the driver now
+     speaks 0x43 to the 8004 identity; the table is byte-verified).
+  2. PLAY (0x47 path) / pause+resume (0x4B) / skip / STOP (0x4E);
+     position display live via 0x42 (binary, current-position format 1).
+  3. If anything is off: read CDA2 (the exact 0x43 ask) + CDA0/1; the
+     serving is fully determined by {ask, table}, so divergences are
+     arithmetic again.
+- Fallback rbf if the dialect misbehaves: 0170576s5 / b46d8bcs5 era
+  (vendor dialect, music-works-2-track state) in scratch/.
+
+**Watch-outs for the tester/next session:**
+- The driver MAY probe additional standard commands we accept-noop or
+  don't implement (e.g. 0x4A notifications, MODE SENSE pages). CDA1
+  last_op + sense shows any rejection; extend the ok-set as evidence
+  arrives.
+- The 0x43 start-track filter (cdb[6]>1) serves the full table in v1 —
+  fine for the known driver pattern (start 0/1); revisit if CDA2 shows
+  bigger starts.
+- LBA-form (cdb[1] MSF bit clear) serves MSF-form values in v1 — the
+  known driver always asks MSF; revisit on evidence.
+- Distortion investigation stays PARKED per the user until the TOC/read
+  path is proven (it may simply vanish).
