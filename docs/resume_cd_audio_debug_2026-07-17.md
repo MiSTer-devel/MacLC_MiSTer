@@ -94,3 +94,53 @@ Main-side auto-reinsert option later.
 - `add-cd-audio`: all 8 fixes committed + pushed; fit stable at ~495-500/553
   blocks, +0.24 ns, default fitter, ~15 min flows.
 - Framework law (sys/ off-limits) in CLAUDE.md on this branch.
+
+
+## ADDENDUM 2026-07-18 evening — the wedge is captured and the suspect list inverted
+
+**Deterministic reproduction on 22d43c4 (full tip):** boot → launch MacAtrium
+(HDD app) → hard wedge. Probe signature (snap + live, decoded):
+- Target 0 mid-READ(10) (PSC6 t0 op=0x28), then BOTH targets phase-IDLE,
+  zero io in flight — while the HOST pseudo-DMA stays ARMED (PSNC dma_en
+  set, dack creeping via watchdog beats). CPU pinned at $F06408 (DACK),
+  berr_fires SATURATED (255), max_stall = 8,125,000 clk = the 250ms
+  watchdog ceiling. ONE bus reset (driver recovery) — cleared the target,
+  NOT the host arm. Mouse/kbd dead = 250ms interrupt latency.
+- CD engine idle and innocent at wedge time (toc_valid=1/22trk, no cmds).
+- CD-Disabled A/B NOT conclusively run (OSD wedged before it applied).
+
+**The suspect inversion:** desk-audit of the hang ladder shows the RTL
+delta from the HW-clean controls (9c5d47f tier-1, a2ae04d prefetch) to the
+wedging tips is HDD-BEHAVIOR-NEUTRAL: the f5a3dec ack-scoping terms are
+per-instance with ca_io_active tied 0 on disk targets; 6685589's io_busy
+guard adds `&& mounted` (constant 1 on disks); the pin is attribute-only.
+Yet HDD reads wedge deterministically on the tip and never on the
+controls. With the logic provably equivalent, the leading theory becomes
+**fit-class marginality on the SCSI peripheral-read path** — the
+documented #3 bug class ("STA-met-but-HW-fails", cold-boot handoff
+2026-06-15): fit-sensitive marginal reads of SCSI status/data registers,
+prescribed fix never implemented. Every ~15-min fit re-rolls placement;
+the cd-era lineage keeps rolling marginal. (Caveat kept honest: ~6 bad
+fits vs 3 good ones could still hide a real logic interaction — the
+hardening below helps either way.)
+
+**Next mission (fresh eyes):**
+1. Implement the #3-prescribed hardening on the SCSI peripheral read path
+   (register/multicycle the CSR+DACK read cone — periph_din_reg from the
+   07-02 stabilization exists; the remaining items are the read-mux
+   shortening / multicycle constraint).
+2. **Disarm the host pseudo-DMA engine on SCSI bus reset** (ncr5380: bus
+   reset should clear MR_DMA/arm state, as real hardware does) — today's
+   signature shows the driver's recovery reset leaving the host armed is
+   what turns a transient into an eternal wedge. Concrete, defensible fix
+   regardless of root cause.
+3. Then the A/B ladder properly: CD-Disabled from a FRESH boot on the
+   tip; seed-roll of the identical netlist; bisect f5a3dec → 6685589 →
+   22d43c4 only if still ambiguous.
+
+**Bench state:** control 9c5d47f restored 20:17 (user unblocked; note
+their stuck-OSD attempt may have half-saved the CD-Disabled option —
+re-check in OSD if CD data is wanted on the control). Tip rbf
+22d43c4s4 stays staged, KNOWN-BAD-ON-HW for MacAtrium launch. Main =
+instrumented fork (state R, healthy — stderr-block theory disproven:
+fd2→/dev/console, writes complete).
