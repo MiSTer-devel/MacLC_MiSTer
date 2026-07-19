@@ -144,3 +144,48 @@ re-check in OSD if CD data is wanted on the control). Tip rbf
 22d43c4s4 stays staged, KNOWN-BAD-ON-HW for MacAtrium launch. Main =
 instrumented fork (state R, healthy — stderr-block theory disproven:
 fd2→/dev/console, writes complete).
+
+## ADDENDUM 2026-07-18 late — MUSIC PLAYED; underrun fixed; the marginality lottery named
+
+**CD AUDIO WAS HEARD** (user, ~22:30): game soundtrack from the MiSTer out,
+on build 35251e5 (reset-disarm). The eternal-wedge fix held under real
+load (berr=0 through a full gameplay session with music).
+
+Fixes/instruments landed tonight (all committed+pushed):
+- 35251e5: MR DMA MODE cleared on SCSI bus reset (5380 datasheet + MAME +
+  BlueSCSI's resilience model; converts eternal wedges into driver-
+  recoverable transients). THE fix that let music happen.
+- 471a83d: audio frame fetches interleave with read-command serving.
+  Live capture had playback at ~42 of the needed 75 frames/s (sample-hold
+  crackle = the reported distortion) because ca_grant demanded total
+  bus-idle while the game streamed from the same disc. Mutual exclusion
+  verified complete in BOTH directions post-change.
+- 34d5dbb: CDA2 probe = last 0xC1 CDB {op,start,alloc}. First capture:
+  the AppleCD player's last ask = op40 (leadout), alloc 4 — the
+  enumeration sequence will need a small CDB history ring if the 2-track
+  display persists after the next verdict.
+
+**OPEN #1 — the 2-track display (AppleCD Audio Player) with a 22-track
+disc**: core table holds 22 (probe), serving desk-matched to MAME's
+three-op contract (op00 {01,last_bcd,00,00} / op40 leadout MSF / op80
+descriptors from CDB[5], repeat-last). Next datum = CDA2 during a fresh
+player launch; if the asks look sane, capture a 4-deep CDB history +
+compare served bytes.
+
+**OPEN #2 — per-fit marginality is now the dominant stability variable**:
+34d5dbb (seed 4, +0.177) wedges BOOT (HDD READ(10), host re-armed after
+its recovery reset, PSWL req_drop SATURATED 65535+ = REQ cycling with
+zero ACKs, CPU polling PseudoVIA for the completion IRQ; CD unmounted and
+answering no-disc correctly) while 35251e5 (+0.251) ran a full evening.
+Functional delta ~nil. The dreq/ack-busy cone (dma_ack_holdoff/dma_settle
+/ dreq gating) is the suspected marginal net family; the 21-node JTAG hub
+routing may be aggravating pressure. Short-term: seed lottery with
+PER-BUILD HW SOAK law (STA-met ≠ stable; slack magnitude correlates).
+**Queued mission (the cure): register/multicycle-harden the SCSI periph
+read + dreq/ack-busy cone** per the 06-15 #3 handoff prescription — ends
+the lottery permanently. Consider probe-deck slimming (drop PBH-era
+leftovers if any, keep CDA/PSDT) if hub pressure proves real.
+
+Artifact ledger tonight: 35251e5s4 (md5 03fd764b) = the MUSIC build,
+stable evening driver; 34d5dbbs4 (b3615c5d) = boot-wedges, quarantine;
+seed-5 build in flight at time of writing.
