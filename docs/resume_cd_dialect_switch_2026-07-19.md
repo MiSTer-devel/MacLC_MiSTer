@@ -128,3 +128,24 @@ Audits clean at every step (final: 34,470 regs / 3,930,474 bits = exactly
   known driver always asks MSF; revisit on evidence.
 - Distortion investigation stays PARKED per the user until the TOC/read
   path is proven (it may simply vanish).
+
+## Fit ledger + law refinement (2026-07-19 late morning)
+
+| Seed | Netlist | Scalar | pll_hdmi setup | Boot-probe | Verdict |
+|---|---|---|---|---|---|
+| 5 | dialect | +0.105 | thin | not run | rejected (law) |
+| 6 | dialect | +0.126 | thin | not run | rejected |
+| 7 | dialect | +0.192 (HOLD-ltd) | **+0.42** | **CLEAN** (berr=0, CDA green, driver conversing) | **DEPLOYED candidate** |
+| 8 | +filter | +0.158 | +0.158 | not run | rejected |
+| 9 | +filter | +0.252 | **+0.64** | **FAILED: CDA hub gone, berr=36, 250ms stall peg** | QUARANTINED |
+
+**LAW REFINEMENT (s9's lesson): STA slack — even fat, per-domain-read —
+does NOT clear a fit. The BOOT-PROBE is the real gate** (instruments
+enumerable + berr=0 + no stall peg + CPU alive). s9 had the mission's
+best numbers and a sick boot; s7 has middling numbers and a clean one.
+Also: the scalar mixes setup/hold — always read the per-domain summary.
+
+**Standing state:** s7 (4125a2f, md5 468e811a) deployed = full dialect
+minus the start-filter (leadout-length quirk visible as wrong disc
+duration). The filter netlist (b3ec132+) still needs a healthy fit —
+roll seeds ≥10, boot-probe each. The 22-track user verdict runs on s7.
