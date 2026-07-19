@@ -350,7 +350,19 @@ module ncr5380
 	/* MR write */
 	always@(posedge clk or posedge reset) begin
 		if (reset) mr <= 8'b0;
-		else if (reg_wr && (bus_rs == `WREG_MR)) mr <= wdata;
+		else if (scsi_rst)
+			/* 5380 datasheet: asserting/observing RST clears MR's DMA MODE bit.
+			 * Without this, dma_en stays armed through the driver's recovery
+			 * bus reset: target returns to IDLE but the host pseudo-DMA keeps
+			 * DREQ/DACK machinery live, and every CPU DACK access stalls to
+			 * the 250ms watchdog ceiling forever (HW capture 2026-07-18:
+			 * berr_fires=255, CPU pinned at $F06408, target phase IDLE,
+			 * PSNC dma_en=1, rst_count=1). BlueSCSI survives the same Mac
+			 * recovery resets precisely because its reset path clears all
+			 * transfer state; MAME's ncr5380 clears the bit too. This turns
+			 * an eternal wedge back into a transient the driver can retry. */
+			mr[`MR_DMA_MODE] <= 1'b0;
+			else if (reg_wr && (bus_rs == `WREG_MR)) mr <= wdata;
 	end
 
 	/* Minimal initiator arbitration. The Mac II ROM writes MR.ARB and then
