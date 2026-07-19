@@ -68,6 +68,14 @@ module cd_audio #(
 	output      [7:0] toc_q0, toc_q1, toc_q2, toc_q3,
 	output reg        toc_ready,
 
+	// standard 0x43 READ TOC response RAM (MMC format 0, MSF form, BINARY
+	// values): {u16be data-len, first=1, last=N} + 8-byte descriptors
+	// {00, adr_ctrl, track#, 00, 00, M, S, F(+150)} + 0xAA lead-out row.
+	// Built by M_T43_* right after the 0xC1 table; toc_ready covers both.
+	input       [8:0] toc43_base,
+	output      [7:0] toc43_q0, toc43_q1, toc43_q2, toc43_q3,
+	output reg  [9:0] toc43_len,
+
 	output reg signed [15:0] snd_l,
 	output reg signed [15:0] snd_r,
 
@@ -119,6 +127,9 @@ wire [7:0] blob_b1 = blob_q[15:8];
 reg        resp_we;
 reg  [8:0] resp_wa;
 reg  [7:0] resp_wd;
+reg        t43_we;            // 0x43 plane write port (driven by M_T43_*)
+reg  [8:0] t43_wa;
+reg  [7:0] t43_wd;
 wire [7:0] re_q0, re_q1, ro_q0, ro_q1;
 // even byte at/after addr x lives at plane index (x + x[0]) >> 1;
 // odd  byte at/after addr x lives at plane index  x >> 1
@@ -148,6 +159,36 @@ assign toc_q0 = tb0[0] ? ro_q0 : re_q0;
 assign toc_q1 = tb0[0] ? re_q0 : ro_q0;   // byte at tb0+1: opposite plane, same pair
 assign toc_q2 = tb2[0] ? ro_q1 : re_q1;
 assign toc_q3 = tb2[0] ? re_q1 : ro_q1;
+
+// 0x43 response planes: identical structure to the resp planes above.
+wire [7:0] t43e_q0, t43e_q1, t43o_q0, t43o_q1;
+wire [8:0] t43b0 = toc43_base;
+wire [8:0] t43b2 = toc43_base + 9'd2;
+wire       t43_we_e = t43_we && !t43_wa[0];
+wire       t43_we_o = t43_we &&  t43_wa[0];
+wire [8:0] t43b0_e = (t43b0 + {8'd0, t43b0[0]}) >> 1;
+wire [8:0] t43b2_e = (t43b2 + {8'd0, t43b2[0]}) >> 1;
+cd_sdp #(.DW(8), .AW(8)) t43_e0 (
+	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_e),
+	.raddr(t43b0_e[7:0]), .q(t43e_q0)
+);
+cd_sdp #(.DW(8), .AW(8)) t43_e1 (
+	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_e),
+	.raddr(t43b2_e[7:0]), .q(t43e_q1)
+);
+cd_sdp #(.DW(8), .AW(8)) t43_o0 (
+	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_o),
+	.raddr(t43b0[8:1]), .q(t43o_q0)
+);
+cd_sdp #(.DW(8), .AW(8)) t43_o1 (
+	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_o),
+	.raddr(t43b2[8:1]), .q(t43o_q1)
+);
+assign toc43_q0 = t43b0[0] ? t43o_q0 : t43e_q0;
+assign toc43_q1 = t43b0[0] ? t43e_q0 : t43o_q0;
+assign toc43_q2 = t43b2[0] ? t43o_q1 : t43e_q1;
+assign toc43_q3 = t43b2[0] ? t43e_q1 : t43o_q1;
+
 
 // frame ping-pong: 2 x 1280 x 16 (2352 B payload + 208 B pad per half)
 reg         fr_cap;
@@ -237,7 +278,9 @@ localparam [4:0]
 	M_CTRK_RD  = 5'd12,                     // track-mode: read start(k), start(k+1)
 	M_APPLY    = 5'd13,
 	M_REF_SCAN = 5'd14,                     // find track containing cur_lba
-	M_REF_DIVA = 5'd15, M_REF_DIVR = 5'd16;
+	M_REF_DIVA = 5'd15, M_REF_DIVR = 5'd16,
+	// standard 0x43 MMC TOC table build (dialect-switch mission 2026-07-19)
+	M_T43_HDR  = 5'd17, M_T43_RD = 5'd18, M_T43_DIV = 5'd19, M_T43_EMIT = 5'd20;
 reg [4:0] mst;
 
 reg  [2:0] step;                        // word-stream step within a state
@@ -246,13 +289,17 @@ reg [31:0] t_start;
 reg  [7:0] t_ctrl;
 reg [31:0] div_v;                       // shared iterative M/S/F divider
 reg  [6:0] div_m, div_s;
-reg  [1:0] emit_k;
+reg  [2:0] emit_k;   // widened for the 8-byte 0x43 descriptors
 
 reg        toc_valid;
 reg  [6:0] n_tracks;
 
 // probe counters (CDA0): how many blob-block fetches / audio-frame fetches
 // actually fired — distinguishes "fetch never ran" from "ran, parse failed".
+reg        t43_lo;            // building the 0xAA lead-out row
+// 0x43 build sizing (cap 60 descriptors; the last-track byte stays honest)
+wire [6:0] w_t43_nreal = (n_tracks > 7'd60) ? 7'd60 : n_tracks;
+wire [9:0] w_t43_dlen  = {{2'd0, w_t43_nreal} + 9'd1, 3'b000} + 10'd2;
 reg  [7:0] dbg_toc_fetch_cnt = 8'd0;
 reg  [4:0] dbg_fr_fetch_cnt  = 5'd0;
 reg [31:0] leadout_lba;
@@ -278,6 +325,7 @@ wire [8:0] entry_w = 9'd8 + {t_idx, 2'b00};
 always @(posedge clk) begin
 	if (rst) begin
 		mst <= M_IDLE; step <= 0; emit_k <= 0;
+		t43_lo <= 0; t43_we <= 0; t43_wa <= 0; t43_wd <= 0; toc43_len <= 0;
 		blob_cap <= 0; blob_blk <= 0; blob_ra <= 0;
 		toc_rd <= 0; toc_act <= 0; toc_lba <= 0;
 		resp_we <= 0; resp_wa <= 0; resp_wd <= 0;
@@ -288,6 +336,7 @@ always @(posedge clk) begin
 		ref_cnt <= 0; t_idx <= 0;
 	end else begin
 		resp_we <= 1'b0;
+		t43_we  <= 1'b0;
 		flush   <= 1'b0;
 
 		// command capture: never lost, executed from M_IDLE
@@ -403,11 +452,11 @@ always @(posedge clk) begin
 		// ------------------------------------------ response header [0..3]
 		M_EMIT_H: begin
 			resp_we <= 1'b1;
-			emit_k  <= emit_k + 2'd1;
+			emit_k  <= emit_k + 3'd1;
 			case (emit_k)
-			2'd0: begin resp_wa <= 9'd0; resp_wd <= 8'h01; end
-			2'd1: begin resp_wa <= 9'd1; resp_wd <= bin2bcd({1'b0, n_tracks}); end
-			2'd2: begin resp_wa <= 9'd2; resp_wd <= 8'h00; end
+			3'd0: begin resp_wa <= 9'd0; resp_wd <= 8'h01; end
+			3'd1: begin resp_wa <= 9'd1; resp_wd <= bin2bcd({1'b0, n_tracks}); end
+			3'd2: begin resp_wa <= 9'd2; resp_wd <= 8'h00; end
 			default: begin
 				resp_wa <= 9'd3; resp_wd <= 8'h00;
 				div_v <= leadout_lba; div_m <= 0; div_s <= 0;
@@ -426,11 +475,11 @@ always @(posedge clk) begin
 		end
 		M_EMIT_LO: begin
 			resp_we <= 1'b1;
-			emit_k  <= emit_k + 2'd1;
+			emit_k  <= emit_k + 3'd1;
 			case (emit_k)
-			2'd0: begin resp_wa <= 9'd4; resp_wd <= bin2bcd({1'b0, div_m}); end
-			2'd1: begin resp_wa <= 9'd5; resp_wd <= bin2bcd({1'b0, div_s}); end
-			2'd2: begin resp_wa <= 9'd6; resp_wd <= bin2bcd(div_v[7:0]); end
+			3'd0: begin resp_wa <= 9'd4; resp_wd <= bin2bcd({1'b0, div_m}); end
+			3'd1: begin resp_wa <= 9'd5; resp_wd <= bin2bcd({1'b0, div_s}); end
+			3'd2: begin resp_wa <= 9'd6; resp_wd <= bin2bcd(div_v[7:0]); end
 			default: begin
 				resp_wa <= 9'd7; resp_wd <= 8'h00;
 				t_idx <= 0; step <= 0;
@@ -474,11 +523,11 @@ always @(posedge clk) begin
 		end
 		M_EMIT_TRK: begin
 			resp_we <= 1'b1;
-			emit_k  <= emit_k + 2'd1;
+			emit_k  <= emit_k + 3'd1;
 			case (emit_k)
-			2'd0: begin resp_wa <= 9'd8  + {t_idx, 2'b00}; resp_wd <= t_ctrl; end
-			2'd1: begin resp_wa <= 9'd9  + {t_idx, 2'b00}; resp_wd <= bin2bcd({1'b0, div_m}); end
-			2'd2: begin resp_wa <= 9'd10 + {t_idx, 2'b00}; resp_wd <= bin2bcd({1'b0, div_s}); end
+			3'd0: begin resp_wa <= 9'd8  + {t_idx, 2'b00}; resp_wd <= t_ctrl; end
+			3'd1: begin resp_wa <= 9'd9  + {t_idx, 2'b00}; resp_wd <= bin2bcd({1'b0, div_m}); end
+			3'd2: begin resp_wa <= 9'd10 + {t_idx, 2'b00}; resp_wd <= bin2bcd({1'b0, div_s}); end
 			default: begin
 				resp_wa <= 9'd11 + {t_idx, 2'b00}; resp_wd <= bin2bcd(div_v[7:0]);
 				if (t_idx == 7'd98) mst <= M_BUILT;
@@ -487,8 +536,87 @@ always @(posedge clk) begin
 			endcase
 		end
 		M_BUILT: begin
-			toc_ready <= 1'b1;
-			mst <= M_IDLE;
+			// 0xC1 table done; build the standard 0x43 table from the same
+			// blob before declaring the TOC ready (toc_ready covers both).
+			emit_k <= 0;
+			mst <= M_T43_HDR;
+		end
+
+		// ---------------- standard 0x43 MMC TOC table (format 0, MSF form) ----
+		M_T43_HDR: begin
+			t43_we <= 1'b1;
+			emit_k <= emit_k + 3'd1;
+			case (emit_k)
+			3'd0: begin t43_wa <= 9'd0; t43_wd <= {6'd0, w_t43_dlen[9:8]}; end
+			3'd1: begin t43_wa <= 9'd1; t43_wd <= w_t43_dlen[7:0]; end
+			3'd2: begin t43_wa <= 9'd2; t43_wd <= 8'h01; end
+			default: begin
+				t43_wa <= 9'd3; t43_wd <= {1'b0, n_tracks};
+				toc43_len <= w_t43_dlen + 10'd2;
+				t_idx <= 0; t43_lo <= 1'b0; step <= 0;
+				mst <= M_T43_RD;
+			end
+			endcase
+		end
+		M_T43_RD: begin
+			if (!toc_valid) begin
+				// synthesized single data track at LBA 0
+				t_ctrl <= 8'h14; t_start <= 32'd0;
+				div_v <= 32'd150; div_m <= 0; div_s <= 0;
+				mst <= M_T43_DIV;
+			end else begin
+				step <= step + 3'd1;
+				case (step)
+				3'd0: blob_ra <= 9'd8  + {(t_idx < n_tracks ? t_idx : n_tracks - 7'd1), 2'b00};
+				3'd1: blob_ra <= blob_ra + 9'd1;
+				3'd2: begin t_ctrl <= blob_b0; blob_ra <= blob_ra + 9'd1; end
+				3'd3: t_start[15:0] <= blob_q;
+				default: begin
+					t_start[31:16] <= blob_q;
+					div_v <= {blob_q, t_start[15:0]} + 32'd150;
+					div_m <= 0; div_s <= 0; step <= 0;
+					mst <= M_T43_DIV;
+				end
+				endcase
+			end
+		end
+		M_T43_DIV: begin
+			if ((div_v >= 32'd4500) && (div_m != 7'd99)) begin
+				div_v <= div_v - 32'd4500; div_m <= div_m + 7'd1;
+			end
+			else if (div_v >= 32'd75) begin
+				div_v <= div_v - 32'd75; div_s <= div_s + 7'd1;
+			end
+			else begin emit_k <= 0; mst <= M_T43_EMIT; end
+		end
+		M_T43_EMIT: begin
+			t43_we <= 1'b1;
+			t43_wa <= 9'd4 + {(t43_lo ? w_t43_nreal : t_idx), 3'b000} + {6'd0, emit_k};
+			emit_k <= emit_k + 3'd1;
+			case (emit_k)
+			3'd0: t43_wd <= 8'h00;
+			3'd1: t43_wd <= t_ctrl;
+			3'd2: t43_wd <= t43_lo ? 8'hAA : ({1'b0, t_idx} + 8'd1);
+			3'd3: t43_wd <= 8'h00;
+			3'd4: t43_wd <= 8'h00;
+			3'd5: t43_wd <= {1'b0, div_m};
+			3'd6: t43_wd <= {1'b0, div_s};
+			default: begin
+				t43_wd <= div_v[7:0];
+				if (t43_lo) begin
+					toc_ready <= 1'b1;
+					mst <= M_IDLE;
+				end
+				else if ((t_idx + 7'd1) < w_t43_nreal) begin
+					t_idx <= t_idx + 7'd1; step <= 0; mst <= M_T43_RD;
+				end
+				else begin
+					t43_lo <= 1'b1;
+					div_v <= leadout_lba + 32'd150; div_m <= 0; div_s <= 0;
+					mst <= M_T43_DIV;
+				end
+			end
+			endcase
 		end
 
 		// -------------------------------------------------- command execute
