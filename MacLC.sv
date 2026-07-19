@@ -681,7 +681,7 @@ module emu
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
-	wire [31:0] dbg_cda0_w, dbg_cda1_w;
+	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w;
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
 
@@ -1163,6 +1163,11 @@ module emu
 	) cp_cda1 (.probe(dbg_cda1_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
 	altsource_probe #(
+		.instance_id ("CDA2"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_cda2 (.probe(dbg_cda2_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	altsource_probe #(
 		.instance_id ("PSDT"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
 	) cp_psdt (.probe({sdma_berr_cnt, 1'b0, sdma_stall_max}), .source(), .source_clk(clk_sys), .source_ena(1'b1));
@@ -1398,6 +1403,7 @@ module emu
 		.dbg_ncr(dbg_ncr_w),
 		.dbg_cda0(dbg_cda0_w),
 		.dbg_cda1(dbg_cda1_w),
+		.dbg_cda2(dbg_cda2_w),
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
 		.selectSCC(selectSCC),
