@@ -463,8 +463,8 @@ function [7:0] cd_inquiry_byte;
 		cd_inquiry_byte =
 			(cnt == 32'd0 )?8'h05:  // CD-ROM device class
 			(cnt == 32'd1 )?8'h80:  // removable
-			(cnt == 32'd2 )?8'h01:
-			(cnt == 32'd3 )?8'h01:
+			(cnt == 32'd2 )?8'h02:  // ANSI SCSI-2 (dialect tier; Snow-matched)
+			(cnt == 32'd3 )?8'h02:
 			(cnt == 32'd4 )?8'h31:  // additional length
 			(cnt == 32'd8 )?"S":(cnt == 32'd9 )?"O":
 			(cnt == 32'd10)?"N":(cnt == 32'd11)?"Y":
@@ -476,9 +476,9 @@ function [7:0] cd_inquiry_byte;
 			(cnt == 32'd24)?"D":(cnt == 32'd25)?"U":
 			(cnt == 32'd26)?"-":(cnt == 32'd27)?"8":
 			(cnt == 32'd28)?"0":(cnt == 32'd29)?"0":
-			(cnt == 32'd30)?"2":(cnt == 32'd31)?" ":
+			(cnt == 32'd30)?"4":(cnt == 32'd31)?" ":  // 8004: standard dialect
 			(cnt == 32'd32)?"1":(cnt == 32'd33)?".":
-			(cnt == 32'd34)?"8":(cnt == 32'd35)?"g":
+			(cnt == 32'd34)?"9":(cnt == 32'd35)?"a":
 			(cnt == 32'd39)?8'hd0:(cnt == 32'd40)?8'h90:
 			(cnt == 32'd41)?8'h27:(cnt == 32'd42)?8'h3e:
 			(cnt == 32'd43)?8'h01:(cnt == 32'd44)?8'h04:
@@ -1574,7 +1574,7 @@ always @(posedge clk) begin
 					// latch ONLY op-0x80 (per-track descriptor) asks: the player's
 					// launch-time track walk is the datum; the periodic op00/op40
 					// refresh was overwriting it before we could read (2026-07-19).
-					if (cmd_cd_toc && cmd[9][7:6] == 2'b10) dbg_toc_cdb <= {cmd[9], cmd[5], cmd[7], cmd[8]};
+					if (cmd_cd_toc43) dbg_toc_cdb <= {cmd[9], cmd[6], cmd[7], cmd[8]};
 					dbg_cmd_cnt <= dbg_cmd_cnt + 8'd1;
 					dbg_last_ok <= 1'b1;
 					ca_read_stb  <= cmd_read && (CDROM != 0);
