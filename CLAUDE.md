@@ -185,8 +185,15 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 - SCSI writes work but are experimental
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
-- CD-ROM (SCSI ID 3, OSD slot `SC4`): data discs only, no CD audio yet.
-  Flat 2048-byte images (ISO/TOAST) work on a stock Main_MiSTer; CUE/BIN
-  (2352) and CHD need the Main fork's `support/maclc/maclc_cd` layer
-  (branch `add-bluescsi-toolbox-for-MacLC`). The guest System needs the
-  Apple CD-ROM extension (or a third-party CD driver) to mount discs.
+- CD-ROM (SCSI ID 3, OSD slot `SC4`): data, mixed-mode, and audio CDs.
+  CD audio + the AppleCD Audio Player (listing, transport, FF/RW scan)
+  fully working as of 2026-07-20 (standard SCSI-2 dialect on the
+  CDU-8004 identity; BlueSCSI + Snow are the byte oracles; command gaps
+  logged in docs/SCSI_CMD_GAPS.md). Flat 2048-byte images (ISO/TOAST)
+  work on a stock Main_MiSTer; CUE/BIN (2352) and CHD need the Main
+  fork's `support/maclc/maclc_cd` layer (branch
+  `add-bluescsi-toolbox-for-MacLC`) — the validated binary ships in
+  `releases/MiSTer`. The guest System needs the Apple CD-ROM extension
+  (or a third-party CD driver) to mount discs. Serving law for any new
+  DataIn command: transfer EXACTLY what the initiator arms (see
+  docs/SCSI_CMD_GAPS.md).
