@@ -209,6 +209,53 @@ stale text, the raw+fields are the 0x43 latch.)
 Box state: restored to 0170576s5 AGAIN (display-checked, happy-Mac).
 s11 rolling.
 
+## MIDNIGHT CORRECTION: THE "LOTTERY" WAS A DETERMINISTIC BUG
+
+The hardened h-s11 (cc81843, hardening of the periph-read/dreq cone)
+wedged at the IDENTICAL point: cmd_cnt=113, same CDA2 latch, same
+$F07Fxx stuck PC. Three (likely four, counting s9's berr=36) builds
+wedging at exactly the same command number is not placement luck.
+
+**ROOT CAUSE (3d0606c): the b3ec632 start-track filter made the 0x43
+response UNDER-SERVE the allocation for the first time.** The driver's
+duration ask {start=22, alloc=48} now had actual=20 < alloc=48; the
+Mac's blind-transfer primitive arms the FULL allocation and pumps DACK;
+our target goes early-STATUS at 20 → host-armed/target-idle, 250 ms
+BERR beats, SCSI-Mgr retry loop = the cycling unpainted alert. s7
+(pre-filter) booted fine because min(alloc,192-byte full table) always
+equaled alloc — the filter didn't have an arithmetic bug (desk-checks
+byte-perfect); it exposed a TRANSPORT contract nobody had violated
+before. Fix: 0x43/0x42 serve EXACTLY the armed allocation, zero-padded
+past the real payload, true lengths in the headers. **SERVING LAW
+(both deadlock directions now witnessed on HW): a DataIn response must
+transfer exactly what the initiator arms — over-serve wedges REQ-held
+(2026-06-10 class), under-serve wedges host-armed (2026-07-19 class).**
+
+Attribution corrections to tonight's ledger:
+- s9/s10/s11/h-s11 gate-2 failures = THIS BUG, not fit marginality.
+- s7's black-screen remains genuinely fit-class (video domain; its
+  boot-probe was clean precisely because it predates the filter).
+- The triple gate's VERDICTS were all correct — only my attribution
+  (lottery) was wrong. Triple gate stays law.
+- The per-fit marginality law (from 07-18's +0.177/+0.251 A/B on
+  identical RTL) is NOT voided, but tonight contributed no evidence
+  for it. The hardening (cc81843) is structurally sound and kept;
+  its early-boot berr=0/8.9ms-vs-36/250ms comparison against s10 is
+  PHASE-CONFOUNDED (h-s11 was probed pre-driver-load) — its real test
+  is whether the old flakiness recurs across future builds.
+
+**DIALECT DISCOVERY (from the same latch): cmd[9]=0x80 — the driver
+issues old-style FORMAT 2 (full TOC) asks: (48-4)/11 = exactly 4
+ELEVEN-byte rows. We serve format-0 8-byte rows to every ask. The
+transport fix unwedges the boot; the CONTENT for format-2 asks is
+next session's mission (Snow read_toc = byte oracle; the format-2
+rows are derivable serve-time from the same T43 plane: point=track#,
+pmin/psec/pframe = the row's addr bytes). Expect the track listing /
+durations to still be off until then — the boot conversation the
+unwedged build captures (CDA1/CDA2) decides the exact layout.**
+
+Gating now: 3d0606c s12 (hardening + padding fix).
+
 ## NIGHT CLOSE (21:50): s11 FAILED gate 2 — LOTTERY CLOSED
 
 | Seed | Netlist | Setup/Hold | Verdict |
