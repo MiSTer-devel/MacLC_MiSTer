@@ -888,19 +888,30 @@ always @(posedge clk) begin
 		M_CMD: begin
 			mst <= M_IDLE;   // default; overridden below
 			// any transport command other than the scan itself ends a scan
-			if (!(c_op == 8'hcd && c_9[7:6] == 2'b00)) scan_x <= 1'b0;
+			if (c_op != 8'hcd) scan_x <= 1'b0;
 			case (c_op)
 			8'hca: begin                                   // AUDIO PAUSE
 				if (c_1 == 8'h10) begin
 					if (pstate == ST_PLAY) pstate <= ST_PAUSE;
 				end else if (pstate == ST_PAUSE) pstate <= ST_PLAY;
 			end
-			8'hc8, 8'hc9, 8'hcb, 8'hcd: begin              // SEARCH/PLAY/STOP/SCAN
-				if (c_op == 8'hcd && c_9[7:6] == 2'b00) begin
-					// standard-driver AUDIO SCAN form (see scan_x block)
-					c_addr <= msf2lba_std(c_3, c_4, c_5);
-					mst <= M_SCAN_GO;
-				end else
+			8'hcd: begin                                   // AUDIO SCAN (FF/RW)
+				// STANDARD decode ONLY (Snow/[PIONEER]: form in cdb9[7:6],
+				// LBA=cdb2-5 / MSF binary=cdb3-5 / track=cdb5; direction
+				// cdb1: 0x00=FF, 0x10=RW per the observed driver+BlueSCSI).
+				// The 8004-identity driver sends nothing else; routing this
+				// into the vendor arm read BCD MSF from bytes 5-7 — track
+				// 4's scan {MSF 18,14,19}@3-5 became BCD 19:00:00@5-7 =
+				// seek into track 2 = the "random track" FF/RW (run 4).
+				case (c_9[7:6])
+				2'b00:   c_addr <= {c_2, c_3, c_4, c_5};       // LBA form
+				2'b01:   c_addr <= msf2lba_std(c_3, c_4, c_5); // MSF form
+				default: c_addr <= cur_lba;  // track form unobserved: v1 =
+				                             // scan from current position
+				endcase
+				mst <= M_SCAN_GO;
+			end
+			8'hc8, 8'hc9, 8'hcb: begin                     // vendor SEARCH/PLAY/STOP
 				case (c_9[7:6])
 				2'b01: begin                               // MSF (C9: bytes 3..5, else 5..7)
 					c_addr <= (c_op == 8'hc9) ? msf2lba(c_3, c_4, c_5)
