@@ -900,7 +900,11 @@ always @(posedge clk) begin
 			end
 			// ---- standard SCSI-2 audio set (dialect switch 2026-07-19) ----
 			8'h47: begin                                   // PLAY AUDIO MSF (hex, +150)
-				c_addr <= msf2lba_std(c_3, c_4, c_5);
+				// start FF:FF:FF = play from CURRENT position (SCSI-2;
+				// BlueSCSI doPlayAudio lba==0xFFFFFFFF). The AppleCD driver
+				// resumes from pause this way (watch capture 2026-07-20).
+				c_addr <= (c_3 == 8'hFF && c_4 == 8'hFF && c_5 == 8'hFF)
+				          ? cur_lba : msf2lba_std(c_3, c_4, c_5);
 				c_next <= msf2lba_std(c_6, c_7, c_8);
 				mst <= M_APPLY;
 			end
@@ -971,10 +975,22 @@ always @(posedge clk) begin
 				end
 			end
 			8'h47, 8'h48: begin                            // standard range play
-				cur_lba  <= c_addr;
-				stop_lba <= c_next;
-				flush    <= 1'b1;
-				pstate   <= (c_addr < c_next) ? ST_PLAY : ST_IDLE;
+				if (c_addr == c_next) begin
+					// Zero-length play = SEEK-ONLY per SCSI-2 (BlueSCSI
+					// doPlayAudio length==0: "update the position without
+					// starting playback"). The driver's Next/Prev/Stop all
+					// park the pickup this way after a pause and expect the
+					// drive to HOLD state at the new position — reporting
+					// idle/"completed" here made the player abandon every
+					// skip (2026-07-20 watch capture). pstate unchanged.
+					cur_lba <= c_addr;
+					flush   <= 1'b1;
+				end else begin
+					cur_lba  <= c_addr;
+					stop_lba <= c_next;
+					flush    <= 1'b1;
+					pstate   <= (c_addr < c_next) ? ST_PLAY : ST_IDLE;
+				end
 			end
 			default: begin                                 // SEARCH (0xC8) / SCAN (0xCD, v1 = seek)
 				cur_lba <= c_addr;
