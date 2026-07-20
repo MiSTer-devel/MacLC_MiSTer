@@ -734,6 +734,7 @@ wire [7:0] cd_toc43_dout_next3  = ca_toc_ready ? t43_hdr_fix(data_cnt_next3, ca_
 // per the serving law; the u16be length fields carry the true sizes.
 wire [7:0]  ca_t2_q0, ca_t2_q1, ca_t2_q2, ca_t2_q3;
 wire [9:0]  ca_t2_len;
+wire        ca_disc_audio;
 wire [8:0]  ca_t2_addr = (cmd_cd_t43f1 ? 9'd496 : 9'd0) + data_cnt[8:0];
 function [7:0] t2_fix;           // full TOC: zero past toc2_len
 	input [31:0] cnt;
@@ -1142,6 +1143,7 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.toc2_q0(ca_t2_q0), .toc2_q1(ca_t2_q1),
 		.toc2_q2(ca_t2_q2), .toc2_q3(ca_t2_q3),
 		.toc2_len(ca_t2_len),
+		.disc_audio(ca_disc_audio),
 		.snd_l(cd_snd_l), .snd_r(cd_snd_r),
 		.dbg_cda0(dbg_cda0)
 	);
@@ -1162,6 +1164,7 @@ end else begin : g_no_cd_audio
 	assign ca_t2_q0 = 8'h00; assign ca_t2_q1 = 8'h00;
 	assign ca_t2_q2 = 8'h00; assign ca_t2_q3 = 8'h00;
 	assign ca_t2_len = 10'd0;
+	assign ca_disc_audio = 1'b0;
 	assign ca_toc_ready = 1'b0;
 	assign cd_snd_l = 16'sd0;
 	assign cd_snd_r = 16'sd0;
@@ -1527,6 +1530,13 @@ wire  cd_needs_media = cmd_test_unit_ready || cmd_read || cmd_read_capacity ||
 		  cmd_cd_audio_nop;
 wire  cd_no_media = (CDROM != 0) && !mounted && cd_needs_media;
 
+// Data READs against a disc with no data track (pure audio CD) must CHECK
+// with ILLEGAL REQUEST + ASC 0x64 "illegal mode for this track" — real
+// AppleCD behavior (BlueSCSI/Snow). The Audio CD Access extension RELIES on
+// this failure to classify the disc; serving audio bytes as data sends the
+// Finder through garbage (2026-07-20 system error 10 at desktop mount).
+wire  cd_audio_read_rej = (CDROM != 0) && mounted && cmd_read && ca_disc_audio;
+
 // New-command strobe (one clk on the CDB completing). Used by the CD sense /
 // eject logic; folds away on disk targets.
 reg   cd_cpl_d = 1'b0;
@@ -1565,6 +1575,9 @@ always @(posedge clk) begin
 		end else if (cd_no_media) begin
 			cd_sense_key <= 4'h2;  // NOT READY
 			cd_sense_asc <= 8'hb0; // AppleCD vendor "no disc"
+		end else if (cd_audio_read_rej) begin
+			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
+			cd_sense_asc <= 8'h64; // illegal mode for this track
 		end else if (cmd_cd_eject) begin
 			if (cd_prevent) begin
 				cd_sense_key <= 4'h5; // ILLEGAL REQUEST
@@ -1647,7 +1660,7 @@ always @(posedge clk) begin
 				// is this a supported and valid command?
 				// (CDROM: media-dependent commands CHECK with the no-disc
 				// sense while unmounted; a prevent-blocked EJECT CHECKs too.)
-				if(cmd_ok && !cd_no_media) begin
+				if(cmd_ok && !cd_no_media && !cd_audio_read_rej) begin
 					// yes, continue
 					status <= (cmd_cd_eject && cd_prevent) ? `STATUS_CHECK_CONDITION : `STATUS_OK;
 

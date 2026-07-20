@@ -96,6 +96,14 @@ module cd_audio #(
 	output      [7:0] toc2_q0, toc2_q1, toc2_q2, toc2_q3,
 	output reg  [9:0] toc2_len,
 
+	// 1 = the mounted disc has NO data track (every track's control bit 2
+	// clear). Data READs against such a disc must CHECK with ILLEGAL
+	// REQUEST/0x64 "illegal mode for this track" (BlueSCSI/Snow oracles) —
+	// the Audio CD Access extension RELIES on that failure to classify the
+	// disc; serving audio bytes as data bombs the Finder (2026-07-20,
+	// system error 10 during the Audio CD desktop mount).
+	output reg        disc_audio,
+
 	output reg signed [15:0] snd_l,
 	output reg signed [15:0] snd_r,
 
@@ -365,6 +373,7 @@ wire [9:0] w_t43_dlen  = {{2'd0, w_t43_nreal} + 9'd1, 3'b000} + 10'd2;
 // format-2 build sizing: rows = 3 lead-in (A0/A1/A2) + tracks, 11 B each;
 // cap 41 tracks so rows end at 4+44*11=488 < the session page at [496..]
 reg        t2_lo;             // building the A2 (lead-out) row
+reg        t2_has_data;       // any track with the data control bit (0x04)
 reg  [4:0] t2_ek;             // 0..21 (A0+A1 pass is 22 writes)
 reg  [8:0] t2_wbase;          // running track-row base (4 + 11*(3+k))
 reg  [7:0] t2_fctrl;          // first track's adr/ctrl (A-rows + session page)
@@ -404,6 +413,7 @@ always @(posedge clk) begin
 		t2_lo <= 0; t2_we <= 0; t2_wa <= 0; t2_wd <= 0; toc2_len <= 0;
 		t2_ek <= 0; t2_wbase <= 0; t2_fctrl <= 8'h14;
 		t2_fm <= 0; t2_fs <= 0; t2_ff <= 0;
+		t2_has_data <= 0; disc_audio <= 0;
 		blob_cap <= 0; blob_blk <= 0; blob_ra <= 0;
 		toc_rd <= 0; toc_act <= 0; toc_lba <= 0;
 		resp_we <= 0; resp_wa <= 0; resp_wd <= 0;
@@ -686,6 +696,7 @@ always @(posedge clk) begin
 					// 0x43 format-0 table done; build the format-2 (full
 					// TOC) table + session-info page before toc_ready.
 					t2_ek <= 0; t2_lo <= 0; t2_wbase <= 9'd37;
+					t2_has_data <= 0;
 					t_idx <= 0; step <= 0;
 					mst <= M_T2_HDR;
 				end
@@ -765,6 +776,7 @@ always @(posedge clk) begin
 			5'd9: t2_wd <= bin2bcd({1'b0, div_s});      // PSEC (BCD)
 			default: begin
 				t2_wd <= bin2bcd(div_v[7:0]);           // PFRAME (BCD)
+				t2_has_data <= t2_has_data | t_ctrl[2]; // 0x04 = data track
 				if (t_idx == 7'd0) begin
 					// first track: A-rows' ctrl + session-info page values
 					t2_fctrl <= t_ctrl;
@@ -845,6 +857,7 @@ always @(posedge clk) begin
 			default: begin
 				t2_wd <= t2_ff;
 				toc2_len <= w_t2_dlen + 10'd2;
+				disc_audio <= toc_valid && !t2_has_data;
 				toc_ready <= 1'b1;
 				mst <= M_IDLE;
 			end
