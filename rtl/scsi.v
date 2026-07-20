@@ -93,7 +93,7 @@ output [31:0] dbg_cda4,     // JTAG CDA4: last play-class CDB {cdb1, cdb6, cdb7,
 
 // SCSI device id
 parameter [2:0] ID = 0;
-// Set on the PRIMARY target only (ID 6). Gates the BlueSCSI Toolbox so just one
+// Set on the PRIMARY target only (ID 0). Gates the BlueSCSI Toolbox so just one
 // target presents as a Toolbox device and owns the dedicated tb_* transport.
 // docs/BLUESCSI_CORE_HPS_CONTRACT.md
 parameter TOOLBOX_ENABLE = 0;

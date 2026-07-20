@@ -80,7 +80,7 @@ module ncr5380
 	output      [15:0] sd_buff_din[DEVS],
 	input              sd_buff_wr,
 
-	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 6) --
+	// ---- BlueSCSI Toolbox dedicated block interface (primary target / ID 0) --
 	input         tb_mounted,
 	output [31:0] tb_lba,
 	output        tb_rd,
@@ -772,7 +772,14 @@ module ncr5380
 		genvar i;
 		for (i = 0; i < DEVS; i = i + 1) begin : target
 			// connect a target
-			scsi #(.ID(3'd6 - i[2:0]), .TOOLBOX_ENABLE(i == 0)) target
+			// Boot disk = SCSI ID 0 (the conventional Mac internal-drive ID,
+			// highest boot priority across every System version), 2nd disk = ID 1
+			// (standardized with MacIIvi 2026-07-20; was 6/5 — the 7.x SCSI
+			// Manager de-prioritizes ID 6). TOOLBOX_ENABLE(i==0) => Toolbox on the
+			// boot target; the Toolbox driver locates it by INQUIRY page 0x31, not
+			// by ID. NOTE: the boot SCSI ID lives in PRAM — an existing install
+			// blessed for ID 6 needs a PRAM reset / re-bless to boot from ID 0.
+			scsi #(.ID(i[2:0]), .TOOLBOX_ENABLE(i == 0)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
@@ -813,7 +820,7 @@ module ncr5380
 				.sd_buff_din( sd_buff_din[i] ),
 				.sd_buff_wr( sd_buff_wr & target_bsy[i] ),
 
-				// Toolbox transport: only target 0 (ID 6) is wired to the slot.
+				// Toolbox transport: only target 0 (ID 0) is wired to the slot.
 				.tb_mounted ( (i == 0) ? tb_mounted : 1'b0 ),
 				.tb_lba     ( tb_lba_g[i] ),
 				.tb_rd      ( tb_rd_g[i] ),

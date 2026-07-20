@@ -21,12 +21,14 @@ this. This contract covers M1+ (the filesystem ops `0xD0/D1/D2/D3/D4/D5`).
   `VD_TOOLBOX = 3` (VDNUM 3 → 4). The disk read/write path is **not touched** —
   zero regression risk to the (hard-won) disk I/O.
 - **Primary target only.** The Toolbox transport + buffer live in `rtl/scsi.v`,
-  enabled by a new `parameter TOOLBOX_ENABLE` that is set **only on the ID 6
-  target** (`i==0` in the ncr5380 generate loop, `scsi #(.ID(3'd6-i))`). The ID 5
-  target is a plain disk. No second-target arbiter.
+  enabled by a new `parameter TOOLBOX_ENABLE` that is set **only on the primary
+  (boot) target — ID 0** (`i==0` in the ncr5380 generate loop, `scsi #(.ID(i))`;
+  IDs standardized 6/5 -> 0/1 on 2026-07-20). The ID 1 target is a plain disk.
+  No second-target arbiter.
   - M0 detection is currently in the shared module so *both* targets advertise
     Toolbox. When wiring M1, gate the detection (`mode_sense_p31`, `cmd_tb_*`) on
-    `TOOLBOX_ENABLE` too, so only ID 6 presents as a Toolbox device.
+    `TOOLBOX_ENABLE` too, so only the primary (ID 0) target presents as a Toolbox
+    device.
 - **Non-prefetched sequential transfer.** Unlike the disk read ring, Toolbox data
   moves one 512-byte block at a time (fetch-then-serve). File transfer is not
   boot-critical; the per-block HPS stall is acceptable and keeps the FSM small.

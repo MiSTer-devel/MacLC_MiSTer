@@ -60,8 +60,8 @@ module emu
 		"F1,DSKIMG,Mount Pri Floppy;",
 		"F2,DSKIMG,Mount Sec Floppy;",
 		"-;",
-		"SC0,IMGVHDHDA,Mount SCSI-6;",
-		"SC1,IMGVHDHDA,Mount SCSI-5;",
+		"SC0,IMGVHDHDA,Mount SCSI-0;",
+		"SC1,IMGVHDHDA,Mount SCSI-1;",
 		"SC2,NVR,Mount PRAM;",
 		"-;",
 		// CD-ROM (SCSI ID 3). ISO/TOAST (TO* matches .toast) are raw
