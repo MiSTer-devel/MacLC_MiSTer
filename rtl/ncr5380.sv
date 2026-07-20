@@ -199,7 +199,52 @@ module ncr5380
 	 * host sampling alignment. (verilator/scsi_bench reproduces all three.)
 	 */
 	wire dma_ack_busy = dma_ack | (dma_ack_holdoff != 3'd0) | (dma_settle != 4'd0);
-	assign dreq = scsi_req & dma_en & !dma_ack_busy;
+
+	/* PDMA host-face pipeline registers — fit hardening (2026-07-19).
+	 *
+	 * dreq and the presented read data used to leave this module as raw
+	 * combinational cones: target FSM / serve-lane muxes (incl. the CD
+	 * target's TOC/T43 readback with its serve-time address transform)
+	 * -> device-select mux -> across the chip to CPU DTACK/din, timed
+	 * single-cycle at full clk_sys rate. STA-met builds still wedged on
+	 * hardware whenever the fitter placed that cone thin (berr-climb OS
+	 * wedges, PSWL req_drop saturation — the #3 "STA-met-but-HW-fails"
+	 * family; 2026-07-19 lottery closed 0-for-4 on exactly this). One
+	 * clk_sys register at the module boundary makes every CPU-facing net
+	 * flop-sourced and route-short, independent of placement luck:
+	 *
+	 *  - dreq_r: DTACK rises one clk_sys later; the CPU bus cycle is a
+	 *    level-sensitive wait, and the 250 ms sdma watchdog dwarfs it.
+	 *  - din_pair_r/din_pair_next_r: lag the bus wires by the SAME one
+	 *    cycle as dreq_r, so the settle-window invariant ("DREQ up =>
+	 *    presented pair valid") is preserved with the dma_settle count
+	 *    unchanged: DREQ_r up at t => wire DREQ up at t-1 => wire pair
+	 *    valid at t-1 => registered pair valid at t. The longword
+	 *    second-word capture below reads din_pair_next_r at the END of
+	 *    a completed (DREQ-gated) cycle, when the wire had been stable
+	 *    for the whole cycle — the register holds the same value.
+	 *  - host_bus_r: host-read copy of scsi_bus_data (CDR/IDR/DACK byte
+	 *    reads). The targets keep consuming the combinational original —
+	 *    selection/command handshake timing is untouched.
+	 */
+	reg        dreq_r;
+	reg [15:0] din_pair_r;
+	reg [15:0] din_pair_next_r;
+	reg  [7:0] host_bus_r;
+	always @(posedge clk or posedge reset) begin
+		if (reset) begin
+			dreq_r          <= 1'b0;
+			din_pair_r      <= 16'h0000;
+			din_pair_next_r <= 16'h0000;
+			host_bus_r      <= 8'h00;
+		end else begin
+			dreq_r          <= scsi_req & dma_en & !dma_ack_busy;
+			din_pair_r      <= din_pair;
+			din_pair_next_r <= din_pair_next;
+			host_bus_r      <= scsi_bus_data;
+		end
+	end
+	assign dreq = dreq_r;
 
 	wire i_dma_rd = bus_cs &  dack & ior;
 	wire i_dma_wr = bus_cs &  dack & iow;
@@ -288,7 +333,7 @@ module ncr5380
 				 */
 				if (old_dma_rd & ~i_dma_rd &
 				    dma_longword_latched & dma_word_latched & !dma_second_word_latched)
-					dma_second_word_data <= din_pair_next;
+					dma_second_word_data <= din_pair_next_r;
 				dma_ack <= dma_en & bsr_pmatch;
 				if (dma_en & bsr_pmatch)
 					dma_ack_holdoff <= (old_dma_rd & ~i_dma_rd) ?
@@ -324,8 +369,12 @@ module ncr5380
 	wire       out_en = icr[`ICR_A_DATA] | mr[`MR_ARB];
 	wire [7:0] dma_write_data = (dma_ack_holdoff == 3'd1 && dma_word_latched) ? dma_write_low_byte : dout;
 	wire [7:0] scsi_bus_data = (out_en ? dma_write_data : 8'h00) | din;
-	wire [7:0] cur_data = scsi_bus_data;
-	wire [15:0] cur_data_pair = out_en ? { dout, dout } : (dma_suppress_ack_latched ? dma_second_word_data : din_pair);
+	/* Host-read face: registered copies (see the PDMA pipeline block above).
+	 * cur_data's CDR/IDR consumers are VPA-paced (microsecond-stable values);
+	 * the DACK byte leg and cur_data_pair are DREQ-gated — both tolerate the
+	 * one-cycle lag by the invariant argued there. */
+	wire [7:0] cur_data = host_bus_r;
+	wire [15:0] cur_data_pair = out_en ? { dout, dout } : (dma_suppress_ack_latched ? dma_second_word_data : din_pair_r);
 
 	/* ICR read wires */
 	wire [7:0] icr_read = { icr[`ICR_A_RST],
