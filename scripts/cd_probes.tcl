@@ -50,6 +50,8 @@ foreach {tag v0 v1} [list A $a0 $a1 B $b0 $b1] {
         $tag $v1 [f $v1 0 8] [f $v1 8 8] [f $v1 16 4] [f $v1 20 8] [f $v1 28 1] [f $v1 29 1] [f $v1 30 1] [f $v1 31 1]]
 }
 if {$a2 != -1} {
-    puts [format "CDA2 last-0xC1 CDB: raw=%08X op=%02X(top2=%d%d) startBCD=%02X alloc=%d"         $a2 [f $a2 24 8] [f $a2 31 1] [f $a2 30 1] [f $a2 16 8] [f $a2 0 16]]
+    # latch = verbatim {cdb9, cdb6, cdb7, cdb8} of the last 0x43 READ TOC ask
+    # (cdb9 top2: 00=format 0, 10=full TOC/0x80, 01=session info/0x40)
+    puts [format "CDA2 last-0x43 ask: raw=%08X cdb9=%02X(fmt=%d%d) start6=%02X alloc=%d"         $a2 [f $a2 24 8] [f $a2 31 1] [f $a2 30 1] [f $a2 16 8] [f $a2 0 16]]
 }
 puts "delta: toc_fetches +[expr {[f $b0 19 8] - [f $a0 19 8]}]  frame_fetches +[expr {(([f $b0 27 5] - [f $a0 27 5]) + 32) % 32}]  cmds +[expr {(([f $b1 8 8] - [f $a1 8 8]) + 256) % 256}]"
