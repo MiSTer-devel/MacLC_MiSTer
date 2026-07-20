@@ -73,6 +73,8 @@ module scsi
 	output [31:0] dbg_wrstall,
 	output [31:0] dbg_cda0,     // JTAG CDA0: cd_audio TOC/engine state (see cd_audio.sv)
 	output [31:0] dbg_cda2,     // JTAG CDA2: last 0xC1 CDB {op9, start5, alloc7, alloc8}
+output [31:0] dbg_cda3,     // JTAG CDA3: last play-class CDB {op, cdb3, cdb4, cdb5}
+output [31:0] dbg_cda4,     // JTAG CDA4: last play-class CDB {cdb1, cdb6, cdb7, cdb8}
 	output [31:0] dbg_cda1,     // JTAG CDA1: {toc_rdy,no_media,mounted,ok, sense_asc, sense_key, cmd_cnt, last_op}
 
 	// ===== BlueSCSI Toolbox dedicated block interface (TOOLBOX_ENABLE only) ====
@@ -1557,9 +1559,24 @@ reg [7:0] dbg_last_op = 8'd0;
 // The served bytes are fully determined by these + the resp plane, so this
 // pins down the "player shows 2 tracks" divergence (2026-07-18).
 reg [31:0] dbg_toc_cdb = 32'd0;
+// CDA3/CDA4: full CDB of the last PLAY-CLASS command (0x47/48/4B/4E and the
+// vendor C8..CD set) — the 0x42 position-poll flood (4/s during playback)
+// overwrites dbg_last_op within 250 ms, so the skip-failure ask (2026-07-20:
+// skip during playback lands the engine idle, player shows track 0) is
+// unrecoverable from CDA1 alone. {op,cdb3,cdb4,cdb5} + {cdb1,cdb6,cdb7,cdb8}
+// reconstruct every play form (MSF, TRACK/INDEX, pause/resume flag).
+reg [31:0] dbg_play_cdb  = 32'd0;
+reg [31:0] dbg_play_cdb2 = 32'd0;
+wire cmd_play_class = (op_code == 8'h47) || (op_code == 8'h48) ||
+                      (op_code == 8'h4b) || (op_code == 8'h4e) ||
+                      (op_code == 8'hc8) || (op_code == 8'hc9) ||
+                      (op_code == 8'hca) || (op_code == 8'hcb) ||
+                      (op_code == 8'hcd);
 reg [7:0] dbg_cmd_cnt = 8'd0;
 reg       dbg_last_ok = 1'b0;
 assign dbg_cda2 = dbg_toc_cdb;
+assign dbg_cda3 = dbg_play_cdb;
+assign dbg_cda4 = dbg_play_cdb2;
 assign dbg_cda1 = { ca_toc_ready, cd_no_media, mounted, dbg_last_ok,
                     cd_sense_asc, cd_sense_key, dbg_cmd_cnt, dbg_last_op };
 reg       cd_prevent   = 1'b0;
@@ -1569,6 +1586,10 @@ always @(posedge clk) begin
 		cd_sense_asc <= 8'd0;
 		cd_prevent   <= 1'b0;
 	end else if ((CDROM != 0) && cd_new_cmd) begin
+		if (cmd_play_class) begin
+			dbg_play_cdb  <= {op_code, cmd[3], cmd[4], cmd[5]};
+			dbg_play_cdb2 <= {cmd[1], cmd[6], cmd[7], cmd[8]};
+		end
 		if (!cmd_ok) begin
 			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
 			cd_sense_asc <= 8'h20; // invalid operation code

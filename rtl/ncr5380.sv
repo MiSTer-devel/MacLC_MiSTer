@@ -141,7 +141,9 @@ module ncr5380
 	// JTAG CDA0/CDA1: CD-audio engine + CD target command visibility
 	output      [31:0] dbg_cda0,
 	output      [31:0] dbg_cda1,
-	output      [31:0] dbg_cda2
+	output      [31:0] dbg_cda2,
+	output      [31:0] dbg_cda3,
+	output      [31:0] dbg_cda4
 );
 	parameter DEVS = 2;
 	// Read-prefetch ring depth for the CD target. 3 => 8 sectors / 4KB = two
@@ -699,6 +701,8 @@ module ncr5380
 		.dbg_cda0 ( dbg_cda0 ),
 		.dbg_cda1 ( dbg_cda1 ),
 		.dbg_cda2 ( dbg_cda2 ),
+		.dbg_cda3 ( dbg_cda3 ),
+		.dbg_cda4 ( dbg_cda4 ),
 		.sel    ( scsi_sel ),
 		.cd_enable ( cd_enable ),
 		// Selection requires a free bus — a wedged-BUSY device must not let a

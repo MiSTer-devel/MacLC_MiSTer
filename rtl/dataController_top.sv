@@ -40,6 +40,8 @@ module dataController_top(
 	output [31:0] dbg_cda0,   // CD-audio engine TOC/state (JTAG CDA0)
 	output [31:0] dbg_cda1,   // CD target command visibility (JTAG CDA1)
 	output [31:0] dbg_cda2,   // last 0xC1 CDB (JTAG CDA2)
+	output [31:0] dbg_cda3,   // last play-class CDB hi (JTAG CDA3)
+	output [31:0] dbg_cda4,   // last play-class CDB lo (JTAG CDA4)
 	output [31:0] dbg_ncr2,   // req_deferred/req_bus + IRQ machine + counters
 	output [31:0] dbg_wr,     // write-stall snapshot (DATA_IN target)
 	input selectSCC,
@@ -449,6 +451,8 @@ module dataController_top(
 		.dbg_cda0(dbg_cda0),
 		.dbg_cda1(dbg_cda1),
 		.dbg_cda2(dbg_cda2),
+		.dbg_cda3(dbg_cda3),
+		.dbg_cda4(dbg_cda4),
 		.dbg_ncr2(dbg_ncr2),
 		.dbg_wr(dbg_wr)
 	);

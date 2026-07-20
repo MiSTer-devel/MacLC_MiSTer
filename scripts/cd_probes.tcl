@@ -33,6 +33,8 @@ proc rd {name} {
 start_insystem_source_probe -device_name $dev -hardware_name $hw
 
 set a2 [rd CDA2]
+set a3 [rd CDA3]
+set a4 [rd CDA4]
 set a0 [rd CDA0]
 set a1 [rd CDA1]
 after 400
@@ -53,5 +55,11 @@ if {$a2 != -1} {
     # latch = verbatim {cdb9, cdb6, cdb7, cdb8} of the last 0x43 READ TOC ask
     # (cdb9 top2: 00=format 0, 10=full TOC/0x80, 01=session info/0x40)
     puts [format "CDA2 last-0x43 ask: raw=%08X cdb9=%02X(fmt=%d%d) start6=%02X alloc=%d"         $a2 [f $a2 24 8] [f $a2 31 1] [f $a2 30 1] [f $a2 16 8] [f $a2 0 16]]
+}
+if {$a3 != -1} {
+    # CDA3/CDA4 = full CDB of the last PLAY-CLASS command (47/48/4B/4E/C8..CD):
+    # CDA3 {op, cdb3, cdb4, cdb5}, CDA4 {cdb1, cdb6, cdb7, cdb8}.
+    puts [format "CDA3/4 last play-class: op=%02X cdb1=%02X cdb3=%02X cdb4=%02X cdb5=%02X cdb6=%02X cdb7=%02X cdb8=%02X" \
+        [f $a3 24 8] [f $a4 24 8] [f $a3 16 8] [f $a3 8 8] [f $a3 0 8] [f $a4 16 8] [f $a4 8 8] [f $a4 0 8]]
 }
 puts "delta: toc_fetches +[expr {[f $b0 19 8] - [f $a0 19 8]}]  frame_fetches +[expr {(([f $b0 27 5] - [f $a0 27 5]) + 32) % 32}]  cmds +[expr {(([f $b1 8 8] - [f $a1 8 8]) + 256) % 256}]"
