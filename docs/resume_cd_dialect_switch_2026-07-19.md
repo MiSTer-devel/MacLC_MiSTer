@@ -208,3 +208,35 @@ stale text, the raw+fields are the 0x43 latch.)
 
 Box state: restored to 0170576s5 AGAIN (display-checked, happy-Mac).
 s11 rolling.
+
+## NIGHT CLOSE (21:50): s11 FAILED gate 2 — LOTTERY CLOSED
+
+| Seed | Netlist | Setup/Hold | Verdict |
+|---|---|---|---|
+| 11 | +filter | +0.308 / +0.244 | **FAILED gate 2: OS-load wedge, USER-OBSERVED live** |
+
+s11 (883c638, md5 4a9c8c99) wedged during extension load with the user
+watching: **an error alert that never finishes painting and perpetually
+redraws** — the wedge class seen from the inside (250ms retry beats
+cycling the draw, too BERR-saturated to complete it). Three independent
+instruments died with it: the delayed probe pass found **no JTAG chain
+with CDA0** (hub unreachable, s9-echo), and the screenshot API returned
+an **HTML error page** instead of a capture. Conviction unanimous.
+
+**Final tally: filter netlist 0-for-4 (s8 thin / s9 probe-dead /
+s10 OS-wedge / s11 OS-wedge), dialect netlist 1 near-miss (s7
+display-dead). STA fatness fully decorrelated from health (s10 was the
+fattest). THE LOTTERY IS CLOSED.**
+
+**NEXT MISSION (the queued #3 cure, now blocking): harden the SCSI
+periph-read + dreq cone** — register/multicycle it per the #3 handoff
+prescription, with specific attention to the NEW readback lanes the
+dialect added (T43 plane quartet + 0x43 4-lane readback widened the
+periph-read mux — the leading suspect for why this netlist family's
+odds collapsed). Caveat from #3 history: naive csr/bsr registering
+alone did NOT fix #3 — treat the mux depth + dreq cone together.
+After hardening: ONE build, triple gate, then the 22-track verdict.
+
+Box left on 0170576s5 (display-checked, extensions loading normally).
+The dialect RTL itself is proven live (see s10 positive above) — do
+NOT touch the serving logic during the hardening; it's fit health only.
