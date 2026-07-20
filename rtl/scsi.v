@@ -1434,7 +1434,16 @@ wire       cmd_cd_audio_nop = (CDROM != 0) && ((op_code == 8'hc8) || (op_code ==
                                                (op_code == 8'hcd) ||
                                                // standard set (dialect switch):
                                                (op_code == 8'h47) || (op_code == 8'h48) ||
-                                               (op_code == 8'h4b) || (op_code == 8'h4e));
+                                               (op_code == 8'h4b) || (op_code == 8'h4e) ||
+                                               // 0x01 REZERO = the AppleCD player's
+                                               // STOP button ("nonstandard stop audio
+                                               // playback", BlueSCSI) — rejecting it
+                                               // raised the error dialog with music
+                                               // still playing (sense 5/0x20 latched,
+                                               // 2026-07-20). SEEK(6)/(10) carry the
+                                               // same Annex-C stop-audio semantics.
+                                               (op_code == 8'h01) ||
+                                               (op_code == 8'h0b) || (op_code == 8'h2b));
 wire       cmd_cd_toc43  = (CDROM != 0) && (op_code == 8'h43);  // standard READ TOC (any format)
 // old-style format select in the CONTROL byte (cmd[9][7:6]) — the AppleCD
 // driver's actual dialect on the 8004 identity (2026-07-19 capture: 0x80).
@@ -1571,7 +1580,9 @@ wire cmd_play_class = (op_code == 8'h47) || (op_code == 8'h48) ||
                       (op_code == 8'h4b) || (op_code == 8'h4e) ||
                       (op_code == 8'hc8) || (op_code == 8'hc9) ||
                       (op_code == 8'hca) || (op_code == 8'hcb) ||
-                      (op_code == 8'hcd);
+                      (op_code == 8'hcd) ||
+                      (op_code == 8'h01) ||
+                      (op_code == 8'h0b) || (op_code == 8'h2b);
 reg [7:0] dbg_cmd_cnt = 8'd0;
 reg       dbg_last_ok = 1'b0;
 assign dbg_cda2 = dbg_toc_cdb;

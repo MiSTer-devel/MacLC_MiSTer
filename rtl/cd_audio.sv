@@ -951,6 +951,8 @@ always @(posedge clk) begin
 				end else if (pstate == ST_PLAY) pstate <= ST_PAUSE;
 			8'h4e:                                         // STOP PLAY
 				if (pstate != ST_IDLE) pstate <= ST_IDLE;
+			8'h01, 8'h0b, 8'h2b:                           // REZERO (player STOP) / SEEK(6/10)
+				if (pstate != ST_IDLE) pstate <= ST_IDLE;  // Annex-C stop-audio (BlueSCSI)
 			default: ;                                     // 0xCE handled in scsi.v
 			endcase
 		end
