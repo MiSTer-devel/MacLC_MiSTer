@@ -359,8 +359,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
 # turns each back into plain registers (<1K regs total) — framework constrained
 # from OUR qsf; sys/ files stay stock. The big ascal shifters (4-6Kbit) are
 # deliberately NOT listed (register cost too high).
-set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*|rdout2*"
-set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*vga_scaler_out|din1*"
-set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*HDMI_shadowmask|vid*"
-set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*yc_out|phase*"
-set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "*dv_de1*"
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *|rdout2*
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *vga_scaler_out|din1*
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *HDMI_shadowmask|vid*
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *yc_out|phase*
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *dv_de1*

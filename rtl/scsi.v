@@ -711,11 +711,12 @@ wire [7:0] cd_subq43_dout       = cd_subq43_byte(data_cnt);
 wire [7:0] cd_subq43_dout_next  = cd_subq43_byte(data_cnt_next);
 wire [7:0] cd_subq43_dout_next2 = cd_subq43_byte(data_cnt_next2);
 wire [7:0] cd_subq43_dout_next3 = cd_subq43_byte(data_cnt_next3);
-function [7:0] t43_hdr_fix;      // override bytes 0/1 with the filtered length
-	input [31:0] cnt;
-	input [7:0]  raw;
+function [7:0] t43_hdr_fix;      // filtered length in bytes 0/1; ZERO past the
+	input [31:0] cnt;            // real payload (serving pads to the armed
+	input [7:0]  raw;            // allocation length — see the data_len note)
 	begin
-		t43_hdr_fix = (cnt == 32'd0) ? {6'd0, ca_t43_flen[9:8]} :
+		t43_hdr_fix = (cnt >= {22'd0, ca_t43_tot}) ? 8'h00 :
+		              (cnt == 32'd0) ? {6'd0, ca_t43_flen[9:8]} :
 		              (cnt == 32'd1) ? ca_t43_flen[7:0] : raw;
 	end
 endfunction
@@ -1208,10 +1209,22 @@ wire [31:0] data_len =
 		 cmd_read?{ 7'd0, tlen, 9'd0 }:   // read command length is in 512 bytes blocks
 		 cmd_write?{ 7'd0, tlen, 9'd0 }:  // write command length is in 512 bytes blocks
 		 cmd_cd_toc?cd_toc_len:           // Apple READ TOC (see cd_toc_len)
-		 cmd_cd_toc43?(({16'd0, cmd[7], cmd[8]} < {22'd0, ca_t43_tot}) ?
-		               {16'd0, cmd[7], cmd[8]} : {22'd0, ca_t43_tot}):
-		 cmd_cd_subq43?(({16'd0, cmd[7], cmd[8]} < 32'd16) ?
-		                {16'd0, cmd[7], cmd[8]} : 32'd16):
+		 // 0x43/0x42 serve EXACTLY the allocation length (zero-filled past the
+		 // real payload; header length fields still carry the true size). The
+		 // under-serve direction deadlocks too (2026-07-19, deterministic at
+		 // boot): the Mac's blind-transfer primitive arms the FULL allocation
+		 // and pumps DACK for it; a target that goes early-STATUS after
+		 // min(alloc,actual) leaves the host armed with no DREQ ever coming —
+		 // 250 ms BERR beats, SCSI Mgr retry, boot wedge ("host-armed/
+		 // target-idle"). Discovered via the 0x43 start-track filter: it was
+		 // the first command whose actual size (20 B for the {start=22,
+		 // alloc=48} duration ask) dropped BELOW the allocation. Caps: 512 =
+		 // T43 plane, 64 > the 16-byte 0x42 payload (its serve function
+		 // zero-fills past byte 15 by construction).
+		 cmd_cd_toc43?(({16'd0, cmd[7], cmd[8]} < 32'd512) ?
+		               {16'd0, cmd[7], cmd[8]} : 32'd512):
+		 cmd_cd_subq43?(({16'd0, cmd[7], cmd[8]} < 32'd64) ?
+		                {16'd0, cmd[7], cmd[8]} : 32'd64):
 		 cmd_cd_subq?32'd9:               // READ Q SUBCODE: fixed 9 bytes
 		 cmd_cd_astat?32'd6:              // AUDIO STATUS: fixed 6 bytes
 		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
