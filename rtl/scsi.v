@@ -374,7 +374,8 @@ wire [7:0] cmd_dout =
 		cmd_mode_sense?mode_sense_dout:
 		cmd_request_sense?request_sense_dout:
 		cmd_cd_toc?cd_toc_dout:
-		cmd_cd_toc43?cd_toc43_dout:
+		(cmd_cd_t43f2 || cmd_cd_t43f1)?cd_toc2_dout:
+		cmd_cd_t43f0?cd_toc43_dout:
 		cmd_cd_subq?cd_subq_dout:
 		cmd_cd_subq43?cd_subq43_dout:
 		cmd_cd_astat?cd_astat_dout:
@@ -389,7 +390,8 @@ wire [15:0] cmd_dout_pair =
 		cmd_mode_sense?{mode_sense_dout, mode_sense_dout_next}:
 		cmd_request_sense?{request_sense_dout, request_sense_dout_next}:
 		cmd_cd_toc?{cd_toc_dout, cd_toc_dout_next}:
-		cmd_cd_toc43?{cd_toc43_dout, cd_toc43_dout_next}:
+		(cmd_cd_t43f2 || cmd_cd_t43f1)?{cd_toc2_dout, cd_toc2_dout_next}:
+		cmd_cd_t43f0?{cd_toc43_dout, cd_toc43_dout_next}:
 		cmd_cd_subq?{cd_subq_dout, cd_subq_dout_next}:
 		cmd_cd_subq43?{cd_subq43_dout, cd_subq43_dout_next}:
 		cmd_cd_astat?{cd_astat_dout, cd_astat_dout_next}:
@@ -404,7 +406,8 @@ wire [15:0] cmd_dout_pair_next =
 		cmd_mode_sense?{mode_sense_dout_next2, mode_sense_dout_next3}:
 		cmd_request_sense?{request_sense_dout_next2, request_sense_dout_next3}:
 		cmd_cd_toc?{cd_toc_dout_next2, cd_toc_dout_next3}:
-		cmd_cd_toc43?{cd_toc43_dout_next2, cd_toc43_dout_next3}:
+		(cmd_cd_t43f2 || cmd_cd_t43f1)?{cd_toc2_dout_next2, cd_toc2_dout_next3}:
+		cmd_cd_t43f0?{cd_toc43_dout_next2, cd_toc43_dout_next3}:
 		cmd_cd_subq?{cd_subq_dout_next2, cd_subq_dout_next3}:
 		cmd_cd_subq43?{cd_subq43_dout_next2, cd_subq43_dout_next3}:
 		cmd_cd_astat?{cd_astat_dout_next2, cd_astat_dout_next3}:
@@ -724,6 +727,32 @@ wire [7:0] cd_toc43_dout        = ca_toc_ready ? t43_hdr_fix(data_cnt,       ca_
 wire [7:0] cd_toc43_dout_next   = ca_toc_ready ? t43_hdr_fix(data_cnt_next,  ca_t43_q1) : 8'h00;
 wire [7:0] cd_toc43_dout_next2  = ca_toc_ready ? t43_hdr_fix(data_cnt_next2, ca_t43_q2) : 8'h00;
 wire [7:0] cd_toc43_dout_next3  = ca_toc_ready ? t43_hdr_fix(data_cnt_next3, ca_t43_q3) : 8'h00;
+
+// format-2 FULL TOC / format-1 SESSION INFO: pre-rendered T2 plane, linear
+// addressing (the plane IS the response image; session page at [496..507]).
+// Zero-fill past the real payload — serving pads to the armed allocation
+// per the serving law; the u16be length fields carry the true sizes.
+wire [7:0]  ca_t2_q0, ca_t2_q1, ca_t2_q2, ca_t2_q3;
+wire [9:0]  ca_t2_len;
+wire [8:0]  ca_t2_addr = (cmd_cd_t43f1 ? 9'd496 : 9'd0) + data_cnt[8:0];
+function [7:0] t2_fix;           // full TOC: zero past toc2_len
+	input [31:0] cnt;
+	input [7:0]  raw;
+	t2_fix = (cnt >= {22'd0, ca_t2_len}) ? 8'h00 : raw;
+endfunction
+function [7:0] sess_fix;         // session-info page: 12 real bytes
+	input [31:0] cnt;
+	input [7:0]  raw;
+	sess_fix = (cnt >= 32'd12) ? 8'h00 : raw;
+endfunction
+wire [7:0] cd_toc2_dout        = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt, ca_t2_q0) : t2_fix(data_cnt, ca_t2_q0);
+wire [7:0] cd_toc2_dout_next   = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt_next, ca_t2_q1) : t2_fix(data_cnt_next, ca_t2_q1);
+wire [7:0] cd_toc2_dout_next2  = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt_next2, ca_t2_q2) : t2_fix(data_cnt_next2, ca_t2_q2);
+wire [7:0] cd_toc2_dout_next3  = !ca_toc_ready ? 8'h00 :
+                                 cmd_cd_t43f1 ? sess_fix(data_cnt_next3, ca_t2_q3) : t2_fix(data_cnt_next3, ca_t2_q3);
 
 wire [7:0] cd_astat_dout       = cd_astat_byte(data_cnt);
 wire [7:0] cd_astat_dout_next  = cd_astat_byte(data_cnt_next);
@@ -1109,6 +1138,10 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.toc43_q0(ca_t43_q0), .toc43_q1(ca_t43_q1),
 		.toc43_q2(ca_t43_q2), .toc43_q3(ca_t43_q3),
 		.toc43_len(ca_t43_len),
+		.toc2_base(ca_t2_addr),
+		.toc2_q0(ca_t2_q0), .toc2_q1(ca_t2_q1),
+		.toc2_q2(ca_t2_q2), .toc2_q3(ca_t2_q3),
+		.toc2_len(ca_t2_len),
 		.snd_l(cd_snd_l), .snd_r(cd_snd_r),
 		.dbg_cda0(dbg_cda0)
 	);
@@ -1126,6 +1159,9 @@ end else begin : g_no_cd_audio
 	assign ca_t43_q0 = 8'h00; assign ca_t43_q1 = 8'h00;
 	assign ca_t43_q2 = 8'h00; assign ca_t43_q3 = 8'h00;
 	assign ca_t43_len = 10'd0;
+	assign ca_t2_q0 = 8'h00; assign ca_t2_q1 = 8'h00;
+	assign ca_t2_q2 = 8'h00; assign ca_t2_q3 = 8'h00;
+	assign ca_t2_len = 10'd0;
 	assign ca_toc_ready = 1'b0;
 	assign cd_snd_l = 16'sd0;
 	assign cd_snd_r = 16'sd0;
@@ -1222,7 +1258,7 @@ wire [31:0] data_len =
 		 // T43 plane, 64 > the 16-byte 0x42 payload (its serve function
 		 // zero-fills past byte 15 by construction).
 		 cmd_cd_toc43?(({16'd0, cmd[7], cmd[8]} < 32'd512) ?
-		               {16'd0, cmd[7], cmd[8]} : 32'd512):
+		               {16'd0, cmd[7], cmd[8]} : 32'd512):   // all formats: f0/f2 tables + f1 page
 		 cmd_cd_subq43?(({16'd0, cmd[7], cmd[8]} < 32'd64) ?
 		                {16'd0, cmd[7], cmd[8]} : 32'd64):
 		 cmd_cd_subq?32'd9:               // READ Q SUBCODE: fixed 9 bytes
@@ -1394,7 +1430,14 @@ wire       cmd_cd_audio_nop = (CDROM != 0) && ((op_code == 8'hc8) || (op_code ==
                                                // standard set (dialect switch):
                                                (op_code == 8'h47) || (op_code == 8'h48) ||
                                                (op_code == 8'h4b) || (op_code == 8'h4e));
-wire       cmd_cd_toc43  = (CDROM != 0) && (op_code == 8'h43);  // standard READ TOC
+wire       cmd_cd_toc43  = (CDROM != 0) && (op_code == 8'h43);  // standard READ TOC (any format)
+// old-style format select in the CONTROL byte (cmd[9][7:6]) — the AppleCD
+// driver's actual dialect on the 8004 identity (2026-07-19 capture: 0x80).
+// Oracles: BlueSCSI apple-quirks (0x80=full TOC, 0x40=session info) + Snow.
+// Unknown format 2'b11 falls back to format 0 (benign, never observed).
+wire       cmd_cd_t43f2  = cmd_cd_toc43 && (cmd[9][7:6] == 2'b10);  // FULL TOC (format 2)
+wire       cmd_cd_t43f1  = cmd_cd_toc43 && (cmd[9][7:6] == 2'b01);  // SESSION INFO (format 1)
+wire       cmd_cd_t43f0  = cmd_cd_toc43 && !cmd_cd_t43f2 && !cmd_cd_t43f1;
 wire       cmd_cd_subq43 = (CDROM != 0) && (op_code == 8'h42);  // standard READ SUB-CHANNEL
 wire       cmd_cd_prevent   = (CDROM != 0) && (op_code == 8'h1e);  // PREVENT/ALLOW MEDIUM REMOVAL
 wire       cmd_cd_startstop = (CDROM != 0) && (op_code == 8'h1b);  // START/STOP UNIT
