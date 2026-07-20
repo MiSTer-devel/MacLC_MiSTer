@@ -78,10 +78,12 @@ The core emulates an Apple-compatible CD-ROM drive on **SCSI ID 3**:
   when disabled
 
 **The guest System must have a CD driver installed** — the stock Apple *CD-ROM* extension
-works: the drive presents the AppleCD 150 identity (`SONY CD-ROM CDU-8002`, byte-exact
-from real hardware), which the stock driver requires — a generic identity was tried and
-the driver refuses to attach. Third-party CD drivers should also work. Without a driver
-the disc mounts nothing on the desktop.
+works: the drive presents an AppleCD-family identity (`CD-ROM CDU-8004`, the AppleCD 300
+mechanism), which the stock driver requires — a generic identity was tried and the driver
+refuses to attach. The driver then speaks its standard SCSI-2 dialect (READ TOC incl. the
+old-style full-TOC/BCD control-byte forms, PLAY MSF/TRACK, READ SUB-CHANNEL) — all served
+byte-exact against BlueSCSI and Snow as references. Third-party CD drivers should also
+work. Without a driver the disc mounts nothing on the desktop.
 
 Image format support:
 
@@ -90,9 +92,19 @@ Image format support:
 | `.iso` / `.toast` / `.bin` (2048-byte sectors) | **Working** — verified on hardware, stock MiSTer Main |
 | `.cue`+`.bin` (2352-byte raw), `.chd` | **Working** — verified on hardware (July 2026); requires a [forked Main_MiSTer](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC) build |
 
-Data discs only (HFS and ISO 9660/hybrid). **CD audio is not implemented yet** — audio
-tracks are ignored. Ejecting from the Finder (drag to Trash) is honored; use the OSD to
-insert a different disc.
+**CD audio is fully supported** (July 2026): audio and mixed-mode discs mount correctly
+(pure-audio discs reject data reads like a real drive — the Audio CD Access extension
+depends on that), and the **AppleCD Audio Player** works end to end: full track listing
+with durations, play, pause/resume, next/previous track, stop, and fast-forward/rewind
+scan with audio. CD audio requires `.cue`+`.bin` or `.chd` images (and therefore the
+forked Main, below) — flat 2048-byte images carry no audio tracks.
+
+The exact Main_MiSTer binary these features were validated against ships in
+[`releases/MiSTer`](releases/) (md5 `9d5f18d3`) — copy it to `/media/fat/MiSTer`
+(back up the original first).
+
+Ejecting from the Finder (drag to Trash) is honored; use the OSD to insert a
+different disc.
 
 ## Floppy disk support
 
