@@ -350,8 +350,20 @@ localparam [4:0]
 	// standard 0x43 MMC TOC table build (dialect-switch mission 2026-07-19)
 	M_T43_HDR  = 5'd17, M_T43_RD = 5'd18, M_T43_DIV = 5'd19, M_T43_EMIT = 5'd20,
 	M_T2_HDR   = 5'd21, M_T2_RD  = 5'd22, M_T2_DIV  = 5'd23, M_T2_TRK  = 5'd24,
-	M_T2_A2    = 5'd25, M_T2_A01 = 5'd26, M_T2_SESS = 5'd27;
+	M_T2_A2    = 5'd25, M_T2_A01 = 5'd26, M_T2_SESS = 5'd27,
+	M_SCAN_GO  = 5'd28;                     // 0xCD standard-form audio scan
 reg [4:0] mst;
+
+// 0xCD AUDIO SCAN (AppleCD player FF/RW, standard-driver form: cdb1
+// 0x00=FF / 0x10=RW, MSF hex in cdb3-5 — BlueSCSI documents the format
+// but leaves it unimplemented; the dynamics here are ours). While
+// scan_x: the playhead advances ±8 sectors per consumed frame (chirping
+// ~8x scan). Cleared by ANY other transport command, playback stop, or
+// reaching an end. Mishandling this (vendor LBA-form decode → pause)
+// wedged the PLAYER's state machine: it waits for position movement
+// that never comes and stops issuing commands (watch capture run 2).
+reg        scan_x;
+reg        scan_dir;                        // 1 = rewind
 
 reg  [2:0] step;                        // word-stream step within a state
 reg  [6:0] t_idx;
@@ -420,6 +432,7 @@ always @(posedge clk) begin
 		toc_valid <= 0; toc_ready <= 0; n_tracks <= 7'd1; leadout_lba <= 0;
 		cmd_pend <= 0; pstate <= ST_IDLE; cur_lba <= 0; stop_lba <= 0; flush <= 0;
 		cur_ctrl <= 8'h14; cur_trk <= 8'h01;
+		scan_x <= 1'b0; scan_dir <= 1'b0;
 		abs_m <= 0; abs_s <= 0; abs_f <= 0; rel_m <= 0; rel_s <= 0; rel_f <= 0;
 		ref_cnt <= 0; t_idx <= 0;
 	end else begin
@@ -435,16 +448,23 @@ always @(posedge clk) begin
 			cmd_pend <= 1'b1;
 		end
 		// oracle: a data READ (or eject / unmount) stops playback
-		if ((read_stb || eject_stb || bus_rst || !mounted) && pstate != ST_IDLE)
+		if ((read_stb || eject_stb || bus_rst || !mounted) && pstate != ST_IDLE) begin
 			pstate <= ST_IDLE;
+			scan_x <= 1'b0;
+		end
 
-		// playhead advance, one frame at a time
+		// playhead advance, one frame at a time (±8 while 0xCD scanning)
 		if (frame_done) begin
-			if (cur_lba + 32'd1 >= stop_lba) begin
+			if (scan_x && scan_dir) begin
+				// rewind: clamp at disc start, keep scanning in place
+				cur_lba <= (cur_lba > 32'd8) ? cur_lba - 32'd8 : 32'd0;
+			end
+			else if (cur_lba + (scan_x ? 32'd8 : 32'd1) >= stop_lba) begin
 				cur_lba <= stop_lba;
 				pstate  <= ST_END;
+				scan_x  <= 1'b0;
 			end
-			else cur_lba <= cur_lba + 32'd1;
+			else cur_lba <= cur_lba + (scan_x ? 32'd8 : 32'd1);
 		end
 
 		case (mst)
@@ -867,6 +887,8 @@ always @(posedge clk) begin
 		// -------------------------------------------------- command execute
 		M_CMD: begin
 			mst <= M_IDLE;   // default; overridden below
+			// any transport command other than the scan itself ends a scan
+			if (!(c_op == 8'hcd && c_9[7:6] == 2'b00)) scan_x <= 1'b0;
 			case (c_op)
 			8'hca: begin                                   // AUDIO PAUSE
 				if (c_1 == 8'h10) begin
@@ -874,6 +896,11 @@ always @(posedge clk) begin
 				end else if (pstate == ST_PAUSE) pstate <= ST_PLAY;
 			end
 			8'hc8, 8'hc9, 8'hcb, 8'hcd: begin              // SEARCH/PLAY/STOP/SCAN
+				if (c_op == 8'hcd && c_9[7:6] == 2'b00) begin
+					// standard-driver AUDIO SCAN form (see scan_x block)
+					c_addr <= msf2lba_std(c_3, c_4, c_5);
+					mst <= M_SCAN_GO;
+				end else
 				case (c_9[7:6])
 				2'b01: begin                               // MSF (C9: bytes 3..5, else 5..7)
 					c_addr <= (c_op == 8'hc9) ? msf2lba(c_3, c_4, c_5)
@@ -951,6 +978,16 @@ always @(posedge clk) begin
 				mst <= M_APPLY;
 			end
 			endcase
+		end
+		M_SCAN_GO: begin
+			cur_lba  <= c_addr;
+			flush    <= 1'b1;
+			scan_x   <= 1'b1;
+			scan_dir <= c_1[4];
+			// FF needs headroom past a stale stop position
+			if (!c_1[4] && stop_lba <= c_addr) stop_lba <= leadout_lba;
+			pstate   <= ST_PLAY;
+			mst <= M_IDLE;
 		end
 		M_APPLY: begin
 			mst <= M_IDLE;
