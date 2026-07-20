@@ -135,7 +135,7 @@ Audits clean at every step (final: 34,470 regs / 3,930,474 bits = exactly
 |---|---|---|---|---|---|
 | 5 | dialect | +0.105 | thin | not run | rejected (law) |
 | 6 | dialect | +0.126 | thin | not run | rejected |
-| 7 | dialect | +0.192 (HOLD-ltd) | **+0.42** | **CLEAN** (berr=0, CDA green, driver conversing) | **DEPLOYED candidate** |
+| 7 | dialect | +0.192 (HOLD-ltd) | **+0.42** | **CLEAN** (berr=0, CDA green, driver conversing) | ~~DEPLOYED~~ **FIELD-QUARANTINED 07-19 eve: BLACK SCREEN** |
 | 8 | +filter | +0.158 | +0.158 | not run | rejected |
 | 9 | +filter | +0.252 | **+0.64** | **FAILED: CDA hub gone, berr=36, 250ms stall peg** | QUARANTINED |
 
@@ -149,3 +149,34 @@ Also: the scalar mixes setup/hold — always read the per-domain summary.
 minus the start-filter (leadout-length quirk visible as wrong disc
 duration). The filter netlist (b3ec132+) still needs a healthy fit —
 roll seeds ≥10, boot-probe each. The 22-track user verdict runs on s7.
+
+## EVENING ADDENDUM (2026-07-19 ~21:00): s7 BLACK-SCREENED IN THE FIELD
+
+User report: "not getting video anymore." Remote diagnosis confirmed:
+- Box power-cycled fresh by the user, MACLC (s7 launchable, pushed
+  10:56) running, CPU-side alive — but Main could not produce a
+  screenshot (stale MacIIvi 07-18 file returned = **no core vsync
+  reaching Main**). Main binary (07-17) and MiSTer.ini (06-16)
+  untouched — not the framework, not the board.
+- A/B: pushed fallback **0170576s5** (256bd46d) as the launchable,
+  relaunched → fresh MACLC screenshot, **happy-Mac on grey pattern,
+  video fine**. User's own power-cycle + s7 = black rules out the
+  07-17 board-PLL condition. s7 = the never-root-caused
+  **black-screen fit class** (seed-2 precedent, CD-ROM mission).
+- The morning session ran s7's boot-probe but **skipped the per-seed
+  display check** (MEMORY law) — the s9 lesson ("boot-probe is the
+  real gate, not STA") over-corrected. s7 boot-probes clean AND
+  black-screens: the two gates catch **disjoint** failure classes.
+
+**LAW (final form): a fit clears only on the TRIPLE gate —
+(1) fat per-domain STA, (2) boot-probe (berr=0, no stall peg,
+instruments alive), (3) DISPLAY CHECK (fresh screenshot showing
+video).** No single gate subsumes another: s9 passed (1) failed (2);
+s7 passed (2) failed (3).
+
+- Box restored: launchable = 0170576s5 (vendor dialect, music plays,
+  2-track bug live). **The 22-track dialect test has NEVER run** — no
+  dialect-netlist build has yet passed all three gates.
+- Next: SEED 10 on the filter netlist (HEAD), triple gate, then the
+  user verdict. s7 rbf kept in scratch/ for the black-screen
+  root-cause pile.
