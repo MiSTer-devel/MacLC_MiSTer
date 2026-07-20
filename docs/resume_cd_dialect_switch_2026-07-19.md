@@ -180,3 +180,31 @@ s7 passed (2) failed (3).
 - Next: SEED 10 on the filter netlist (HEAD), triple gate, then the
   user verdict. s7 rbf kept in scratch/ for the black-screen
   root-cause pile.
+
+## LATE ADDENDUM (21:25): s10 gated same evening — FAILED gate 2
+
+| Seed | Netlist | Setup/Hold | Gate 2 (boot-probe) | Gate 3 (display) |
+|---|---|---|---|---|
+| 10 | +filter | **+0.503 / +0.199** (fattest of the era) | **FAILED: berr 36→57 climbing, CPU frozen (delta=1), cmd_cnt dead at 113, OS wedged @Starting-up w/ unpainted alert** | video itself fine |
+
+s10 (09811ee, md5 cd70f1af, staged in scratch/) proves the point a third
+way: fattest per-domain STA of the mission, video output healthy, and an
+OS-load wedge in the fit-marginal SCSI-read class (#3 family, the 07-18
+MacAtrium-wedge signature: BERR-climb + frozen CPU). **Filter netlist is
+now 0-for-3 healthy (s8 thin / s9 probe-dead / s10 OS-wedge).** Lottery
+odds on this netlist look bad; the queued structural cure
+(register/multicycle the SCSI periph-read+dreq cone, #3 handoff
+prescription) is now the leading move if s11 also flunks.
+
+**MISSION-CRITICAL POSITIVE (from s10's short life): THE DIALECT IS LIVE
+ON HW.** Before the wedge, the CD target served **113 commands, zero
+sense errors, last_op=0x28 (standard READ-10)**, toc_valid=1/n_tracks=22,
+and CDA2 latched a real **0x43 READ TOC ask (start=0x16=22, alloc=48 —
+a leadout-window ask, exactly what the start-track filter exists for)**.
+The CDU-8004 identity flip worked: the stock driver speaks standard
+SCSI-2 to us. Only fit health stands between here and the 22-track
+verdict. (Tooling nit: cd_probes.tcl still labels CDA2 "last-0xC1 CDB" —
+stale text, the raw+fields are the 0x43 latch.)
+
+Box state: restored to 0170576s5 AGAIN (display-checked, happy-Mac).
+s11 rolling.
