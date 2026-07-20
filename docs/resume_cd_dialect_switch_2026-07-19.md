@@ -256,6 +256,39 @@ unwedged build captures (CDA1/CDA2) decides the exact layout.**
 
 Gating now: 3d0606c s12 (hardening + padding fix).
 
+## NIGHT FINAL (23:30): p12 TRIPLE-GATE PASS disc-less; format-2 content = the one remaining blocker
+
+**p12 = 3d0606c s12 (md5 2e282b44, staged scratch/): setup +0.460 /
+hold +0.254 (fattest of the night).**
+
+| Config | Verdict |
+|---|---|
+| Audio CHD mounted at boot | Wedge CLASS CURED (CPU alive/free, berr bounded static at 36, no DACK pin) but boot HELD at a blank alert loop — the driver's format-2 asks get format-0 bytes, it gives up, the OS raises an alert whose draw/dismiss cycle never completes. Deterministic, content-layer. |
+| No disc mounted (s4 parked) | **TRIPLE-GATE PASS: berr_fires=0, max_stall 6.8 ms, 13 CD cmds answered w/ correct no-disc sense (2/0xB0), FULL DESKTOP (painted shutdown-warning dialog = Finder up)** |
+
+The transport serving law (pad to armed allocation) is PROVEN: the
+identical boot that previously pinned the CPU at $F07Fxx with climbing
+BERRs now runs berr=0 disc-less and berr-bounded-static with the disc.
+The hardening (cc81843) rides along, untested in anger but structurally
+sound and cost-free (+36 regs, timing improved).
+
+**NEXT SESSION — the single completing move: serve FORMAT 2 (full TOC)
+for cmd[9][7:6]==2'b10 asks.** Oracle: Snow read_toc (WSL ~/repos/snow)
++ BlueSCSI_cdrom.cpp (S2S_CFG_QUIRKS_APPLE). Layout: 4-byte header
+{u16be len, first session, last session} + 11-byte rows {session,
+adr_ctrl, tno=00, point, min, sec, frame, zero, pmin, psec, pframe} —
+derivable serve-time from the T43 plane (point=track#, pmin/psec/pframe
+= the row's 3 addr bytes, +A0/A1/A2 lead-in point rows). Serve padded
+to alloc per the serving law. The driver's observed asks: {cmd9=0x80,
+start=22, alloc=48} (and the boot capture CDA1/CDA2 from the unwedged
+p12 run holds the full conversation). VERIFY Snow's exact row set
+(A0/A1/A2 presence + track rows + ordering) before coding.
+
+Box overnight: s5 (0170576s5) + CD remounted (s4 unparked) = the
+music-works/2-track vendor state. p12 staged for the format-2 base.
+Deployment ledger tonight: s7→(field black)→s5→s11(wedge)→s5→
+h-s11(wedge)→s5→p12(alert hold)→p12-no-disc(DESKTOP)→s5.
+
 ## NIGHT CLOSE (21:50): s11 FAILED gate 2 — LOTTERY CLOSED
 
 | Seed | Netlist | Setup/Hold | Verdict |
