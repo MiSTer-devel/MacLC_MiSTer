@@ -97,6 +97,16 @@ parameter [2:0] ID = 0;
 // target presents as a Toolbox device and owns the dedicated tb_* transport.
 // docs/BLUESCSI_CORE_HPS_CONTRACT.md
 parameter TOOLBOX_ENABLE = 0;
+// Set on the CD-ROM target (ID 3) only. Gates the BlueSCSI Toolbox CD Changer
+// (0xD7 LIST / 0xD8 SET NEXT / 0xDA COUNT) onto the SAME tb_* transport as the
+// disk Toolbox, with the CD-changer opcode set + a CD-folder HPS handler.
+// docs/BLUESCSI_CD_CHANGER_CONTRACT.md
+parameter CDCHANGER_ENABLE = 0;
+// tb transport buffer size (per lane), in address bits. 8 = one 512-byte SD
+// sector (file Toolbox + single-block default). The CD changer sets 11 (8
+// sectors = 4 KB) so LIST CDS serves the full 100-entry list in one
+// fetch-all-then-serve pass. docs/BLUESCSI_CD_CHANGER_CONTRACT.md §4, §10.
+parameter TB_ADDRW = 8;
 // Apple CD-ROM mode (docs/plan_scsi_cdrom.md; MAME nscsi_cdrom_apple_device is
 // the byte-for-byte oracle). 0 = hard disk: every CDROM conditional below
 // constant-folds away, leaving the wedge-hardened disk target bit-identical.
@@ -383,7 +393,7 @@ wire [7:0] cmd_dout =
 		cmd_cd_astat?cd_astat_dout:
 		cmd_tb_devinfo?tb_devinfo_dout:
 		cmd_tb_debug?tb_debug_dout:
-		cmd_tb_fs_in?tb_serve:
+		(cmd_tb_fs_in || cmd_cdc_in)?tb_serve:
 		8'h00;
 wire [15:0] cmd_dout_pair =
 		cmd_read?(data_cnt[0] ? {buffer1_dout, buffer0_dout_next} : {buffer0_dout, buffer1_dout}):
@@ -399,7 +409,7 @@ wire [15:0] cmd_dout_pair =
 		cmd_cd_astat?{cd_astat_dout, cd_astat_dout_next}:
 		cmd_tb_devinfo?{tb_devinfo_dout, tb_devinfo_dout_next}:
 		cmd_tb_debug?{tb_debug_dout, tb_debug_dout_next}:
-		cmd_tb_fs_in?tb_serve_pair:
+		(cmd_tb_fs_in || cmd_cdc_in)?tb_serve_pair:
 		16'h0000;
 wire [15:0] cmd_dout_pair_next =
 		cmd_read?(data_cnt[0] ? {buffer1_dout_next, buffer0_dout_next2} : {buffer0_dout_next, buffer1_dout_next}):
@@ -415,7 +425,7 @@ wire [15:0] cmd_dout_pair_next =
 		cmd_cd_astat?{cd_astat_dout_next2, cd_astat_dout_next3}:
 		cmd_tb_devinfo?{tb_devinfo_dout_next2, tb_devinfo_dout_next3}:
 		cmd_tb_debug?{tb_debug_dout_next2, tb_debug_dout_next3}:
-		cmd_tb_fs_in?tb_serve_pair_next:
+		(cmd_tb_fs_in || cmd_cdc_in)?tb_serve_pair_next:
 		16'h0000;
 
 // REQUEST SENSE response: minimal fixed-format sense, "NO SENSE".
@@ -914,11 +924,12 @@ reg [15:0] tb_len;
 reg [3:0]  tb_load_w;
 reg [1:0]  tb_settle;
 reg        old_tb_ack;
+reg [3:0]  tb_fetch_sec;    // which 512B sector the HPS fill is landing (multi-block LIST; TB_ADDRW>8)
 
 // Shared-folder availability: latches when the HPS mounts the Toolbox slot.
 // Until then (incl. a stock Main with no handler) fs ops return CHECK (§4a).
 reg tb_ready = 1'b0;
-always @(posedge clk) if (TOOLBOX_ENABLE && tb_mounted) tb_ready <= 1'b1;
+always @(posedge clk) if ((TOOLBOX_ENABLE || CDCHANGER_ENABLE) && tb_mounted) tb_ready <= 1'b1;
 
 // Toolbox buffer: one 512-byte sector, byte-split (even->buf0, odd->buf1) with
 // the SAME HPS lane mapping as the disk buffer so bytes arrive in order.
@@ -942,9 +953,17 @@ wire       tb_hps_wr  = sd_buff_wr & tb_ack;            // HPS fills the slot
 wire       tb_collect = (phase == PHASE_DATA_IN) && cmd_tb_send;
 wire       tb_col_wr0 = tb_collect && stb_ack && ~data_cnt[0];
 wire       tb_col_wr1 = tb_collect && stb_ack &&  data_cnt[0];
-wire [7:0] tb_b_addr  = (tb_state == TBS_LOAD) ? {4'd0, tb_load_w}
-                      : tb_collect            ? (8'd8 + data_cnt[8:1])
-                      :                          data_cnt[8:1];
+// tb buffer word address, computed at 11b (max = 8 sectors) then sliced to
+// TB_ADDRW. On single-sector targets (TB_ADDRW=8) the high bits are always 0
+// (tb_fetch_sec=0, data_cnt<512), so the slice reproduces the old data_cnt[8:1].
+wire [10:0] tb_b_addr11 = (tb_state == TBS_LOAD) ? {7'd0, tb_load_w}
+                        : tb_collect            ? (11'd8 + {3'd0, data_cnt[8:1]})
+                        :                          data_cnt[11:1];
+wire [TB_ADDRW-1:0] tb_b_addr = tb_b_addr11[TB_ADDRW-1:0];
+// HPS fill address: sector tb_fetch_sec at word offset tb_fetch_sec*256, so a
+// multi-sector LIST lands contiguously (LBA 1+k -> words k*256..k*256+255).
+wire [10:0] tb_hps_addr11 = {tb_fetch_sec[2:0], sd_buff_addr[7:0]};
+wire [TB_ADDRW-1:0] tb_hps_addr = tb_hps_addr11[TB_ADDRW-1:0];
 wire       tb_b_wr0   = (tb_state == TBS_LOAD) || tb_col_wr0;
 wire       tb_b_wr1   = (tb_state == TBS_LOAD) || tb_col_wr1;
 wire [7:0] tb_load_b0 = cmd[{tb_load_w[2:0], 1'b0}];   // even CDB byte
@@ -954,16 +973,16 @@ wire [7:0] tb_b_d1    = (tb_state == TBS_LOAD) ? tb_load_b1 : din;   // CDB odd 
 
 wire [7:0] tb0_dout, tb0_dout_next, tb0_dout_next2;
 wire [7:0] tb1_dout, tb1_dout_next, tb1_dout_next2;
-scsi_dpram #(.ADDRWIDTH(8)) tb_buf0 (
+scsi_dpram #(.ADDRWIDTH(TB_ADDRW)) tb_buf0 (
 	.clock(clk),
-	.address_a(sd_buff_addr), .data_a(tb_buf0_da), .wren_a(tb_hps_wr), .q_a(tb_buf0_qa),
+	.address_a(tb_hps_addr), .data_a(tb_buf0_da), .wren_a(tb_hps_wr), .q_a(tb_buf0_qa),
 	.address_b(tb_b_addr), .data_b(tb_b_d0), .wren_b(tb_b_wr0), .q_b(tb0_dout),
 	.address_c(tb_b_addr + 1'b1), .q_c(tb0_dout_next),
 	.address_d(tb_b_addr + 2'd2), .q_d(tb0_dout_next2)
 );
-scsi_dpram #(.ADDRWIDTH(8)) tb_buf1 (
+scsi_dpram #(.ADDRWIDTH(TB_ADDRW)) tb_buf1 (
 	.clock(clk),
-	.address_a(sd_buff_addr), .data_a(tb_buf1_da), .wren_a(tb_hps_wr), .q_a(tb_buf1_qa),
+	.address_a(tb_hps_addr), .data_a(tb_buf1_da), .wren_a(tb_hps_wr), .q_a(tb_buf1_qa),
 	.address_b(tb_b_addr), .data_b(tb_b_d1), .wren_b(tb_b_wr1), .q_b(tb1_dout),
 	.address_c(tb_b_addr + 1'b1), .q_c(tb1_dout_next),
 	.address_d(tb_b_addr + 2'd2), .q_d(tb1_dout_next2)
@@ -974,6 +993,15 @@ wire  [7:0] tb_serve           = data_cnt[0] ? tb1_dout : tb0_dout;
 wire [15:0] tb_serve_pair      = data_cnt[0] ? {tb1_dout, tb0_dout_next} : {tb0_dout, tb1_dout};
 wire [15:0] tb_serve_pair_next = data_cnt[0] ? {tb1_dout_next, tb0_dout_next2} : {tb0_dout_next, tb1_dout_next};
 
+// Multi-sector LIST fetch (TB_ADDRW>8): the HPS returns tb_len bytes across
+// ceil(tb_len/512) sectors (LBA 1..N). TB_MAXSEC bounds it to the buffer; with
+// TB_ADDRW=8 => TB_MAXSEC=1 => single-block (file Toolbox behaviour preserved).
+localparam [3:0] TB_MAXSEC = 1 << (TB_ADDRW - 8);
+wire [6:0] tb_nsec_raw = tb_len[15:9] + {6'd0, |tb_len[8:0]};  // ceil(tb_len/512)
+wire [3:0] tb_nsec = (tb_nsec_raw == 7'd0)         ? 4'd1
+                   : (tb_nsec_raw > {3'd0,TB_MAXSEC}) ? TB_MAXSEC
+                   :                                  tb_nsec_raw[3:0];
+
 // Round-trip FSM. Drives tb_state / tb_rd / tb_wr / tb_lba; the MAIN phase FSM
 // moves `phase` (CMD_IN -> PHASE_TB -> DATA_OUT/STATUS_OUT) by watching tb_state.
 always @(posedge clk) begin
@@ -981,10 +1009,12 @@ always @(posedge clk) begin
 	if (rst) begin
 		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
 		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 2'd0;
-	end else if (TOOLBOX_ENABLE) begin
+		tb_fetch_sec <= 4'd0;
+	end else if (TOOLBOX_ENABLE || CDCHANGER_ENABLE) begin
 		case (tb_state)
 		TBS_IDLE: begin
 			tb_load_w <= 4'd0;
+			tb_fetch_sec <= 4'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
 			if (phase == PHASE_TB) tb_state <= TBS_LOAD;
 		end
 		// write the 10-byte CDB as 5 words (0..4) into the tb buffer
@@ -1011,15 +1041,25 @@ always @(posedge clk) begin
 				tb_status <= tb0_dout;                       // byte 0 = SCSI status
 				tb_len    <= {tb0_dout_next, tb1_dout_next}; // bytes 2,3 = length
 				if ({tb0_dout_next, tb1_dout_next} != 16'd0) begin
-					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_state <= TBS_DATA;
+					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 4'd0; tb_state <= TBS_DATA;
 				end else tb_state <= TBS_RDY;                // status-only
 			end else begin                               // no real handler -> CHECK
 				tb_status <= 8'h02; tb_len <= 16'd0; tb_state <= TBS_RDY;
 			end
-		// data: HPS returns one 512-byte block at words 0..255
+		// data: HPS returns tb_len bytes across ceil(tb_len/512) sectors, one per
+		// LBA (1..N). Each lands at buffer offset tb_fetch_sec*256; fetch the next
+		// until all N are in, then serve linearly (fetch-all-then-serve, so the
+		// Mac-facing DATA_OUT timing stays single-block-identical). §4/§10.
 		TBS_DATA: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
-			if (old_tb_ack & ~tb_ack) tb_state <= TBS_RDY;
+			if (old_tb_ack & ~tb_ack) begin
+				if ((tb_fetch_sec + 4'd1) >= tb_nsec) tb_state <= TBS_RDY;
+				else begin
+					tb_fetch_sec <= tb_fetch_sec + 4'd1;
+					tb_lba_r     <= tb_lba_r + 32'd1;
+					tb_rd_r      <= 1'b1;
+				end
+			end
 		end
 		// round-trip done; the main FSM consumes tb_status/tb_len and leaves
 		TBS_RDY: if (phase != PHASE_TB) tb_state <= TBS_IDLE;
@@ -1278,7 +1318,7 @@ wire [31:0] data_len =
 		 cmd_request_sense?((sense_len < 32'd18) ? sense_len : 32'd18):
 		 cmd_tb_devinfo?tb_devinfo_len:                       // 0xD9 DEVICE INFO
 		 cmd_tb_debug_get?32'd1:                              // 0xD6 get = one flag byte
-		 cmd_tb_fs_in?{16'd0, tb_len}:                        // 0xD0/D1/D2 toolbox DataIn (HPS length)
+		 (cmd_tb_fs_in || cmd_cdc_in)?{16'd0, tb_len}:        // 0xD0/D1/D2 fs + 0xD7/DA CD-changer DataIn (HPS length)
 		 cmd_tb_send_prep?32'd33:                             // 0xD3 SEND PREP: 33-byte filename
 		 cmd_tb_send_data?(cmd[6] ? {15'd0, cmd[6], 9'd0}     // 0xD4 SEND DATA: CDB[6]*512 (block enc),
 		                          : {16'd0, cmd[1], cmd[2]}): //   else legacy u16(CDB[1..2]) byte count
@@ -1384,11 +1424,13 @@ wire [2:0] cmd_group = op_code[7:5];
 // check if a complete command has been received
 wire       cmd_cpl = cmd6_cpl || cmd10_cpl;
 wire       cmd6_cpl = (cmd_group == 3'b000) && (cmd_cnt == 6);
-// BlueSCSI Toolbox vendor commands (0xD0-0xD9, group 110) are 10-byte CDBs.
+// BlueSCSI Toolbox vendor commands (0xD0-0xDA, group 110) are 10-byte CDBs.
 // Decode ONLY this exact range as 10-byte (not the whole vendor group 110) so
 // other group-110 opcodes aren't mis-lengthed (0xC0 EJECT is a 6-byte CDB).
-// docs/BLUESCSI_MISTER_MAIN_PLAN.md, docs/BLUESCSI_HANDOFF.md §1.
-wire       cmd_toolbox_op = (op_code >= 8'hd0) && (op_code <= 8'hd9);
+// 0xDA (CD-changer COUNT CDS) extends the file Toolbox's 0xD0-0xD9 range.
+// docs/BLUESCSI_MISTER_MAIN_PLAN.md, docs/BLUESCSI_HANDOFF.md §1,
+// docs/BLUESCSI_CD_CHANGER_CONTRACT.md §2.
+wire       cmd_toolbox_op = (op_code >= 8'hd0) && (op_code <= 8'hda);
 // Apple CD vendor commands 0xC0-0xCE are ALL 10-byte CDBs (MAME
 // nscsi_cdrom_apple_device::scsi_command_done: command&0xf0==0xc0 -> 10).
 wire       cmd_apple_cd_op = (CDROM != 0) && (op_code[7:4] == 4'hc);
@@ -1513,6 +1555,19 @@ always @(posedge clk) begin
 		tb_debug_flag <= (cmd[2] != 8'd0);
 end
 
+// ----- BlueSCSI Toolbox CD Changer (CDCHANGER_ENABLE; CD target / ID 3) ------
+// 0xD7 LIST CDS + 0xDA COUNT CDS are DataIn HPS round-trips (serve the staged
+// list/count exactly like the file-Toolbox 0xD0/D1/D2). 0xD8 SET NEXT CD is a
+// status-only round-trip: the HPS remaps the CD image slot (VD_CDROM), whose
+// img_mounted pulse drives the SAME media-change the OSD swap uses -- no extra
+// RTL here. All gated on tb_ready so a stock Main (no CD-folder handler mounted
+// on the changer slot) leaves them CHECK. docs/BLUESCSI_CD_CHANGER_CONTRACT.md
+wire       cmd_cdc_list  = CDCHANGER_ENABLE && tb_ready && (op_code == 8'hd7);
+wire       cmd_cdc_count = CDCHANGER_ENABLE && tb_ready && (op_code == 8'hda);
+wire       cmd_cdc_set   = CDCHANGER_ENABLE && tb_ready && (op_code == 8'hd8);
+wire       cmd_cdc_in    = cmd_cdc_list || cmd_cdc_count; // DataIn: serve HPS list/count
+wire       cmd_cdc_tb    = cmd_cdc_in   || cmd_cdc_set;    // any changer op -> HPS round-trip
+
 // valid command in buffer? TODO: check for valid command parameters
 wire  cmd_ok_hd = cmd_read || cmd_write || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_format || cmd_mode_sense ||
@@ -1528,7 +1583,7 @@ wire  cmd_ok_cd = cmd_read || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_request_sense || cmd_cd_eject || cmd_cd_toc || cmd_cd_subq ||
 		  cmd_cd_astat || cmd_cd_actl || cmd_cd_audio_nop ||
 		  cmd_cd_toc43 || cmd_cd_subq43 ||
-		  cmd_cd_prevent || cmd_cd_startstop;
+		  cmd_cd_prevent || cmd_cd_startstop || cmd_cdc_tb;
 
 wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
 
@@ -1713,7 +1768,7 @@ always @(posedge clk) begin
 					// continue according to command
 
 					// these commands return data
-					if(cmd_tb_fs_in) phase <= PHASE_TB;   // toolbox DataIn fs op: HPS round-trip, then serve
+					if(cmd_tb_fs_in || cmd_cdc_tb) phase <= PHASE_TB;   // toolbox fs DataIn OR CD-changer (list/count DataIn + set status-only): HPS round-trip
 						else if(cmd_tb_send_end) phase <= PHASE_TB;       // SEND END: no payload, straight to round-trip
 						else if(cmd_tb_send_pay) phase <= PHASE_DATA_IN;  // SEND PREP/DATA: collect the DataOut payload first
 						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_toc43 || cmd_cd_subq43) phase <= PHASE_DATA_OUT;

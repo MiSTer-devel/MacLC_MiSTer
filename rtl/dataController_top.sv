@@ -121,6 +121,14 @@ module dataController_top(
 	input                   tb_ack,
 	output           [15:0] tb_buff_din,
 
+	// ---- BlueSCSI Toolbox CD Changer block interface (CD target / ID 3) ------
+	input                   cdtb_mounted,
+	output           [31:0] cdtb_lba,
+	output                  cdtb_rd,
+	output                  cdtb_wr,
+	input                   cdtb_ack,
+	output           [15:0] cdtb_buff_din,
+
 	// CD audio PCM (from the SCSI CDROM target's playback engine)
 	output signed    [15:0] cd_snd_l,
 	output signed    [15:0] cd_snd_r,
@@ -429,6 +437,14 @@ module dataController_top(
 		.tb_wr(tb_wr),
 		.tb_ack(tb_ack),
 		.tb_buff_din(tb_buff_din),
+
+		// BlueSCSI Toolbox CD Changer transport pass-through (CD target).
+		.cdtb_mounted(cdtb_mounted),
+		.cdtb_lba(cdtb_lba),
+		.cdtb_rd(cdtb_rd),
+		.cdtb_wr(cdtb_wr),
+		.cdtb_ack(cdtb_ack),
+		.cdtb_buff_din(cdtb_buff_din),
 		.cd_snd_l(cd_snd_l),
 		.cd_snd_r(cd_snd_r),
 

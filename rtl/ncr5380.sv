@@ -88,6 +88,16 @@ module ncr5380
 	input         tb_ack,
 	output [15:0] tb_buff_din,
 
+	// ---- BlueSCSI Toolbox CD Changer block interface (CD target / ID 3) ------
+	// Same transport shape as tb_* above, dedicated to the cdrom_target so it can
+	// enumerate/switch CD images. docs/BLUESCSI_CD_CHANGER_CONTRACT.md
+	input         cdtb_mounted,
+	output [31:0] cdtb_lba,
+	output        cdtb_rd,
+	output        cdtb_wr,
+	input         cdtb_ack,
+	output [15:0] cdtb_buff_din,
+
 	// CD audio PCM from the CDROM target's playback engine
 	output signed [15:0] cd_snd_l,
 	output signed [15:0] cd_snd_r,
@@ -691,7 +701,9 @@ module ncr5380
 	// no longer instantiated). Responds to selection whenever cd_enable —
 	// media-less selection returns the AppleCD no-disc sense, which is how
 	// the driver's insertion poll works.
-	scsi #(.ID(3'd3), .CDROM(1), .RING_LOG(CD_RING_LOG)) cdrom_target
+	// TB_ADDRW(11) = 4 KB tb buffer (8 sectors) so LIST CDS holds the full
+	// 100-entry list in one fetch-all-then-serve pass (§4/§10 of the contract).
+	scsi #(.ID(3'd3), .CDROM(1), .CDCHANGER_ENABLE(1), .TB_ADDRW(11), .RING_LOG(CD_RING_LOG)) cdrom_target
 	(
 		.clk    ( clk ),
 		.rst    ( scsi_rst ),
@@ -747,13 +759,13 @@ module ncr5380
 		.sd_buff_din( cd_sd_buff_din ),
 		.sd_buff_wr( sd_buff_wr & cd_io_ack ),
 
-		// No Toolbox on the CD target.
-		.tb_mounted ( 1'b0 ),
-		.tb_lba     ( ),
-		.tb_rd      ( ),
-		.tb_wr      ( ),
-		.tb_ack     ( 1'b0 ),
-		.tb_buff_din( ),
+		// BlueSCSI Toolbox CD Changer transport (0xD7/D8/DA) -> slot VD_CD_TOOLBOX.
+		.tb_mounted ( cdtb_mounted ),
+		.tb_lba     ( cdtb_lba ),
+		.tb_rd      ( cdtb_rd ),
+		.tb_wr      ( cdtb_wr ),
+		.tb_ack     ( cdtb_ack ),
+		.tb_buff_din( cdtb_buff_din ),
 
 		.dbg_mounted( ),
 		.dbg_phase( ),
