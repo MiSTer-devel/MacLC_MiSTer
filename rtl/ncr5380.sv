@@ -757,7 +757,14 @@ module ncr5380
 		.sd_buff_addr( sd_buff_addr ),
 		.sd_buff_dout( sd_buff_dout ),
 		.sd_buff_din( cd_sd_buff_din ),
-		.sd_buff_wr( sd_buff_wr & cd_io_ack ),
+		// Frame sd_buff_wr by EITHER slot session that fills a buffer inside this
+		// target: cd_io_ack (CD-ROM/CD-audio, slot VD_CDROM) OR cdtb_ack (CD Changer
+		// tb round-trip, slot VD_CD_TOOLBOX). Without the cdtb_ack term every slot-5
+		// fill strobe was blanked, so the tb buffer (tb_hps_wr = sd_buff_wr & tb_ack)
+		// never captured the HPS status/data block -> the core read back its own CDB
+		// -> signature 0x00 != 0xB5 -> boxes. The two slots are serviced disjointly
+		// (one HPS session at a time), so the OR never double-frames. (2026-07-21)
+		.sd_buff_wr( sd_buff_wr & (cd_io_ack | cdtb_ack) ),
 
 		// BlueSCSI Toolbox CD Changer transport (0xD7/D8/DA) -> slot VD_CD_TOOLBOX.
 		.tb_mounted ( cdtb_mounted ),

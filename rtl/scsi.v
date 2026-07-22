@@ -851,13 +851,13 @@ function [7:0] cd_mode_sense_byte;
 endfunction
 
 // Page select: CDROM response, else 0x31 detection page vs. the default.
-wire [7:0] mode_sense_dout       = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt)
+wire [7:0] mode_sense_dout       = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt)       : cd_mode_sense_byte(data_cnt))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt)       : mode_sense_def_dout;
-wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next)
+wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt_next)  : cd_mode_sense_byte(data_cnt_next))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next)  : mode_sense_def_dout_next;
-wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next2)
+wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt_next2) : cd_mode_sense_byte(data_cnt_next2))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next2) : mode_sense_def_dout_next2;
-wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? cd_mode_sense_byte(data_cnt_next3)
+wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt_next3) : cd_mode_sense_byte(data_cnt_next3))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next3) : mode_sense_def_dout_next3;
 
 // Default MODE SENSE(6) response (unchanged; served for every page except 0x31).
@@ -922,7 +922,9 @@ reg [31:0] tb_lba_r;
 reg [7:0]  tb_status;
 reg [15:0] tb_len;
 reg [3:0]  tb_load_w;
-reg [1:0]  tb_settle;
+reg [3:0]  tb_settle;   // status-latch settle for the registered port-B (q_b) reads
+                        // of the status block (word 0 = status/sig, word 1 = length).
+reg [17:0] tb_to;       // tb read-completion watchdog (~8-17 ms); see TBS_STAT.
 reg        old_tb_ack;
 reg [3:0]  tb_fetch_sec;    // which 512B sector the HPS fill is landing (multi-block LIST; TB_ADDRW>8)
 
@@ -956,9 +958,9 @@ wire       tb_col_wr1 = tb_collect && stb_ack &&  data_cnt[0];
 // tb buffer word address, computed at 11b (max = 8 sectors) then sliced to
 // TB_ADDRW. On single-sector targets (TB_ADDRW=8) the high bits are always 0
 // (tb_fetch_sec=0, data_cnt<512), so the slice reproduces the old data_cnt[8:1].
-wire [10:0] tb_b_addr11 = (tb_state == TBS_LOAD) ? {7'd0, tb_load_w}
-                        : tb_collect            ? (11'd8 + {3'd0, data_cnt[8:1]})
-                        :                          data_cnt[11:1];
+wire [10:0] tb_b_addr11 = (tb_state == TBS_LOAD)   ? {7'd0, tb_load_w}
+                        : tb_collect               ? (11'd8 + {3'd0, data_cnt[8:1]})
+                        :                             data_cnt[11:1];
 wire [TB_ADDRW-1:0] tb_b_addr = tb_b_addr11[TB_ADDRW-1:0];
 // HPS fill address: sector tb_fetch_sec at word offset tb_fetch_sec*256, so a
 // multi-sector LIST lands contiguously (LBA 1+k -> words k*256..k*256+255).
@@ -1008,7 +1010,7 @@ always @(posedge clk) begin
 	old_tb_ack <= tb_ack;
 	if (rst) begin
 		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
-		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 2'd0;
+		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
 		tb_fetch_sec <= 4'd0;
 	end else if (TOOLBOX_ENABLE || CDCHANGER_ENABLE) begin
 		case (tb_state)
@@ -1026,38 +1028,48 @@ always @(posedge clk) begin
 		TBS_REQ: begin
 			if (tb_ack) tb_wr_r <= 1'b0;
 			if (old_tb_ack & ~tb_ack) begin
-				tb_rd_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_STAT;
+				tb_rd_r <= 1'b1; tb_lba_r <= 32'd0; tb_to <= 18'd0; tb_state <= TBS_STAT;
 			end
 		end
-		// status: HPS returns {status, 0xB5, len_hi, len_lo} at buffer words 0/1
+		// status: HPS returns {status, 0xB5, len_hi, len_lo} at buffer words 0/1.
+		// Proceed on the read-completion ack-fall OR a watchdog timeout: on HW the
+		// tb READ ack is not observed by the core (the write ack is, with identical
+		// code; and the file-Toolbox transport this rides on was never HW-validated).
+		// The HPS has already filled the buffer by the timeout, so force-latch the
+		// status block. Same watchdog on TBS_DATA. (2026-07-21)
 		TBS_STAT: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
-			if (old_tb_ack & ~tb_ack) begin tb_settle <= 2'd2; tb_state <= TBS_LATCH; end
+			tb_to <= tb_to + 1'b1;
+			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin tb_settle <= 4'd8; tb_state <= TBS_LATCH; end
 		end
-		// let the registered buffer reads (addr 0/1, data_cnt=0) settle, then latch
+		// buffer reads for addr 0/1 are registered; let them settle after the
+		// force-latch, then read the status block: word 0 = {status, 0xB5 sig},
+		// word 1 = {len_hi, len_lo}. Signature present -> adopt status+length and
+		// (if length>0) fetch the data sector(s); absent -> no handler, CHECK.
 		TBS_LATCH:
-			if (tb_settle != 2'd0) tb_settle <= tb_settle - 1'b1;
+			if (tb_settle != 4'd0) tb_settle <= tb_settle - 1'b1;
 			else if (tb1_dout == 8'hb5) begin            // signature ok (byte 1)
 				tb_status <= tb0_dout;                       // byte 0 = SCSI status
 				tb_len    <= {tb0_dout_next, tb1_dout_next}; // bytes 2,3 = length
 				if ({tb0_dout_next, tb1_dout_next} != 16'd0) begin
-					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 4'd0; tb_state <= TBS_DATA;
+					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 4'd0; tb_to <= 18'd0; tb_state <= TBS_DATA;
 				end else tb_state <= TBS_RDY;                // status-only
 			end else begin                               // no real handler -> CHECK
 				tb_status <= 8'h02; tb_len <= 16'd0; tb_state <= TBS_RDY;
 			end
 		// data: HPS returns tb_len bytes across ceil(tb_len/512) sectors, one per
 		// LBA (1..N). Each lands at buffer offset tb_fetch_sec*256; fetch the next
-		// until all N are in, then serve linearly (fetch-all-then-serve, so the
-		// Mac-facing DATA_OUT timing stays single-block-identical). §4/§10.
+		// until all N are in, then serve linearly. Same read-ack watchdog as TBS_STAT.
 		TBS_DATA: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
-			if (old_tb_ack & ~tb_ack) begin
+			tb_to <= tb_to + 1'b1;
+			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
 				if ((tb_fetch_sec + 4'd1) >= tb_nsec) tb_state <= TBS_RDY;
 				else begin
 					tb_fetch_sec <= tb_fetch_sec + 4'd1;
 					tb_lba_r     <= tb_lba_r + 32'd1;
 					tb_rd_r      <= 1'b1;
+					tb_to        <= 18'd0;
 				end
 			end
 		end
@@ -1268,6 +1280,14 @@ wire [31:0] sense_len = (tlen == 16'd256) ? 32'd4 : {16'd0, tlen};
 // are <<2-scaled at latch time.
 localparam [31:0] INQUIRY_LEN = (CDROM != 0) ? 32'd54 : 32'd36;
 wire        cd_ms30    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h30);
+// CD-changer detection: serve the BlueSCSI Toolbox page-0x31 magic on the CD
+// target so a Toolbox client (MacAtrium) recognizes it as a CD changer (its probe
+// = MODE SENSE page 0x31 magic + INQUIRY CD-ROM). UNGATED (CDCHANGER_ENABLE, not
+// tb_ready): detection works standalone before the HPS handler lands; MacAtrium
+// tolerates the follow-up LIST/SET CHECK gracefully. Only the explicit page-0x31
+// request is affected — the AppleCD driver's page 0x30 / default MODE SENSE is
+// untouched. docs/BLUESCSI_CD_CHANGER_CONTRACT.md
+wire        cd_ms31    = CDCHANGER_ENABLE && cmd_mode_sense && (cmd[2][5:0] == 6'h31);
 // ops 00/01: MAME serves a fixed 4; clamp to the allocation as well so a
 // short alloc can never leave unserved bytes holding REQ (the 2026-06-10
 // alloc-overserve wedge class). Identical to MAME for the observed alloc=4.
@@ -1310,7 +1330,8 @@ wire [31:0] data_len =
 		 cmd_cd_astat?32'd6:              // AUDIO STATUS: fixed 6 bytes
 		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
 		 cmd_inquiry?((alloc_len < INQUIRY_LEN) ? alloc_len : INQUIRY_LEN):
-		 cmd_mode_sense?((CDROM != 0) ? (cd_ms30 ? ((alloc_len < 32'd36) ? alloc_len : 32'd36)
+		 cmd_mode_sense?((CDROM != 0) ? (cd_ms31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
+		                               : cd_ms30 ? ((alloc_len < 32'd36) ? alloc_len : 32'd36)
 		                                         : ((alloc_len < 32'd12) ? alloc_len : 32'd12))
 		                              : (mode_sense_p31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
 		                                                : ((alloc_len < 32'd12) ? alloc_len : 32'd12))):

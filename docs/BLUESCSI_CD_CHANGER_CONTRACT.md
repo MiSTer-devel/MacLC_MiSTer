@@ -102,6 +102,30 @@ No data phase. `CDB[1]` = the index from a prior LIST. HPS remaps `VD_CDROM` to 
 image and triggers the media change (§6). Out-of-range index or remap failure →
 CHECK. GOOD once the new image is mounted.
 
+### 2.4 Client detection — MODE SENSE page 0x31 + INQUIRY CD-ROM (LOAD-BEARING)
+A Toolbox client finds the changer **before** issuing any vendor opcode, by probing
+each SCSI ID with a *standard* command pair (verified against MacAtrium's
+`toolbox_probe_id`, and the same as the BlueSCSI app):
+1. **MODE SENSE(6) page 0x31** (`0x1A`, `CDB[2]=0x31`, alloc 64) → the response must
+   contain the magic prefix **`BlueSCSI is the BEST`** anywhere in the returned bytes.
+2. **INQUIRY** → peripheral device type must be **`0x05` (CD-ROM)** — this is how the
+   client tells the CD changer apart from the file-Toolbox HDD (which also carries the
+   0x31 magic). Without it, `LIST/SET` would land on the disk → "Unknown command D7h".
+
+So the **CD target must serve BOTH**: INQUIRY PDT `0x05` (already does) **and** the
+page-0x31 magic. The RTL adds `cd_ms31` (`CDCHANGER_ENABLE && MODE SENSE page 0x31`)
+which serves the existing `mode_sense_p31_byte` (56-byte magic) on the CD target — only
+for an explicit page-0x31 request; the AppleCD driver's page 0x30 / default MODE SENSE
+is untouched. **Gating (current): ungated** (`CDCHANGER_ENABLE`, not `cdtb_ready`) so
+detection works standalone before the HPS handler lands — MacAtrium tolerates the
+follow-up `LIST/SET` CHECK gracefully (`toolbox_list_cds` returns 0). For a **release**,
+revisit gating on `cdtb_ready` (the §4a "advertise only when serviceable" rule) once the
+stock BlueSCSI file app is confirmed not to engage a CD's 0x31 advert.
+
+> **Without page 0x31 the whole feature is invisible** — this was the "No BlueSCSI CD
+> device found" gap (2026-07-21): the CD answered INQUIRY as a CD-ROM but a CDROM
+> target's MODE SENSE always returned CD mode pages, never the magic.
+
 ## 3. Enumeration & filtering policy (HPS-side, in `maclc_cd`)
 
 Real BlueSCSI does **zero** filtering ("no universal name for a CD image"). We are
