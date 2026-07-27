@@ -48,7 +48,7 @@ set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
-set_global_assignment -name SEED 13
+set_global_assignment -name SEED 5
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -89,6 +89,12 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # MacLC.sv on the ASC sample + a sample-tick counter, to confirm on hardware
 # whether audio data is moving (counter advances) or frozen. Keep COMMENTED for release.
 # set_global_assignment -name VERILOG_MACRO "USE_AUDIO_ISSP=1"
+
+# DEBUG (JTAG): uncomment to build the main In-System Sources & Probes deck in
+# MacLC.sv (CDA0-4 CD engine/target, PSDT/PSDS/PSD2/PSD3 pseudo-DMA, and the
+# dbg_probes SCSI/CPU/video deck). Read with scripts/read_probes.sh / *.tcl.
+# Keep COMMENTED for release — release RBFs ship without the probe deck.
+# set_global_assignment -name VERILOG_MACRO "USE_DBG_PROBES=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"

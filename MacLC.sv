@@ -60,8 +60,8 @@ module emu
 		"F1,DSKIMG,Mount Pri Floppy;",
 		"F2,DSKIMG,Mount Sec Floppy;",
 		"-;",
-		"SC0,IMGVHDHDA,Mount SCSI-6;",
-		"SC1,IMGVHDHDA,Mount SCSI-5;",
+		"SC0,IMGVHDHDA,Mount SCSI-0;",
+		"SC1,IMGVHDHDA,Mount SCSI-1;",
 		"SC2,NVR,Mount PRAM;",
 		"-;",
 		// CD-ROM (SCSI ID 3). ISO/TOAST (TO* matches .toast) are raw
@@ -155,7 +155,8 @@ module emu
 	localparam VD_PRAM    = 2;         // PRAM NVRAM save image -> hps_io slot 2
 	localparam VD_TOOLBOX = 3;         // BlueSCSI Toolbox shared folder -> hps_io slot 3
 	localparam VD_CDROM   = 4;         // CD-ROM image (SCSI ID 3) -> hps_io slot 4
-	localparam VDNUM      = 5;         // total hps_io block devices
+	localparam VD_CD_TOOLBOX = 5;      // BlueSCSI Toolbox CD Changer control -> hps_io slot 5
+	localparam VDNUM      = 6;         // total hps_io block devices
 
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
@@ -199,6 +200,19 @@ module emu
 	assign sd_buff_din[VD_TOOLBOX] = tb_buff_din;
 	wire        tb_ack     = sd_ack[VD_TOOLBOX];
 	wire        tb_mounted = img_mounted[VD_TOOLBOX];
+
+	// BlueSCSI Toolbox CD Changer control slot (5): control-only round-trip for
+	// the CD target's 0xD7/D8/DA. No CONF_STR mount entry — the Main fork mounts
+	// it when the CD-folder handler is active. docs/BLUESCSI_CD_CHANGER_CONTRACT.md
+	wire [31:0] cdtb_lba;
+	wire        cdtb_rd, cdtb_wr;
+	wire [15:0] cdtb_buff_din;
+	assign sd_lba[VD_CD_TOOLBOX]      = cdtb_lba;
+	assign sd_rd [VD_CD_TOOLBOX]      = cdtb_rd;
+	assign sd_wr [VD_CD_TOOLBOX]      = cdtb_wr;
+	assign sd_buff_din[VD_CD_TOOLBOX] = cdtb_buff_din;
+	wire        cdtb_ack     = sd_ack[VD_CD_TOOLBOX];
+	wire        cdtb_mounted = img_mounted[VD_CD_TOOLBOX];
 
 	// CD-ROM (SCSI ID 3) dedicated slot (4): read-only block device driven by
 	// the cdrom target through dataController. cd_wr is tied off — the target
@@ -1145,6 +1159,9 @@ module emu
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
+	// DEBUG-ONLY: gated behind USE_DBG_PROBES (set in MacLC.qsf for a debug build,
+	// commented out for release). Release RBFs ship without the JTAG probe deck.
+`ifdef USE_DBG_PROBES
 	// PSDT: pseudo-DMA stall timeout visibility — {fires[7:0], max_stall[22:0]}
 	// CDA0/CDA1: CD-audio engine + CD target visibility (2026-07-17, the
 	// "one track / PLAY fails" hunt). Decode:
@@ -1244,6 +1261,7 @@ module emu
 		.pvia_video_config(pvia_video_config),
 		.v8_vblank(v8_vblank_s)
 	);
+`endif // USE_DBG_PROBES
 
 	maclc_v8_video v8_video(
 		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock
@@ -1485,6 +1503,14 @@ module emu
 		.tb_wr(tb_wr),
 		.tb_ack(tb_ack),
 		.tb_buff_din(tb_buff_din),
+
+		// BlueSCSI Toolbox CD Changer transport (slot VD_CD_TOOLBOX).
+		.cdtb_mounted(cdtb_mounted),
+		.cdtb_lba(cdtb_lba),
+		.cdtb_rd(cdtb_rd),
+		.cdtb_wr(cdtb_wr),
+		.cdtb_ack(cdtb_ack),
+		.cdtb_buff_din(cdtb_buff_din),
 		.cd_snd_l(cd_snd_l),
 		.cd_snd_r(cd_snd_r),
 
