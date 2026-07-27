@@ -1159,6 +1159,9 @@ module emu
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
+	// DEBUG-ONLY: gated behind USE_DBG_PROBES (set in MacLC.qsf for a debug build,
+	// commented out for release). Release RBFs ship without the JTAG probe deck.
+`ifdef USE_DBG_PROBES
 	// PSDT: pseudo-DMA stall timeout visibility — {fires[7:0], max_stall[22:0]}
 	// CDA0/CDA1: CD-audio engine + CD target visibility (2026-07-17, the
 	// "one track / PLAY fails" hunt). Decode:
@@ -1258,6 +1261,7 @@ module emu
 		.pvia_video_config(pvia_video_config),
 		.v8_vblank(v8_vblank_s)
 	);
+`endif // USE_DBG_PROBES
 
 	maclc_v8_video v8_video(
 		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock

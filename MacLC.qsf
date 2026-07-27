@@ -90,6 +90,12 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # whether audio data is moving (counter advances) or frozen. Keep COMMENTED for release.
 # set_global_assignment -name VERILOG_MACRO "USE_AUDIO_ISSP=1"
 
+# DEBUG (JTAG): uncomment to build the main In-System Sources & Probes deck in
+# MacLC.sv (CDA0-4 CD engine/target, PSDT/PSDS/PSD2/PSD3 pseudo-DMA, and the
+# dbg_probes SCSI/CPU/video deck). Read with scripts/read_probes.sh / *.tcl.
+# Keep COMMENTED for release — release RBFs ship without the probe deck.
+# set_global_assignment -name VERILOG_MACRO "USE_DBG_PROBES=1"
+
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"
 set_global_assignment -name DEVICE 5CSEBA6U23I7

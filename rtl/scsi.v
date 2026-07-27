@@ -544,18 +544,6 @@ wire [7:0] inquiry_dout_next3 = inquiry_byte(data_cnt_next3);
 // been mounted (drive present, no disc), so the capacity bytes must not be X.
 reg [31:0] capacity = 32'd0;
 reg        mounted = 0;
-// CD MEDIA-CHANGE UNIT ATTENTION one-shot. Set when the CD image is remapped
-// UNDER a disc the guest still believes is loaded — i.e. img_mounted pulses while
-// already `mounted` (a BlueSCSI CD-changer SET NEXT CD, or an OSD Mount-CD swap
-// with no eject first). The System 7 AppleCD driver does NOT poll a drive it
-// thinks is loaded, so a bare remap is invisible (HW 2026-07-27: disc->disc swap
-// left `mounted` high the whole time and the guest never re-read). Instead we arm
-// a standard media-change UNIT ATTENTION (sense 6 / ASC 0x28) that the driver's
-// next command picks up, forcing a TOC re-read + remount of the NEW disc. This
-// makes disc->disc swapping work for ANY changer client (MacAtrium, the stock
-// BlueSCSI app, OSD) with no client-side eject. First insert (mounted 0->1) is
-// NOT a change; folds away on disk targets. Retired by cd_ua_clear when delivered.
-reg        cd_media_changed = 1'b0;
 always @(posedge clk) begin
 	if (img_mounted) begin
 		if (|img_blocks) begin
@@ -564,11 +552,6 @@ always @(posedge clk) begin
 			capacity <= (CDROM != 0) ? ({2'b00, img_blocks[31:2]} - 1'd1)
 			                         : (img_blocks - 1'd1);
 			if (!mounted) $display("Image mounted on target %d, size: %d", ID, img_blocks);
-			// Remap while ALREADY mounted == media change -> arm the UA so the
-			// guest re-examines. A fresh insert into an empty drive is mounted
-			// 0->1 (the driver's own insertion poll catches that) and must NOT
-			// arm the UA, so this is gated on the prior `mounted`.
-			if ((CDROM != 0) && mounted) cd_media_changed <= 1'b1;
 			mounted <= 1;
 		end else
 			mounted <= 0;
@@ -579,10 +562,6 @@ always @(posedge clk) begin
 		// driver's insertion poll is waiting for. The HPS-side image stays
 		// mounted — harmless, the target simply reports no-disc until then.
 		mounted <= 0;
-	else if (cd_ua_clear)
-		// one-shot: retire the UA once the guest has been told (cd_ua reported
-		// on its next media-dependent command).
-		cd_media_changed <= 1'b0;
 end
 
 wire [7:0] read_capacity_dout =
@@ -1664,15 +1643,6 @@ wire  cmd_cd_eject_any = cmd_cd_eject ||
                          (cmd_cd_startstop && cmd[4][1] && !cmd[4][0]);
 wire  cd_eject_pulse = cd_new_cmd && cmd_cd_eject_any && !cd_prevent;
 
-// Media-change UNIT ATTENTION (armed by cd_media_changed at the `mounted` reg on a
-// remap-under-present-disc). Reported on the next MEDIA-DEPENDENT command after the
-// swap: that command CHECKs with sense 6/28, the driver REQUEST SENSEs it, sees
-// "medium may have changed", and re-reads the TOC -> the new disc mounts. INQUIRY /
-// REQUEST SENSE are not media-dependent so they still pass (UA persists until a
-// media command retires it). One-shot: cd_ua_clear fires on delivery.
-wire  cd_ua       = (CDROM != 0) && cd_media_changed && cd_needs_media;
-wire  cd_ua_clear = cd_ua && cd_new_cmd;
-
 // REQUEST SENSE state (CDROM only): key/ASC latched when a command CHECKs,
 // cleared by the next successful non-REQUEST-SENSE command (SCSI-1 semantics).
 reg [3:0] cd_sense_key = 4'd0;
@@ -1722,9 +1692,6 @@ always @(posedge clk) begin
 		if (!cmd_ok) begin
 			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
 			cd_sense_asc <= 8'h20; // invalid operation code
-		end else if (cd_ua) begin
-			cd_sense_key <= 4'h6;  // UNIT ATTENTION
-			cd_sense_asc <= 8'h28; // NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED
 		end else if (cd_no_media) begin
 			cd_sense_key <= 4'h2;  // NOT READY
 			cd_sense_asc <= 8'hb0; // AppleCD vendor "no disc"
@@ -1812,9 +1779,8 @@ always @(posedge clk) begin
 				$display("New command on target %d: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", ID, cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5], cmd[6], cmd[7], cmd[8], cmd[9]);
 				// is this a supported and valid command?
 				// (CDROM: media-dependent commands CHECK with the no-disc
-				// sense while unmounted; a prevent-blocked EJECT CHECKs too;
-				// cd_ua CHECKs the first media command after a disc swap.)
-				if(cmd_ok && !cd_no_media && !cd_audio_read_rej && !cd_ua) begin
+				// sense while unmounted; a prevent-blocked EJECT CHECKs too.)
+				if(cmd_ok && !cd_no_media && !cd_audio_read_rej) begin
 					// yes, continue
 					status <= (cmd_cd_eject_any && cd_prevent) ? `STATUS_CHECK_CONDITION : `STATUS_OK;
 
