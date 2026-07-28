@@ -113,7 +113,11 @@ module cd_audio #(
 	//   [14:10]=mst [16:15]=pstate [18:17]=fst
 	//   [26:19]=toc_fetch_cnt (M_ACQ_REQ fires, wraps)
 	//   [31:27]=frame_fetch_cnt[4:0] (F_REQ fires, wraps)
-	output     [31:0] dbg_cda0
+	output     [31:0] dbg_cda0,
+
+	// Underrun probe word (JTAG CDUR): [31:16]=starvation entries (wraps),
+	// [15:0]=starved clk/256 (7.9 us units at 32.5 MHz clk).
+	output     [31:0] dbg_cdur
 );
 
 // HPS window contract (Main_MiSTer support/maclc/maclc_cd.h)
@@ -1286,6 +1290,24 @@ always @(posedge clk) begin
 		end
 	end
 end
+
+// Starvation forensics (CDUR): playing, but the half-frame the sample engine
+// needs has not been delivered, so the output freezes at its last value.
+// HDMI-capture forensics of the 07-20 build measured ~5% of music time in
+// 0.4-4 ms freezes — exactly this condition (the 2-half ping-pong affords
+// 13.3 ms of slack and HPS serving intermittently exceeds it), and it also
+// accounts for the CDS meter's 41.8k changes/s (44.1k x 0.95). Counters
+// wrap; readers diff two snapshots over a known interval.
+reg [15:0] ur_cnt  = 16'd0;
+reg [23:0] ur_clks = 24'd0;
+reg        ur_d    = 1'b0;
+wire       ur_now  = (pstate == ST_PLAY) && !fr_valid[fr_half_r];
+always @(posedge clk) begin
+	ur_d <= ur_now;
+	if (ur_now && !ur_d) ur_cnt  <= ur_cnt  + 16'd1;
+	if (ur_now)          ur_clks <= ur_clks + 24'd1;
+end
+assign dbg_cdur = {ur_cnt, ur_clks[23:8]};
 
 endmodule
 

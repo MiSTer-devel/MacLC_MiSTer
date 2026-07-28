@@ -76,6 +76,7 @@ module scsi
 output [31:0] dbg_cda3,     // JTAG CDA3: last play-class CDB {op, cdb3, cdb4, cdb5}
 output [31:0] dbg_cda4,     // JTAG CDA4: last play-class CDB {cdb1, cdb6, cdb7, cdb8}
 	output [31:0] dbg_cda1,     // JTAG CDA1: {toc_rdy,no_media,mounted,ok, sense_asc, sense_key, cmd_cnt, last_op}
+	output [31:0] dbg_cdur,     // JTAG CDUR: cd_audio underrun counters (see cd_audio.sv)
 
 	// ===== BlueSCSI Toolbox dedicated block interface (TOOLBOX_ENABLE only) ====
 	// Isolated from the disk block interface above so the disk read/write path is
@@ -1210,7 +1211,8 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.toc2_len(ca_t2_len),
 		.disc_audio(ca_disc_audio),
 		.snd_l(cd_snd_l), .snd_r(cd_snd_r),
-		.dbg_cda0(dbg_cda0)
+		.dbg_cda0(dbg_cda0),
+		.dbg_cdur(dbg_cdur)
 	);
 end else begin : g_no_cd_audio
 	assign ca_io_active = 1'b0;
@@ -1234,6 +1236,7 @@ end else begin : g_no_cd_audio
 	assign cd_snd_l = 16'sd0;
 	assign cd_snd_r = 16'sd0;
 	assign dbg_cda0 = 32'd0;
+	assign dbg_cdur = 32'd0;
 end endgenerate
 
 reg  stb_ack;

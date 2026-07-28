@@ -700,6 +700,7 @@ module emu
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
 	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
+	wire [31:0] dbg_cdur_w;
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
 
@@ -1198,6 +1199,15 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_cda4 (.probe(dbg_cda4_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
+	// CDUR: cd_audio delivery-starvation counters (2026-07-28, the "scratchy /
+	// not CD quality" hunt). [31:16]=starvation entries (wraps), [15:0]=starved
+	// clk/256 (7.9 us units). Healthy playback: both frozen. The 07-20 HDMI
+	// capture measured ~5% starvation duty = CDS 41.8k/s, freezes of 0.4-4 ms.
+	altsource_probe #(
+		.instance_id ("CDUR"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_cdur (.probe(dbg_cdur_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
 	altsource_probe #(
 		.instance_id ("PSDT"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
@@ -1473,6 +1483,7 @@ module emu
 		.dbg_cda2(dbg_cda2_w),
 		.dbg_cda3(dbg_cda3_w),
 		.dbg_cda4(dbg_cda4_w),
+		.dbg_cdur(dbg_cdur_w),
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
 		.selectSCC(selectSCC),
