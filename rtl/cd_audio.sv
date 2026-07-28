@@ -1258,6 +1258,15 @@ always @(posedge clk) begin
 end
 
 // Interpolated output stage — the only driver of snd_l/snd_r.
+// The output register commits only every 8th clk (246 ns hold, ~92 points
+// per 44.1 kHz sample): sys/audio_out.sv's clk_audio pickup is a STABILITY
+// FILTER — two consecutive 24.576 MHz captures must be EQUAL before a value
+// is accepted (audio_out.sv "if(cl2 == cl1)") — so a bus that moves every
+// clk_sys is rejected outright: the framework freezes through any fast
+// segment and jumps where the ramp flattens (= the "scratchy, sometimes
+// muffled" report on the every-clk version of this stage, 07-28 evening).
+// The 8-clk hold spans ~6 clk_audio captures, so every step is accepted,
+// while the stair-step imaging the interpolation exists to kill stays gone.
 wire        [15:0] seg_f  = frac16[16] ? 16'hFFFF : frac16[15:0];
 wire signed [16:0] seg_dl = {snd_l_t[15], snd_l_t} - {snd_l_p[15], snd_l_p};
 wire signed [16:0] seg_dr = {snd_r_t[15], snd_r_t} - {snd_r_p[15], snd_r_p};
@@ -1265,12 +1274,16 @@ wire signed [33:0] seg_ml = seg_dl * $signed({1'b0, seg_f});
 wire signed [33:0] seg_mr = seg_dr * $signed({1'b0, seg_f});
 wire signed [16:0] sum_l  = {snd_l_p[15], snd_l_p} + $signed(seg_ml[32:16]);
 wire signed [16:0] sum_r  = {snd_r_p[15], snd_r_p} + $signed(seg_mr[32:16]);
+reg  [2:0] odiv;
 always @(posedge clk) begin
 	if (rst || pstate != ST_PLAY) begin
-		snd_l <= 0; snd_r <= 0;
+		snd_l <= 0; snd_r <= 0; odiv <= 0;
 	end else begin
-		snd_l <= sum_l[15:0];
-		snd_r <= sum_r[15:0];
+		odiv <= odiv + 3'd1;
+		if (odiv == 3'd0) begin
+			snd_l <= sum_l[15:0];
+			snd_r <= sum_r[15:0];
+		end
 	end
 end
 
