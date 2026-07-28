@@ -1327,7 +1327,9 @@ module emu
 		// odd regs alias onto the even reg below them. Reconstruct the real A0
 		// from tg68_a[0], exactly like the SWIM/IWM instance does.
 		.addr({cpuAddr[11:1], tg68_a[0]}),
-		.data_in(cpuDataOut[7:0]),
+		// Full 16-bit write bus: the FIFO must see BOTH byte lanes so MOVE.W/
+		// MOVE.L fills land every sample (see the fifo_pend note in rtl/asc.sv).
+		.data_in(cpuDataOut),
 		.data_out(asc_data_out),
 		.we(!_cpuRW && cpuBusControl),
 		.cpu_as_n(_cpuAS),
@@ -1377,6 +1379,39 @@ module emu
 		.enable_metastability    ("NO")
 	) u_aud_issp (
 		.probe  (aud_probe_bus),
+		.source ()
+	);
+
+	// CD-audio cadence probe (instance "CDS") — for the "CD audio sounds like
+	// half quality / distorted" report. Free-running wrap counters of VALUE
+	// CHANGES on the CD engine's PCM outputs; read twice a known interval
+	// apart (scripts/cd_meters.tcl) and diff mod 2^16:
+	//   ~44_100 changes/s during music  -> full-rate content reaches the mixer;
+	//     the whole digital path (HPS serving, fetch, sample engine) is
+	//     exonerated and the loss is downstream (mix gain / 48 kHz ZOH
+	//     resample in sys_top / analog out).
+	//   ~22_050/s -> literally half-rate content (duplicated samples): defect
+	//     in the serving/engine path.
+	//   Far lower + audible stutter -> underruns (frame fetch starving).
+	reg [15:0] cdl_chg_cnt = 16'd0, cdr_chg_cnt = 16'd0;
+	reg signed [15:0] cdl_prev = 16'sd0, cdr_prev = 16'sd0;
+	always @(posedge clk_sys) begin
+		cdl_prev <= cd_snd_l;
+		cdr_prev <= cd_snd_r;
+		if (cd_snd_l != cdl_prev) cdl_chg_cnt <= cdl_chg_cnt + 16'd1;
+		if (cd_snd_r != cdr_prev) cdr_chg_cnt <= cdr_chg_cnt + 16'd1;
+	end
+	wire [31:0] cds_probe_bus = { cdl_chg_cnt, cdr_chg_cnt };
+	altsource_probe #(
+		.sld_auto_instance_index ("YES"),
+		.sld_instance_index      (0),
+		.instance_id             ("CDS"),
+		.probe_width             (32),
+		.source_width            (0),
+		.source_initial_value    ("0"),
+		.enable_metastability    ("NO")
+	) u_cds_issp (
+		.probe  (cds_probe_bus),
 		.source ()
 	);
 `endif
