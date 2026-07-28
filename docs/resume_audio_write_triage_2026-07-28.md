@@ -7,9 +7,58 @@ root-caused and fixed (HW-unvalidated), one is instrumented but unmeasured.
 
 | # | Report | Status |
 |---|---|---|
-| 1 | CD audio "not 44.1 kHz quality, distorted, sounds ~half" | **Instrumented, unmeasured.** Digital path exonerated by inspection; needs the CDS meter reading with a track playing |
-| 2 | Some games play audio ~2x fast (Reader Rabbit 2; TIM3 "MIDI"; POP fine) | **Root-caused + fixed** `ebf605e`, HW-unvalidated |
-| 3 | TIM3 (The Incredible Machine 3) loads extremely slowly; install reports "files may be damaged" | **Corruption root-caused + fixed** `17f5a85` (HW-unvalidated). General slowness NOT explained |
+| 1 | CD audio "not 44.1 kHz quality, distorted, sounds ~half" | **Digital path EXONERATED on HW 07-28 pm**: CDS meter ~41.8k changes/s sustained both channels during playback (full-rate class; 22.05k = halved would have been the defect). Remaining suspects downstream: half-gain CD mix (`MacLC.sv` ~597) + sys 48 kHz ZOH resample (fix = core-side gain + interpolating resampler; `sys/` untouchable) |
+| 2 | Some games play audio ~2x fast (Reader Rabbit 2; TIM3 "MIDI"; POP fine) | **VALIDATED on HW 07-28 pm** — user ears: RR2 music normal speed on build 91bfb2fa (`ebf605e`) |
+| 3 | TIM3 (The Incredible Machine 3) loads extremely slowly; install reports "files may be damaged" | **Corruption root-caused + fixed** `17f5a85` (HW-unvalidated — needs fresh install test after volume repair). General slowness NOT explained |
+
+## 07-28 pm validation session addenda
+
+- **TIM3-launch wedge captured live** (pre-reset): CPU spinning forever in the
+  ROM's AuxWin-list walk ($A18A3A-46, `cmpa.l 4(a0),a3` vs AuxWinHead $CD0.w,
+  i.e. DisposeWindow on a circularized/corrupt aux-window list). SCSI fully
+  idle, video timing alive, vram_wr frozen. Verdict: guest heap/list
+  corruption from launching the KNOWN-DAMAGED pre-fix TIM3 install — not a
+  core hang. Full dump: `scratch/wedge_dump1.log`, reader
+  `scratch/wedge_dump.tcl` (content-selects the chain by PIFA).
+- **CUE-at-boot-attach did NOT hang this boot**: 13:51 reload came up with
+  `CD3/TIM_3-mac.CUE` attached from config and booted clean to MacAtrium.
+  The open "CUE/CHD-at-boot-attach hang" issue did not reproduce under
+  91bfb2fa (one data point, not closure).
+- **Volume layout correction**: there is ONE hda (`Mac68KColorGames_v1.hda` =
+  volume "MacAtrium_Sys", 690 MB, 60 MB free) carrying System Folders 6.0.8 /
+  7.1 (MacAtrium boot) / 7.5.5 / 7.6.1 + System Picker + all games. The
+  damaged-catalog findings apply to THIS (boot) volume — Disk First Aid before
+  the reinstall test.
+- The 7.1 Apple-menu "AppleCD Audio Player" alias is broken (opens a 7.6.1
+  desktop-printing readme via SimpleText). Real app:
+  `Apple Extras/AppleCD Audio Player/AppleCD Audio Player`.
+
+## Guest-driving crib (07-28 pm, supersedes mouse notes)
+
+- **Remote ws/HTTP mouse buttons never reach the guest** (moves do; verb is
+  `mouseBtn:click`, and even that dies in Main's input path for buttons —
+  clicks via the Remote web UI don't land either). Keyboard: HTTP
+  `keyboard-raw/{code}` and ws `kbdRawDown/kbdRawUp` (chords: 56=LAlt=Cmd)
+  both reach the guest.
+- **Working click/drag path: inject raw `input_event` structs into the
+  PHYSICAL mouse node** (`/dev/input/event3`, XING WEI) over ssh via
+  busybox printf octal escapes. 16 B/event {8B zero time, u16 type, u16
+  code, s32 value}; EV_REL=2 (REL_X=0/REL_Y=1), EV_KEY=1 BTN_LEFT=0x110,
+  SYN=16 zero bytes. Writes must be 16-byte multiples; **avoid value bytes
+  = 0x0A** (busybox printf line-buffers and splits the write -> EINVAL).
+- **Core mouse path clamps accumulated delta per poll** — burst moves
+  collapse (this was the whole ws-mouse attenuation mystery). Rule:
+  **<=2-3 px per event spaced ~25-30 ms = exact 1:1**; >=5 px steps hit Mac
+  acceleration (~2x). Button hold persists across ssh commands — press,
+  drag, screenshot-verify the menu highlight at leisure, then release.
+  System 7 menus fully drivable this way.
+- MacAtrium Quick-Launch (ESC): Settings / Status / CD Library / Toolbox
+  Shared Files / Show Finder / Exit to Finder / System Folder Chooser /
+  Restart / Shut Down. "Show Finder" keeps MacAtrium resident. RR2 quit
+  dialog answers to the `y` key.
+- OSD is NOT composited into screenshots (drove blind-OSD attempts astray;
+  use `load_core` via `/dev/MiSTer_cmd` for a deterministic guest reset —
+  config re-attaches mounts).
 
 ## What is on the hardware right now (.143)
 
