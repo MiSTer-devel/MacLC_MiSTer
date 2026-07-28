@@ -591,13 +591,17 @@ module emu
 	end
 
 	// ASC samples drive AUDIO_L/R, with CD audio (SCSI CD-ROM playback
-	// engine) mixed in at half gain, saturating. cd_snd_* are silent
-	// (exact zeros) whenever the drive isn't playing.
+	// engine) mixed in at full gain, saturating — the real LC sums the
+	// drive's line out with the DAC at unity, and the previous half-gain
+	// mix was the "CD sounds half as loud" report (07-28). cd_snd_* are
+	// silent (exact zeros) whenever the drive isn't playing, and are
+	// linearly interpolated inside cd_audio.sv so the sys/audio_out 48 kHz
+	// pickup doesn't add stair-step imaging.
 	wire signed [15:0] cd_snd_l, cd_snd_r;
 	wire signed [16:0] audio_mix_l = {asc_sample_l[15], asc_sample_l}
-	                               + {{2{cd_snd_l[15]}}, cd_snd_l[15:1]};
+	                               + {cd_snd_l[15], cd_snd_l};
 	wire signed [16:0] audio_mix_r = {asc_sample_r[15], asc_sample_r}
-	                               + {{2{cd_snd_r[15]}}, cd_snd_r[15:1]};
+	                               + {cd_snd_r[15], cd_snd_r};
 	assign AUDIO_L = (audio_mix_l > 17'sd32767)  ? 16'sd32767 :
 	                 (audio_mix_l < -17'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
 	assign AUDIO_R = (audio_mix_r > 17'sd32767)  ? 16'sd32767 :

@@ -1197,12 +1197,28 @@ reg  [1:0] sph;
 reg        frame_done_r;
 assign frame_done = frame_done_r;
 
+// The 44.1 kHz targets are linearly interpolated on the way out (below):
+// sys/audio_out.sv picks AUDIO_L/R up with a free-running 48 kHz zero-order
+// hold, and feeding it the raw stair-step adds audible imaging ("not CD
+// quality" report, 07-28). Interpolating continuously in the 32.5 MHz domain
+// means whatever instant the framework samples, it sees a point on the
+// segment between the previous and current cadence targets — no knowledge of
+// the 48 kHz phase needed. frac16 is a Q16 approximation of the segment
+// phase (increment 89 ~= 65536*44100/32.5MHz per clk, saturating; reset at
+// each pair commit). Interpolation never leaves the [prev,target] range, so
+// the 16-bit output cannot overflow.
+reg signed [15:0] snd_l_t, snd_r_t;   // cadence-tick targets (was snd_l/r)
+reg signed [15:0] snd_l_p, snd_r_p;   // previous targets (segment start)
+reg        [16:0] frac16;             // Q16 segment phase, saturating at 1.0
+
 always @(posedge clk) begin
 	if (rst) begin
 		acc <= 0; widx <= 0; sph <= 0; frame_done_r <= 0;
-		snd_l <= 0; snd_r <= 0; fr_half_r <= 0; frame_ra <= 0;
+		snd_l_t <= 0; snd_r_t <= 0; snd_l_p <= 0; snd_r_p <= 0;
+		frac16 <= 0; fr_half_r <= 0; frame_ra <= 0;
 	end else begin
 		frame_done_r <= 1'b0;
+		if (!frac16[16]) frac16 <= frac16 + 17'd89;
 		if (flush) begin
 			widx <= 0; acc <= 0; sph <= 0; fr_half_r <= 1'b0;
 		end
@@ -1218,9 +1234,10 @@ always @(posedge clk) begin
 				sph <= sph + 2'd1;
 				case (sph)
 				2'd1: frame_ra <= {fr_half_r, widx + 11'd1};
-				2'd2: snd_l <= frame_q;
+				2'd2: begin snd_l_p <= snd_l_t; snd_l_t <= frame_q; end
 				default: begin
-					snd_r <= frame_q; sph <= 2'd0;
+					snd_r_p <= snd_r_t; snd_r_t <= frame_q;
+					frac16 <= 0; sph <= 2'd0;
 					if (widx == 11'd1174) begin
 						widx <= 0;
 						fr_half_r <= ~fr_half_r;
@@ -1231,10 +1248,29 @@ always @(posedge clk) begin
 			end
 		end
 		else begin
-			if (pstate != ST_PLAY) begin snd_l <= 0; snd_r <= 0; end
+			if (pstate != ST_PLAY) begin
+				snd_l_t <= 0; snd_r_t <= 0; snd_l_p <= 0; snd_r_p <= 0;
+			end
 			// underrun (half not ready): hold position, emit silence
 			if (pstate != ST_PLAY) acc <= 0;
 		end
+	end
+end
+
+// Interpolated output stage — the only driver of snd_l/snd_r.
+wire        [15:0] seg_f  = frac16[16] ? 16'hFFFF : frac16[15:0];
+wire signed [16:0] seg_dl = {snd_l_t[15], snd_l_t} - {snd_l_p[15], snd_l_p};
+wire signed [16:0] seg_dr = {snd_r_t[15], snd_r_t} - {snd_r_p[15], snd_r_p};
+wire signed [33:0] seg_ml = seg_dl * $signed({1'b0, seg_f});
+wire signed [33:0] seg_mr = seg_dr * $signed({1'b0, seg_f});
+wire signed [16:0] sum_l  = {snd_l_p[15], snd_l_p} + $signed(seg_ml[32:16]);
+wire signed [16:0] sum_r  = {snd_r_p[15], snd_r_p} + $signed(seg_mr[32:16]);
+always @(posedge clk) begin
+	if (rst || pstate != ST_PLAY) begin
+		snd_l <= 0; snd_r <= 0;
+	end else begin
+		snd_l <= sum_l[15:0];
+		snd_r <= sum_r[15:0];
 	end
 end
 
