@@ -324,9 +324,19 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // the whole OS at the 8ms watchdog ceiling per poll (HW 2026-07-17). With
 // the medium gone the read completes with stale bytes and the driver gets
 // its error through the normal status path instead.
+// wr_pending lives at module scope (declared here, driven by the flush engine
+// below) because io_busy must include it: between a block's req_wr edge and
+// the flush issuing (io_wr rise) — one cycle normally, longer while a previous
+// flush is still in flight — neither io_wr nor io_ack is high, so the old
+// (io_wr | io_ack) busy term dropped REQ for that window and one extra
+// pseudo-DMA word could land in the slot the flush hadn't read yet. TIM3
+// install forensics 2026-07-28: a 7.5 MB write otherwise perfect except the
+// FIRST WORD of one 512-byte block ("Machine Data" blk 81) — this window's
+// exact signature.
+reg    wr_pending;
 wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted && (rd_cur_blk >= rd_hps_blk)) ||
-                 (phase == PHASE_DATA_IN  && (io_wr | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
-                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | (io_ack & ~ca_io_active)));
+                 (phase == PHASE_DATA_IN  && (io_wr | wr_pending | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
+                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | wr_pending | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
 	// WRITE with transfer length 0) must complete immediately: data_complete
 	// only sets on an ACK edge, which never comes when the initiator expects
@@ -1118,7 +1128,6 @@ assign io_rd = io_rd_d | ca_io_rd_w;
 
 always @(posedge clk) begin
 	reg old_wr;
-	reg wr_pending;
 	reg rd_busy;            // a read-prefetch sector fetch is outstanding
 
 	// A SCSI bus reset aborts any in-flight/queued disk IO.  Without this,
