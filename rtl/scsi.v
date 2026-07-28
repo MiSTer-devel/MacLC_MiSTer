@@ -44,6 +44,7 @@ module scsi
 	input         io_ack,
 
 	input   [7:0] sd_buff_addr,
+	input   [4:0] sd_buff_addr_hi, // hps_io addr[12:8] (CD whole-frame bursts)
 	input  [15:0] sd_buff_dout,
 	output [15:0] sd_buff_din,
 	input         sd_buff_wr,
@@ -71,6 +72,7 @@ module scsi
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen[5:0] [31]=req
 	output [31:0] dbg_wrstall,
+	output [31:0] dbg_wrfb,     // JTAG WRFB: write-phase first-beat forensics
 	output [31:0] dbg_cda0,     // JTAG CDA0: cd_audio TOC/engine state (see cd_audio.sv)
 	output [31:0] dbg_cda2,     // JTAG CDA2: last 0xC1 CDB {op9, start5, alloc7, alloc8}
 output [31:0] dbg_cda3,     // JTAG CDA3: last play-class CDB {op, cdb3, cdb4, cdb5}
@@ -1194,7 +1196,8 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.ch_grant(ca_grant),
 		.ca_io_active(ca_io_active), .ca_io_rd(ca_io_rd_w), .ca_io_lba(ca_io_lba),
 		.io_ack(io_ack),
-		.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
+		.sd_buff_addr(sd_buff_addr), .sd_buff_addr_hi(sd_buff_addr_hi),
+		.sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
 		.ast_code(ca_ast_code), .cur_ctrl(ca_cur_ctrl), .cur_trk(ca_cur_trk),
 		.abs_m(ca_abs_m), .abs_s(ca_abs_s), .abs_f(ca_abs_f),
 		.rel_m(ca_rel_m), .rel_s(ca_rel_s), .rel_f(ca_rel_f),
@@ -2008,6 +2011,42 @@ end
 //               [10:8]=live win_maxphase [7]=live win_read_done [6:0]=0
 assign dbg_wrstall = { brst_valid, brst_maxphase, brst_read_done, brst_sel_seen,
                        brst_count, brst_lastop, win_maxphase, win_read_done, 7'd0 };
+
+// ---- WRFB: write-data-phase first-beat forensics (2026-07-28) -------------
+// For the one-inserted-byte-per-64KB-unit corruption hunt: if a WRITE
+// command's first data beat ever arrives with data_cnt[0]=1, or the
+// byte/word pseudo-DMA mode flips mid-phase, the odd_byte_r lane pairing
+// slips one byte for the rest of the command — exactly the observed
+// signature. Latched per DATA_IN phase of a block-write command; read live
+// while an install runs and correlate against the corrupt 64 KB spans.
+//   [31:24]=write-phase serial (wraps)  [23:16]=mode flips this phase (sat)
+//   [15:8]=first beat's din  [7:2]=0  [1]=first-beat dbg_dma_word
+//   [0]=first-beat data_cnt[0] (law: 0; 1 = the smoking gun)
+reg  [7:0] wrfb_cmds  = 8'd0;
+reg  [7:0] wrfb_flips = 8'd0;
+reg  [7:0] wrfb_byte0 = 8'd0;
+reg        wrfb_par0  = 1'b0;
+reg        wrfb_word0 = 1'b0;
+reg        wrfb_armed = 1'b0;
+reg        wrfb_dma_d = 1'b0;
+always @(posedge clk) begin
+	wrfb_dma_d <= dbg_dma_word;
+	if (phase != PHASE_DATA_IN || !cmd_write) begin
+		wrfb_armed <= 1'b1;
+	end else begin
+		if (stb_ack && wrfb_armed) begin
+			wrfb_armed <= 1'b0;
+			wrfb_cmds  <= wrfb_cmds + 8'd1;
+			wrfb_byte0 <= din;
+			wrfb_par0  <= data_cnt[0];
+			wrfb_word0 <= dbg_dma_word;
+			wrfb_flips <= 8'd0;
+		end
+		else if (!wrfb_armed && (dbg_dma_word != wrfb_dma_d) && (wrfb_flips != 8'hFF))
+			wrfb_flips <= wrfb_flips + 8'd1;
+	end
+end
+assign dbg_wrfb = { wrfb_cmds, wrfb_flips, wrfb_byte0, 6'd0, wrfb_word0, wrfb_par0 };
 
 // ---- Selection/command handshake observability (PSEL probe) -----------
 // Live state {phase,sel,bsy,req,ack} plus sticky high-water/counters that

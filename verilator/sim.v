@@ -851,6 +851,7 @@ module emu
 		.io_ack(sd_ack[1:0]),
 
 		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_addr_hi(5'd0),   // sim HPS model serves 512-byte blocks only
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),

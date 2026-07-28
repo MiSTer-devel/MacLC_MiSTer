@@ -45,6 +45,7 @@ module dataController_top(
 	output [31:0] dbg_cdur,   // cd_audio underrun counters (JTAG CDUR)
 	output [31:0] dbg_ncr2,   // req_deferred/req_bus + IRQ machine + counters
 	output [31:0] dbg_wr,     // write-stall snapshot (DATA_IN target)
+	output [31:0] dbg_wrfb,   // write first-beat forensics (JTAG WRFB)
 	input selectSCC,
 	input selectIWM,
 	input selectVIA,
@@ -110,6 +111,7 @@ module dataController_top(
 	output  [SCSI_DEVS-1:0] io_wr,
 	input   [SCSI_DEVS-1:0] io_ack,
 	input             [7:0] sd_buff_addr,
+	input             [4:0] sd_buff_addr_hi,  // hps_io addr[12:8]: CD whole-frame bursts
 	input            [15:0] sd_buff_dout,
 	output           [15:0] sd_buff_din[SCSI_DEVS],
 	input                   sd_buff_wr,
@@ -427,6 +429,7 @@ module dataController_top(
 		.io_ack ( io_ack ),
 
 		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_addr_hi(sd_buff_addr_hi),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
 		.sd_buff_wr(sd_buff_wr),
@@ -472,7 +475,8 @@ module dataController_top(
 		.dbg_cda4(dbg_cda4),
 		.dbg_cdur(dbg_cdur),
 		.dbg_ncr2(dbg_ncr2),
-		.dbg_wr(dbg_wr)
+		.dbg_wr(dbg_wr),
+		.dbg_wrfb(dbg_wrfb)
 	);
 
 	// onesec (VIA1 CA2) is derived from the fixed 60.15 Hz system tick — see

@@ -50,6 +50,7 @@ module cd_audio #(
 	output     [31:0] ca_io_lba,
 	input             io_ack,
 	input       [7:0] sd_buff_addr,
+	input       [4:0] sd_buff_addr_hi,  // hps_io addr[12:8]: whole-frame bursts
 	input      [15:0] sd_buff_dout,
 	input             sd_buff_wr,
 
@@ -254,15 +255,20 @@ assign toc2_q2 = t2b2[0] ? t2o_q1 : t2e_q1;
 assign toc2_q3 = t2b2[0] ? t2e_q1 : t2o_q1;
 
 
-// frame ping-pong: 2 x 1280 x 16 (2352 B payload + 208 B pad per half)
+// frame ping-pong: 2 x 2048 x 16 (1176 words = one 2352 B frame per half).
+// Each half is filled by ONE whole-frame HPS transaction (Main forces
+// blksz=2352 for the AUDIO window, PSX-style): a single sd_ack window with
+// sd_buff_addr streaming 0..1175 continuously — the wide address bits come
+// in via sd_buff_addr_hi. The old 5x512 view cost five ~2.8 ms round-trips
+// per 13.3 ms frame = chronic ~4.5% starvation (CDUR-measured 2026-07-28).
 reg         fr_cap;
 reg         fr_half_w;
-reg  [2:0]  fr_blk;
 reg [11:0]  frame_ra;
 wire [15:0] frame_q;
+wire [10:0] fr_wword = {sd_buff_addr_hi[2:0], sd_buff_addr};
 cd_sdp #(.DW(16), .AW(12)) frame_ram (
 	.clock(clk),
-	.waddr({fr_half_w, fr_blk, sd_buff_addr}), .wdata(sd_buff_dout),
+	.waddr({fr_half_w, fr_wword}), .wdata(sd_buff_dout),
 	.wr(fr_cap && sd_buff_wr),
 	.raddr(frame_ra), .q(frame_q)
 );
@@ -1144,7 +1150,7 @@ wire       sample_half = fr_half_r;
 
 always @(posedge clk) begin
 	if (rst) begin
-		fst <= F_IDLE; fr_cap <= 0; fr_valid <= 2'b00; fr_half_w <= 0; fr_blk <= 0;
+		fst <= F_IDLE; fr_cap <= 0; fr_valid <= 2'b00; fr_half_w <= 0;
 		fr_rd <= 0; fr_act <= 0; fr_lba <= 0; fetch_lba <= 0; fetch_sync <= 1'b1;
 	end else begin
 		if (flush) begin fr_valid <= 2'b00; fetch_sync <= 1'b1; end
@@ -1157,14 +1163,15 @@ always @(posedge clk) begin
 			else if ((pstate == ST_PLAY) && mounted && toc_ready &&
 			         !(&fr_valid) && (fetch_lba < stop_lba)) begin
 				fr_half_w <= fr_valid[0] ? 1'b1 : 1'b0;
-				fr_blk    <= 3'd0;
 				fst <= F_REQ;
 			end
 		end
 		F_REQ: begin
 			if (flush) fst <= F_IDLE;
 			else if (ch_grant && !toc_act && !toc_rd && !fr_rd && (mst == M_IDLE)) begin
-				fr_lba <= AUDIO_BLK + (fetch_lba * 32'd5) + {29'd0, fr_blk};
+				// lba = AUDIO window + disc LBA: ONE 2352-byte transaction
+				// fills the whole half (Main keys blksz on this window)
+				fr_lba <= AUDIO_BLK + fetch_lba;
 				fr_rd  <= 1'b1;
 				fr_act <= 1'b1;
 				fr_cap <= 1'b1;
@@ -1177,14 +1184,9 @@ always @(posedge clk) begin
 			if (ack_fall && fr_act) begin
 				fr_act <= 1'b0;
 				fr_cap <= 1'b0;
-				if (fr_blk == 3'd4) begin
-					fr_valid[fr_half_w] <= 1'b1;
-					fetch_lba <= fetch_lba + 32'd1;
-					fst <= F_IDLE;
-				end else begin
-					fr_blk <= fr_blk + 3'd1;
-					fst <= F_REQ;
-				end
+				fr_valid[fr_half_w] <= 1'b1;
+				fetch_lba <= fetch_lba + 32'd1;
+				fst <= F_IDLE;
 			end
 		end
 		default: fst <= F_IDLE;

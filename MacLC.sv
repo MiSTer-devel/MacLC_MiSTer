@@ -167,7 +167,9 @@ module emu
 	wire  [VDNUM-1:0] sd_rd;
 	wire  [VDNUM-1:0] sd_wr;
 	wire  [VDNUM-1:0] sd_ack;
-	wire            [7:0] sd_buff_addr;
+	// hps_io drives [12:0] (AW=12 in WIDE mode); [7:0] serves every 512-byte
+	// consumer, [12:8] reach the CD whole-frame burst path (2352 B/txn).
+	wire           [12:0] sd_buff_addr;
 	wire           [15:0] sd_buff_dout;
 	wire           [15:0] sd_buff_din[VDNUM];
 	wire                  sd_buff_wr;
@@ -698,7 +700,7 @@ module emu
 	wire scsiIRQ;         // NCR5380 latched IRQ (level) → pseudo-VIA IFR bit 3
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
-	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
+	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w, dbg_wrfb_w;
 	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
 	wire [31:0] dbg_cdur_w;
 	wire [23:0] overlay_trigger_addr;
@@ -1229,6 +1231,15 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_psd3 (.probe(sdma_snap_wr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
+	// WRFB: write-data-phase first-beat forensics (2026-07-28, the inserted-
+	// byte corruption hunt). Layout (scsi.v dbg_wrfb): [31:24]=write-phase
+	// serial [23:16]=byte/word mode flips this phase [15:8]=first beat's din
+	// [1]=first-beat dbg_dma_word [0]=first-beat data_cnt[0] (law: 0).
+	altsource_probe #(
+		.instance_id ("WRFB"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_wrfb (.probe(dbg_wrfb_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
 	// (PRST reset-source recorder and PFL0/PFL1 floppy probes + capture ring
 	// removed 2026-07-16 — #3 is root-caused/resolved and the 800K floppy
 	// mission is parked on its own probe-bearing build (e322926 seed 3).
@@ -1486,6 +1497,7 @@ module emu
 		.dbg_cdur(dbg_cdur_w),
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
+		.dbg_wrfb(dbg_wrfb_w),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),
@@ -1541,7 +1553,8 @@ module emu
 		.io_wr(scsi_wr),
 		.io_ack(scsi_ack),
 
-		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_addr(sd_buff_addr[7:0]),
+		.sd_buff_addr_hi(sd_buff_addr[12:8]),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),
