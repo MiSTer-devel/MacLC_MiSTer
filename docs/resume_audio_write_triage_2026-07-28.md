@@ -59,6 +59,11 @@ root-caused and fixed (HW-unvalidated), one is instrumented but unmeasured.
 - OSD is NOT composited into screenshots (drove blind-OSD attempts astray;
   use `load_core` via `/dev/MiSTer_cmd` for a deterministic guest reset —
   config re-attaches mounts).
+- **Guest WARM RESTART is broken (user, 07-28): Finder Special→Restart hangs
+  the next boot at uniform grey — a separate known core bug, still OPEN.**
+  The only supported reboot is clean Shut Down (or dead guest) + core
+  re-launch via `load_core`. Newly OSD-mounted SCSI volumes therefore get
+  picked up by a core re-launch, not a guest restart.
 
 ## What is on the hardware right now (.143)
 
