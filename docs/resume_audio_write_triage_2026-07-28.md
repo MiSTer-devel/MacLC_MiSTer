@@ -143,6 +143,75 @@ Findings:
 Installer note: TIM3 uses a StuffIt InstallerMaker installer (it extracts
 from an archive; it is not a Finder copy).
 
+## ★★ 07-28 pm: write corruption REPRODUCED with `17f5a85` — precise signature
+
+Test setup (repeatable): fresh copy of the validated `MacLC_7-5-5.hda` as
+`TIM3TEST_755.hda` on SCSI-1 (volume `Mac7-5-5`), CD3 CUE mounted, TIM3
+installed to a new folder on that clean volume, build 91bfb2fa (`ebf605e` +
+`17f5a85` + probes). Both the damaged-catalog theory and the stale-install
+theory are DEAD: the volume was pristine.
+
+**Result: "The file ... may be damaged" fired twice (Machine Data, TIM
+Audio).** So `17f5a85` narrowed but did NOT close the write corruption.
+
+### The signature (this is the actionable part)
+
+Extraction: `scratch/tim3/extract2.py` (new; `hfs_walk.py` silently misses
+records once the catalog outgrows the MDB's 3 extents — it only warns. The
+new tool whole-image-scans for 0xFF leaf nodes and follows extents overflow).
+
+`TIM Audio` resource fork vs the CD reference:
+- Corrupt spans start at **0x10000, 0x30000, 0x50000, 0x70000 …** — i.e.
+  **every OTHER 64 KB unit**, perfectly 64 KB aligned, each span 0xFE00
+  (65,024 B = 127 sectors) long, re-aligning ~0xFE00 in. 24 spans total,
+  3353/5689 blocks affected.
+- Inside a span: **one byte is INSERTED within the first 4 bytes** (observed
+  at span+1 and span+3 — odd offsets = the LDS/low lane), and the rest of the
+  span is the reference **shifted by one byte**. Examples: `6f 72 67 [40] 61
+  6e` vs `6f 72 67 61 6e` ("org@an"/"organ"); `4c [3c] 0f 99` vs `4c 0f 99`.
+- Fork logical layout is identical (same header: data@256 len=2899335,
+  map@2899591 len=12739); the file is 4 bytes longer = trailing allocation
+  only. `Machine Data` shows the same class (+78 B, first divergence 0x1f5d).
+
+`TIM Voices 1` — **plain Finder drag-copy, NO installer** (14.5 MB): only
+**2 of 28,350 blocks differ** — block 0 (resource-header scratch area,
+legitimately rewritten) and **block 193, where exactly the first WORD is
+wrong** (`80 80` vs `38 40`), rest of block perfect. That is the SAME
+"first word of a 512-byte block" signature as the 07-28 am forensics.
+
+**Therefore: the corruption is installer-independent and reproducible.**
+Two signatures now, both surviving `17f5a85`:
+1. rare: one wrong WORD at a 512-block start (Finder copy, ~1 in 28k blocks)
+2. frequent: one INSERTED byte near the start of every other 64 KB write
+   unit, shifting that unit (installer's large sequential writes)
+
+### Leading hypothesis for #2
+
+Alternating per 64 KB write command => a **residue carried between write
+commands**: a leftover odd/low byte from the end of command N prepended to
+command N+1, which then leaves none, so N+2 repeats. Prime suspect is the
+word-write byte-packing in `rtl/scsi.v` ~226-276: `odd_byte_r` is a
+module-scope latch, reset ONLY on `rst`, captured at
+`stb_ack && PHASE_DATA_IN && ~data_cnt[0] && dbg_dma_word` and consumed as
+buffer1's `data_b`. If a command's first data beat ever pairs against the
+wrong `data_cnt[0]` parity (or the driver's classic "first byte by hand,
+rest by DMA" pattern flips byte/word mode mid-command), the even/odd lane
+pairing slips by one byte for the remainder of that command — exactly what
+the dumps show. NOT yet proven; do not patch blind. Next step: a targeted
+probe latching `data_cnt[0]`, `dbg_dma_word`, and the first 4 bytes of each
+WRITE(10) command's data phase, then correlate a corrupt span with a
+byte/word-mode transition.
+
+Live probe capture during the install (`scratch/wr_watch{1,2}.log`,
+reader `scratch/wr_watch.tcl`) was CLEAN: bus resets stayed at 1 (boot),
+no stalls, WRITE(10) (0x2A) on target 1 / READ(10) (0x28) on target 0.
+So this is silent data corruption, not an error/retry path.
+
+### Artifacts (all in `scratch/tim3/`, gitignored)
+`TIM3TEST_755.hda` (post-install image, md5 5f2e5e9e), `new_tim_audio.rsrc`,
+`new_machine_data.dat`, `new_voices1.rsrc` (the Finder-copy control),
+`extract2.py`. References from the am session are unchanged and still valid.
+
 ## Open threads
 
 1. **CD audio quality — unmeasured.** Engine is a correct 44.1 kHz fractional
