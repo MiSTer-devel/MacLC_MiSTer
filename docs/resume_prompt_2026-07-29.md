@@ -166,7 +166,24 @@ corruption. Three facts kill it:
   phases have their first word-mode beat at odd parity (ODDW 9 → 51 →
   saturated 63 during one install).
 
-### Still OPEN — a SEPARATE, deterministic CD-read defect
+### ✅ RESOLVED 2026-07-29 (later session) — commit `082dcc4`
+The mechanism: io_busy validated only the CURRENT byte's block, while the
+pDMA host-face consumes up to data_cnt+3 (a longword's second word is
+captured from din_pair_next at the END of its first cycle). The driver's
+byte/word prefix skews the longword grid off the 512-byte block grid, so
+the boundary access reached into the NEXT ring block unvalidated — at a
+just-in-time fill it read the ring slot's PREVIOUS occupant (0x18200's
+0x8080 = the bytes exactly one CD-ring-depth = 4 KB earlier). Fix: stall
+REQ until the +3 look-ahead block is fetched (tail-clamped). Also closed a
+1-cycle snoop hole in the scsi_dpram prefetch steal-launch cycle.
+Bench (scsi_bench, new aperiodic pattern + longskew/wordskew modes):
+pre-fix reproduces the exact field signature (stale first word of every
+crossed block), post-fix 0 mismatches across the full sweep. HW: two
+independent Finder CD copies of TIM Voices 1 on build `79f72fe3`, both
+byte-identical to the ISO reference outside block-0 header scratch; the
+defect offset reads correctly in both. Section below kept as history.
+
+### (historical) Still OPEN — a SEPARATE, deterministic CD-read defect
 The "rare variant" (previously believed to be a random write fault) is
 **deterministic and is NOT the write path**: CD-sourced copies contain
 `0x8080` where the CD holds `0x3840`, at fork offset `0x18200`. Identical
