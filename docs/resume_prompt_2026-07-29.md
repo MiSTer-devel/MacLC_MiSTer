@@ -183,18 +183,24 @@ preserved by a disk-to-disk copy — so it enters on the READ side.
   serving-boundary bug. Next step: instrument the CD read/serve path
   around the 512 B sub-boundary handling.
 
-### Also OPEN (pre-existing, user-confirmed "for a while") — colour-icon
-### display corruption
-Seen on the probes-off boot 3 in the Finder: custom COLOUR icons render
-as multicolour noise (volume icons, System Folder icons, Trash, the TIM
-Voices doc icon) while plain 1-bit folder icons, all window chrome,
-menus and text render perfectly. The selectivity — colour icons only —
-points at the 4/8bpp colour path rather than the scaler or a fit
-problem, which lines up with the known 4/8bpp colour issue that the
-DDR3-video-channel work is meant to fix (video fetch off SDRAM onto
-cached DDR3). NOT caused by the write fix or by dropping the probe deck:
-the user confirms it predates both. Do not score it against a boot gate;
-score the gate on boot + main-loop responsiveness.
+### Colour-icon corruption = the probes-off FAILURE SIGNATURE (not
+### pre-existing)
+My first read — "pre-existing display issue, don't score it" — was WRONG
+and the user corrected it: NEW problem. Evidence it belongs to the
+probes-off build, not to the video path or the disk:
+- Same disk, same Finder window, `24592e25` clean (×2 boots) vs
+  `cc57535d` garbled, then Finder error type 11 on the next boot.
+- Selectivity: custom COLOUR icons become multicolour noise while 1-bit
+  folder icons, window chrome, menus and text stay perfect. Shape-bearing
+  noise blocks = the icon PIXEL DATA is wrong, not the palette.
+- MacAtrium's colour UI renders fine on the SAME failing build — so a
+  plain scanout/palette fault is ruled out, and MacAtrium is useless as a
+  display gate.
+That pattern (colour icon resources read wrong → Finder eventually dies)
+reads as bad DATA reaching the Finder, i.e. a READ-path fault in the
+probes-off fit, which is the same neighbourhood as the historical `#3`
+SCSI-status-read class. Use it as the gate signature for every anchor
+candidate.
 
 ## Mission 2 — the probes-off marginality
 
@@ -214,20 +220,41 @@ score the gate on boot + main-loop responsiveness.
   historical `#3` class (SCSI CSR reads) is the prime suspect and the
   Finder-wedge symptom (blocked on disk I/O) matches.
 
-### RESOLVED 2026-07-29 — probes-off now PASSES, no anchors needed
+### ~~RESOLVED~~ **RETRACTED 2026-07-29 — probes-off STILL FAILS**
 
-A probes-off fit of the POST-write-fix netlist (`ceaec45`, SEED 5, md5
-`cc57535d`, STA +0.248) **passes the boot gate 3/3** with a responsive
-main loop (menus open on demand — the historical failure was a live
-cursor over a blocked main loop). The attribute hunt below was never
-needed and should NOT be started unless the symptom returns.
+**The "resolved" verdict below was WRONG. Do not trust it.** It was
+called on 3 boots, but two of those booted into MacAtrium (which does not
+exercise the failing path) and the third showed colour-icon corruption
+that was wrongly written off as a pre-existing display issue. The user
+corrected that ("this is a NEW PROBLEM"), and a controlled A/B settled it.
 
-Most likely cause of the earlier failures: the write fix changed the SCSI
-cone structurally (new `wm_beat2`/`store_low` registers; the data-source
-mux moved off the `data_cnt[0]` parity path), which relieved the marginal
-path the probe instances had been accidentally anchoring. The A/B backs
-this up — the probes-off build has MORE margin in the core domains than
-the probe build, not less:
+**Controlled A/B, SAME disk, minutes apart, identical Finder window:**
+- `24592e25` (probes ON): every icon renders clean, Finder healthy. Twice
+  (08:35 and 09:48).
+- `cc57535d` (probes OFF): desktop + window icons render as multicolour
+  noise, and on the next boot **the Finder CRASHED — "system error …
+  'Finder' error type 11"**.
+
+So the data at rest is fine (proved twice on the same image) and the
+failure is build-dependent. Offline block-diff of the two image pulls
+also exonerates the write path: the duplicate changed exactly one
+contiguous 13.84 MB run plus 8 tiny runs (MDB/bitmap, catalog nodes) —
+no scattered collateral damage.
+
+This is the SAME failure class as the three earlier probes-off fits
+(Finder-related death), just with a much better signature to gate on:
+**corrupted colour-icon data + Finder error type 11**. The attribute hunt
+below is therefore still ON.
+
+**Gate lesson:** MacAtrium's UI is NOT a sufficient display check — it
+booted clean on a build whose Finder dies. Any probes-off fit must be
+gated in the FINDER, on colour icons, not just "did it boot".
+
+The STA comparison below is retained because it is a real and
+counter-intuitive datum: the failing probes-off build has MORE nominal
+margin in the core domains than the passing probe build, which means
+**STA slack does not predict this failure** — consistent with the
+historical STA-met-but-HW-marginal `#3` class.
 
 | domain | probes ON | probes OFF |
 |---|---|---|
@@ -240,10 +267,10 @@ Registers 35,346 (on) vs 32,928 (off) = 2,418 for the deck + its JTAG
 `sld_hub`; block memory bits identical at 3,975,530 (no RAM migration).
 Report pair archived at `scratch/m2/probes_{on,off}.{map,fit,sta}.rpt`.
 
-**Consequence: releases no longer need to ship the probe decks.** The
-07-28 user-approved deviation is retired.
+**Consequence: releases MUST still ship with the probe decks** until the
+anchor hunt lands. The 07-28 user-approved deviation STANDS.
 
-### The hunt (attributes only — no behavioral RTL) — ONLY IF IT RETURNS
+### The hunt (attributes only — no behavioral RTL) — STILL REQUIRED
 1. Diff `map.rpt`/`fit.rpt` between the probe build and a probes-off build
    for the SCSI cones (register duplication/retiming reports name nets).
 2. Add targeted anchors on OUR side: `(* preserve *)`/`(* syn_keep *)` RTL
