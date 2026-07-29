@@ -1234,7 +1234,8 @@ module emu
 	// WRFB: write-data-phase first-beat forensics (2026-07-28, the inserted-
 	// byte corruption hunt). Layout (scsi.v dbg_wrfb): [31:24]=write-phase
 	// serial [23:16]=byte/word mode flips this phase [15:8]=first beat's din
-	// [1]=first-beat dbg_dma_word [0]=first-beat data_cnt[0] (law: 0).
+	// [7:2]=cumulative odd-first-word-beat count (the slip trigger, sat 63)
+	// [1]=first-beat dbg_dma_word [0]=first-beat data_cnt[0].
 	altsource_probe #(
 		.instance_id ("WRFB"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
