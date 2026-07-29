@@ -110,25 +110,78 @@ suggest the user raise it.
    with `USE_DBG_PROBES=1` re-flipped in the qsf (WT-only!). Triple gate on
    deploy (STA + boot screenshot + probes).
 
-### Verification recipe (all tooling exists)
-- Reproduce: boot the fresh disk, mount the TIM CD (`CD3/TIM_3-mac.CUE`
-  auto-attaches; the boot repulse in Main covers cold attach), run
-  `Tim CD Installer` from the CD window (drive it with `scratch/mouse.sh`;
-  install to a NEW folder — prefer the clean `TIM3TEST_755.hda` volume on
-  SCSI-1 if still attached, else the fresh games volume).
-- During the install: sample WRFB every ~10 s
-  (`quartus_stp_tcl -t scratch/wrfb_read.tcl`) — with the mux fixed you get
-  per-command parity/modeflip evidence.
-- After: clean Shut Down → menu core (releases mounts) → pull the target
-  hda → in WSL: `python3 scratch/tim3/extract2.py <hda> extract
-  'Machine Data' data out.dat` (it auto-picks the NEWEST cnid) → compare
-  against `scratch/tim3/machine_data_ref.dat` (7,487,823 B) and
-  `tim_audio_ref.rsrc` (2,912,330 B). PASS = byte-identical (installer
-  legitimately rewrites TIM Audio's first header block only).
-  Tonight's corrupt extracts for contrast: `tonight_machine_data.dat`
-  (+78 @0x1f5d), `tonight_tim_audio.rsrc` (odd-unit spans).
-- Also re-test the rare variant: a 14.5 MB Finder drag of "TIM Voices 1"
-  (~4 min) — previously 1 corrupt first-word in 28,350 blocks.
+### Verification recipe — REWRITTEN 2026-07-29 (the old one was unsound)
+
+**The old criterion was wrong and must not be reused.** It said: extract
+the installer's `Machine Data` and PASS = byte-identical to
+`scratch/tim3/machine_data_ref.dat`, treating the `+78` bytes as
+corruption. Three facts kill it:
+- The CD's OWN `Machine Data` data fork is **7,487,823** bytes — i.e.
+  `machine_data_ref.dat` IS THE CD SOURCE, not expected install output.
+  The installer legitimately writes a transformed, 78-byte-longer file, so
+  `+78` is normal and every run would "fail" regardless of hardware.
+- The two supposed references disagree with each other:
+  `machine_data_ref.dat` vs `machine_data_installed.dat` differ at byte
+  41,473.
+- Installer output is not a stable oracle at all (it transforms content).
+
+**Use length-preserving copies instead, against a verified source.**
+- `scratch/tim3/TIM3-data.iso` is VERIFIED byte-perfect: `reiso.py`
+  re-extracts the data track from `TIM_3-mac.BIN` (mode-1 user data at
+  sector byte 16, len 2048) and 0 of 68,677 sectors differ. Fork
+  references pulled from it with `extract2.py` are authoritative;
+  `forkmap.py` maps a fork offset to a raw image offset with NO extent
+  stitching when a byte needs checking independently.
+- **Write-path test (the definitive one, no CD in the loop):** in the
+  guest, select a large file already on a volume and File > Duplicate
+  (a 14.5 MB file takes ~4 min). Then extract BOTH from the pulled image
+  and compare with `difflist.py`. Self-contained — needs no external
+  reference. PASS = every 512 B data block identical; only block 0 may
+  differ (the resource-fork reserved header holds the file NAME, so the
+  duplicate legitimately contains the literal string " copy" there).
+- **CD-path test:** Finder-drag `TIM Voices 1` (14.5 MB) from the CD to a
+  volume, then compare the extracted copy against the ISO-derived
+  reference. Block 0 header scratch is expected; anything else is real.
+- Sample WRFB during any write workload
+  (`quartus_stp_tcl -t scratch/wrfb_read.tcl`). ODDW ([7:2]) counts the
+  lane-slip trigger. The installer path saturates it; Finder/disk copies
+  never trigger it (ODDW stays 0) — so the installer is the workload that
+  exercises the pairing fix.
+- Tools written 2026-07-29, all in `scratch/tim3/` (gitignored):
+  `difflist.py` (equal-length offset diff + block/parity histogram),
+  `align.py` (reference-free indel/substitution counter),
+  `cmp3.py` (shift-hypothesis divergence classifier), `reiso.py`,
+  `forkmap.py`.
+
+### Outcome 2026-07-29 — write path VALIDATED CLEAN
+- Disk-to-disk duplicate of a 14.5 MB fork on build `24592e25` (RTL
+  `ceaec45`): **28,348 of 28,349 data blocks byte-identical, zero
+  corruption**; the only differing block is block 0's resource header,
+  whose diff literally contains `20636f7079` (" copy") = the new filename.
+- The pairing fix is measurable on the installer path: today's output is
+  byte-identical to the pre-fix run for the first 65,539 bytes and then
+  re-syncs at shift −1 with 99.3% match — exactly one inserted byte
+  removed at the 64 KB boundary, the documented signature.
+- WRFB proves the trigger is real and common: ~29% of installer write
+  phases have their first word-mode beat at odd parity (ODDW 9 → 51 →
+  saturated 63 during one install).
+
+### Still OPEN — a SEPARATE, deterministic CD-read defect
+The "rare variant" (previously believed to be a random write fault) is
+**deterministic and is NOT the write path**: CD-sourced copies contain
+`0x8080` where the CD holds `0x3840`, at fork offset `0x18200`. Identical
+bytes in two runs across two different core builds, and faithfully
+preserved by a disk-to-disk copy — so it enters on the READ side.
+- Location: CD data-track sector **49,385 + 512 bytes** — a 512 B
+  sub-boundary inside a 2048 B sector.
+- `0x8080` is the neutral/silence value for unsigned 8-bit audio and
+  replaces a smooth waveform ramp (`2c 33 38 40 45 4a…`), which reads as
+  unfilled buffer content rather than a lane swap.
+- The sector is a clean Mode-1 sector (`00 ff*10 00`, header `11 00 35 01`)
+  with no false sync pattern in its user data.
+- Only 1 occurrence in 7,088 CD sectors, so it is not a periodic
+  serving-boundary bug. Next step: instrument the CD read/serve path
+  around the 512 B sub-boundary handling.
 
 ## Mission 2 — the probes-off marginality
 
