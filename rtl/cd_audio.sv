@@ -1153,8 +1153,14 @@ always @(posedge clk) begin
 		fst <= F_IDLE; fr_cap <= 0; fr_valid <= 2'b00; fr_half_w <= 0;
 		fr_rd <= 0; fr_act <= 0; fr_lba <= 0; fetch_lba <= 0; fetch_sync <= 1'b1;
 	end else begin
+		// Free the half that FINISHED. sample_half (= fr_half_r) has already
+		// flipped by the clock this block observes frame_done, so indexing by
+		// it freed the half that had just STARTED — the ping-pong degenerated
+		// into fetch-on-demand at every boundary and playback froze for one
+		// fetch duration (~0.5-4 ms, HPS-load dependent) 75x/s: THE original
+		// "not CD quality" graininess (CDUR: 71 starves/s, one per half).
 		if (flush) begin fr_valid <= 2'b00; fetch_sync <= 1'b1; end
-		else if (frame_done) fr_valid[sample_half] <= 1'b0;
+		else if (frame_done) fr_valid[frame_done_half_r] <= 1'b0;
 
 		case (fst)
 		F_IDLE: begin
@@ -1201,6 +1207,7 @@ reg [31:0] acc;
 reg [10:0] widx;
 reg  [1:0] sph;
 reg        frame_done_r;
+reg        frame_done_half_r;   // WHICH half just finished (captured pre-flip)
 assign frame_done = frame_done_r;
 
 // The 44.1 kHz targets are linearly interpolated on the way out (below):
@@ -1219,7 +1226,7 @@ reg        [16:0] frac16;             // Q16 segment phase, saturating at 1.0
 
 always @(posedge clk) begin
 	if (rst) begin
-		acc <= 0; widx <= 0; sph <= 0; frame_done_r <= 0;
+		acc <= 0; widx <= 0; sph <= 0; frame_done_r <= 0; frame_done_half_r <= 0;
 		snd_l_t <= 0; snd_r_t <= 0; snd_l_p <= 0; snd_r_p <= 0;
 		frac16 <= 0; fr_half_r <= 0; frame_ra <= 0;
 	end else begin
@@ -1248,6 +1255,9 @@ always @(posedge clk) begin
 						widx <= 0;
 						fr_half_r <= ~fr_half_r;
 						frame_done_r <= 1'b1;
+						// nonblocking: captures the PRE-flip half — the one
+						// that just finished playing
+						frame_done_half_r <= fr_half_r;
 					end else widx <= widx + 11'd2;
 				end
 				endcase
