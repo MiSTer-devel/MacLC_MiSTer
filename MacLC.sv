@@ -1166,8 +1166,16 @@ module emu
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
-	// DEBUG-ONLY: gated behind USE_DBG_PROBES (set in MacLC.qsf for a debug build,
-	// commented out for release). Release RBFs ship without the JTAG probe deck.
+	// DEBUG-ONLY, split across TWO macros (both set in MacLC.qsf for a debug
+	// build, commented out for release; the flips are working-tree-only):
+	//   USE_DBG_PROBES   — the 11 top-level altsource_probe instances below
+	//                      (CDA0-4/CDUR CD-audio cone, PSDT/PSDS/PSD2/PSD3
+	//                      pseudo-DMA capture, WRFB write forensics)
+	//   USE_DBG_OBSERVER — the dbg_probes deck (CPU bus + peripheral selects +
+	//                      all scsi_dbg* taps, 14 more probe instances inside)
+	// Split 2026-07-29 to bisect the probes-off Finder marginality: each half
+	// pins a different cone (probes: sdma snap capture + CD/WRFB taps;
+	// observer: CPU bus + scsi_dbg/4/5/ncr2). A full debug deck needs BOTH.
 `ifdef USE_DBG_PROBES
 	// PSDT: pseudo-DMA stall timeout visibility — {fires[7:0], max_stall[22:0]}
 	// CDA0/CDA1: CD-audio engine + CD target visibility (2026-07-17, the
@@ -1247,7 +1255,9 @@ module emu
 	// Recover from git history if either resurfaces. The trim also frees the
 	// ring's M10K and returns the JTAG deck below the ~20-node hub ceiling
 	// whose name table read back corrupted at ~40 nodes.)
+`endif // USE_DBG_PROBES
 
+`ifdef USE_DBG_OBSERVER
 	dbg_probes probes(
 		.clk(clk_sys),
 		.cpuAddr(cpuAddr[23:0]),
@@ -1287,7 +1297,7 @@ module emu
 		.pvia_video_config(pvia_video_config),
 		.v8_vblank(v8_vblank_s)
 	);
-`endif // USE_DBG_PROBES
+`endif // USE_DBG_OBSERVER
 
 	maclc_v8_video v8_video(
 		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock
