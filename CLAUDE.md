@@ -182,7 +182,13 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 ## Known Limitations
 
 - Floppy disks are read-only
-- SCSI writes work but are experimental
+- SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
+  in-guest duplicate byte-identical). SCSI/CD reads validated same day
+  (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO
+  reference). Release fits no longer carry the JTAG probe decks — an
+  always-on anchor in MacLC.sv (4dfb463) pins the SCSI capture cones; do
+  not remove it (comment block explains), and gate every new fit in the
+  FINDER on colour icons per docs/resume_probes_off_hunt_2026-07-29.md §3.
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
 - CD-ROM (SCSI ID 3, OSD slot `SC4`): data, mixed-mode, and audio CDs.

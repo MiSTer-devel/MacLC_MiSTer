@@ -1163,11 +1163,51 @@ module emu
 	wire [7:0]  dbg_flp_raw;
 	wire [21:0] dbg_flp_gcr_addr;
 
+	// ── Always-on marginality anchor (2026-07-29) ───────────────────────────
+	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
+	// path on hardware (Finder colour-icon noise → error-11 / F-Line bombs)
+	// while every probe-bearing fit passes; STA is met either way and does not
+	// predict it (docs/resume_probes_off_hunt_2026-07-29.md §5). A two-way
+	// bisect isolated the protective effect to the fanout of the 11 top-level
+	// ISSP probes below — NOT the dbg_probes observer deck: observer-only
+	// (54b6c8e1) bombed the Finder on boot 1; ISSP-only (063c2354) passed the
+	// full colour-icon gate + 3-boot soak. These sink registers keep exactly
+	// the same nets loaded in every build — deliberately, with no JTAG hub —
+	// so the fitter keeps treating the SCSI capture/status cones as live
+	// logic. preserve+noprune = no merging, no retiming, no sweeping. Do NOT
+	// remove, ifdef, or XOR-fold them (a reduction would let synthesis
+	// restructure the cones); ~352 FFs is the entire cost.
+	(* preserve, noprune *) reg [31:0] anchor_cda0, anchor_cda1, anchor_cda2,
+	                                   anchor_cda3, anchor_cda4, anchor_cdur;
+	(* preserve, noprune *) reg [31:0] anchor_psdt, anchor_psds, anchor_psd2,
+	                                   anchor_psd3, anchor_wrfb;
+	always @(posedge clk_sys) begin
+		anchor_cda0 <= dbg_cda0_w;
+		anchor_cda1 <= dbg_cda1_w;
+		anchor_cda2 <= dbg_cda2_w;
+		anchor_cda3 <= dbg_cda3_w;
+		anchor_cda4 <= dbg_cda4_w;
+		anchor_cdur <= dbg_cdur_w;
+		anchor_psdt <= {sdma_berr_cnt, 1'b0, sdma_stall_max};
+		anchor_psds <= {15'd0, sdma_snapped, sdma_snap_scsi2};
+		anchor_psd2 <= sdma_snap_ncr;
+		anchor_psd3 <= sdma_snap_wr;
+		anchor_wrfb <= dbg_wrfb_w;
+	end
+
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
-	// DEBUG-ONLY: gated behind USE_DBG_PROBES (set in MacLC.qsf for a debug build,
-	// commented out for release). Release RBFs ship without the JTAG probe deck.
+	// DEBUG-ONLY, split across TWO macros (both set in MacLC.qsf for a debug
+	// build, commented out for release; the flips are working-tree-only):
+	//   USE_DBG_PROBES   — the 11 top-level altsource_probe instances below
+	//                      (CDA0-4/CDUR CD-audio cone, PSDT/PSDS/PSD2/PSD3
+	//                      pseudo-DMA capture, WRFB write forensics)
+	//   USE_DBG_OBSERVER — the dbg_probes deck (CPU bus + peripheral selects +
+	//                      all scsi_dbg* taps, 14 more probe instances inside)
+	// Split 2026-07-29 to bisect the probes-off Finder marginality: each half
+	// pins a different cone (probes: sdma snap capture + CD/WRFB taps;
+	// observer: CPU bus + scsi_dbg/4/5/ncr2). A full debug deck needs BOTH.
 `ifdef USE_DBG_PROBES
 	// PSDT: pseudo-DMA stall timeout visibility — {fires[7:0], max_stall[22:0]}
 	// CDA0/CDA1: CD-audio engine + CD target visibility (2026-07-17, the
@@ -1234,7 +1274,8 @@ module emu
 	// WRFB: write-data-phase first-beat forensics (2026-07-28, the inserted-
 	// byte corruption hunt). Layout (scsi.v dbg_wrfb): [31:24]=write-phase
 	// serial [23:16]=byte/word mode flips this phase [15:8]=first beat's din
-	// [1]=first-beat dbg_dma_word [0]=first-beat data_cnt[0] (law: 0).
+	// [7:2]=cumulative odd-first-word-beat count (the slip trigger, sat 63)
+	// [1]=first-beat dbg_dma_word [0]=first-beat data_cnt[0].
 	altsource_probe #(
 		.instance_id ("WRFB"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
@@ -1246,7 +1287,9 @@ module emu
 	// Recover from git history if either resurfaces. The trim also frees the
 	// ring's M10K and returns the JTAG deck below the ~20-node hub ceiling
 	// whose name table read back corrupted at ~40 nodes.)
+`endif // USE_DBG_PROBES
 
+`ifdef USE_DBG_OBSERVER
 	dbg_probes probes(
 		.clk(clk_sys),
 		.cpuAddr(cpuAddr[23:0]),
@@ -1286,7 +1329,7 @@ module emu
 		.pvia_video_config(pvia_video_config),
 		.v8_vblank(v8_vblank_s)
 	);
-`endif // USE_DBG_PROBES
+`endif // USE_DBG_OBSERVER
 
 	maclc_v8_video v8_video(
 		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock

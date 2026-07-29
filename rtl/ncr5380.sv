@@ -957,17 +957,20 @@ module ncr5380
 	end
 	assign dbg_wr = dbg_wr_mux;
 
-	// WRFB: same data-phase routing as PSCW; the latches persist after the
-	// phase ends, so a read between commands returns the LAST write's beats
-	// for whichever target held a data phase most recently in the mux scan.
-	reg [31:0] dbg_wrfb_mux;
-	always begin : wrfb_mux
+	// WRFB: route through the target that MOST RECENTLY held a data phase,
+	// via a clocked index latch. The old live-phase scan fell back to
+	// target_wrfb[DEVS-1] whenever no phase was active, so JTAG sampling
+	// BETWEEN commands (the only practical cadence) never saw target 0's
+	// per-command evidence — it read target 1's stale latch instead.
+	localparam WRFB_TGT_W = (DEVS > 1) ? $clog2(DEVS) : 1;
+	reg [WRFB_TGT_W-1:0] wrfb_tgt = {WRFB_TGT_W{1'b0}};
+	always @(posedge clk) begin : wrfb_mux
 		integer k;
-		dbg_wrfb_mux = target_wrfb[DEVS-1];
 		for (k = 0; k < DEVS; k = k + 1)
-			if (target_phase[k] == 3'd3 || target_phase[k] == 3'd2) dbg_wrfb_mux = target_wrfb[k];
+			if (target_phase[k] == 3'd3 || target_phase[k] == 3'd2)
+				wrfb_tgt <= k[WRFB_TGT_W-1:0];
 	end
-	assign dbg_wrfb = dbg_wrfb_mux;
+	assign dbg_wrfb = target_wrfb[wrfb_tgt];
 
 	// NOTE: lbmactwo's JTAG In-System Source/Probe (altsource_probe) blocks for
 	// target_wrsnap/target_selsnap were removed in the MacLC port — this core has

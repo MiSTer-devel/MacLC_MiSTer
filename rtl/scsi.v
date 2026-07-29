@@ -211,7 +211,7 @@ scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer0
 	.q_a(buf0_q_a),
 
 	.address_b(mac_addr),
-	.data_b(din),
+	.data_b(store_low ? odd_byte_r : din),   // beat-role mux, see BEAT-ROLE FIX below
 	.wren_b(buffer0_wr),
 	.q_b(buffer0_dout),
 
@@ -242,19 +242,65 @@ wire [7:0] buffer1_dout_next2;
 //         path on a fit-marginal design; intermittent setup violations corrupt the
 //         write and cascade into a SCSI driver fault → Sad Mac on the first WRITE.
 //
-//   Refinement: latch the current word's odd byte LOCALLY at beat-1's stb_ack (when
-//   data_cnt is even and we're in PHASE_DATA_IN). At that moment dma_write_low_byte
-//   is stable with the current word's wdata[7:0]. Hold it across beat 2's storage.
+//   Refinement: latch the current word's odd byte LOCALLY at the word's FIRST
+//   beat (stb_ack in PHASE_DATA_IN). At that moment dma_write_low_byte is stable
+//   with the current word's wdata[7:0]. Hold it across beat 2's storage.
 //   This is both race-free (locked to the current word, immune to the next CPU
 //   access) and timing-friendly (BlockRAM data_b is now a short local-reg-to-RAM
 //   path). Byte-mode (dbg_dma_word=0) still uses din directly, unchanged.
-//   buffer0 (even byte) is untouched — it was already storing correctly.
+//
+//   BEAT-ROLE FIX (2026-07-29, the +1-inserted-byte write corruption): the
+//   original capture/pairing keyed on data_cnt[0] parity — capture at even
+//   beats, store odd_byte_r at odd beats — which assumes every word-mode pair
+//   lands (even,odd). The Mac driver hand-feeds the first bytes of a write in
+//   BYTE mode before flipping to word pseudo-DMA (WRFB: first_word=0,
+//   modeflips=1); when that prefix has ODD length the word beats land
+//   (odd,even): the first beat hit buffer1 which stored a STALE odd_byte_r
+//   (never captured this phase) and dropped the high byte on din — one
+//   garbage byte inserted, the rest of the phase shifted one position. Fix:
+//   key the DATA SOURCE on the beat's ROLE inside the word pair (wm_beat2),
+//   not on count parity. Beat A: din is reliable (dout holds the high byte
+//   through the train) — store din, capture dma_write_low_byte. Beat B: din
+//   has reverted (the low byte's bus window is 1 cycle, before the ack even
+//   rises) — store the captured odd_byte_r. Which BUFFER a beat lands in
+//   stays keyed on data_cnt[0] (pure byte-position addressing, always
+//   correct); only the value mux moves. Aligned pairs behave bit-identically
+//   to the proven path; store_low is beat-locked at stb_ack so the wren-cycle
+//   mux no longer samples the live dbg_dma_word (immune to a mid-train
+//   re-latch by the next CPU access).
 reg [7:0] odd_byte_r;
+reg       wm_beat2;   // word pair half-done: next word-mode beat is beat B
+reg       store_low;  // this cycle's pending dpram write stores odd_byte_r
 always @(posedge clk) begin
-	if (rst)
+	if (rst) begin
 		odd_byte_r <= 8'h00;
-	else if (stb_ack && (phase == PHASE_DATA_IN) && ~data_cnt[0] && dbg_dma_word)
-		odd_byte_r <= dbg_dma_lowbyte;
+		wm_beat2   <= 1'b0;
+		store_low  <= 1'b0;
+	end else begin
+		store_low <= 1'b0;
+		if (phase != PHASE_DATA_IN)
+			wm_beat2 <= 1'b0;
+		else if (stb_ack) begin
+			// Test wm_beat2 FIRST: once a word pair is in flight the next beat
+			// IS beat B by construction, so the decision must not consult the
+			// live mode signal. dbg_dma_word (= ncr dma_word_latched) re-latches
+			// on the NEXT CPU bus-cycle RISE, which is not DREQ-gated and can
+			// land in the ~3-clock gap between the pair's two ACKs. If that next
+			// access is byte-mode (the driver flips modes constantly — WRFB
+			// measured up to 254 flips in one phase) a mode-first test would
+			// mistake beat B for a byte beat, store the stale high byte still on
+			// din, and re-slip the lane the fix exists to protect.
+			if (wm_beat2) begin         // beat B: din stale, serve the captured low byte
+				store_low <= 1'b1;
+				wm_beat2  <= 1'b0;
+			end else if (dbg_dma_word) begin
+				// beat A: high byte on din, low byte stable in the ncr latch
+				odd_byte_r <= dbg_dma_lowbyte;
+				wm_beat2   <= 1'b1;
+			end
+			// byte beat: store din (store_low stays 0), wm_beat2 already clear
+		end
+	end
 end
 
 scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer1
@@ -267,7 +313,7 @@ scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer1
 	.q_a(buf1_q_a),
 
 	.address_b(mac_addr),
-	.data_b(dbg_dma_word ? odd_byte_r : din),
+	.data_b(store_low ? odd_byte_r : din),   // beat-role mux, see BEAT-ROLE FIX above
 	.wren_b(buffer1_wr),
 	.q_b(buffer1_dout),
 
@@ -337,7 +383,27 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // FIRST WORD of one 512-byte block ("Machine Data" blk 81) — this window's
 // exact signature.
 reg    wr_pending;
-wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted && (rd_cur_blk >= rd_hps_blk)) ||
+// (2026-07-29) rd_ahead_blk: block of the FURTHEST byte one pseudo-DMA
+// transaction can consume. The host-face serves din_pair/din_pair_next =
+// bytes data_cnt..data_cnt+3, and a longword read CAPTURES the +2/+3 pair
+// (its ACK-suppressed second word, ncr5380 dma_second_word_data) at the END
+// of its FIRST bus cycle. When the driver's byte/word prefix skews the
+// longword grid off the 512-byte block grid, that capture crosses into the
+// NEXT ring block — which the old stall (rd_cur_blk only) never validated.
+// At a just-in-time fill the capture read the ring slot's PREVIOUS occupant:
+// TIM Voices 1 fork 0x18200 got 0x8080 (the bytes exactly one ring-depth =
+// 4 KB earlier) instead of 0x3840; deterministic, 2 runs x 2 builds
+// (docs/resume_prompt_2026-07-29.md §8, CD sector 49385+512). Stall REQ
+// until every byte the transaction can touch is in the ring. rd_ahead_needed
+// clamps at the transfer TAIL, where +3 pokes past the last armed block: no
+// fetch would ever arrive (deadlock), and the host never consumes those
+// bytes (the driver's trailing word/byte reads stay inside the armed length
+// and data_complete ends the phase first).
+wire [22:0] rd_ahead_blk    = (data_cnt + 32'd3) >> 9;
+wire        rd_ahead_needed = (rd_ahead_blk < rd_blk_total);
+wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
+                  ((rd_cur_blk >= rd_hps_blk) ||
+                   (rd_ahead_needed && (rd_ahead_blk >= rd_hps_blk)))) ||
                  (phase == PHASE_DATA_IN  && (io_wr | wr_pending | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
                  (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | wr_pending | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
@@ -2020,19 +2086,26 @@ assign dbg_wrstall = { brst_valid, brst_maxphase, brst_read_done, brst_sel_seen,
 // signature. Latched per DATA_IN phase of a block-write command; read live
 // while an install runs and correlate against the corrupt 64 KB spans.
 //   [31:24]=write-phase serial (wraps)  [23:16]=mode flips this phase (sat)
-//   [15:8]=first beat's din  [7:2]=0  [1]=first-beat dbg_dma_word
+//   [15:8]=first beat's din  [7:2]=CUMULATIVE count of write phases whose
+//   FIRST word-mode beat arrived at odd data_cnt (sat 63 — the direct
+//   slip-trigger counter; with the beat-role fix in, nonzero here plus a
+//   clean extract diff = trigger occurred AND was handled)
+//   [1]=first-beat dbg_dma_word
 //   [0]=first-beat data_cnt[0] (law: 0; 1 = the smoking gun)
 reg  [7:0] wrfb_cmds  = 8'd0;
 reg  [7:0] wrfb_flips = 8'd0;
 reg  [7:0] wrfb_byte0 = 8'd0;
+reg  [5:0] wrfb_oddw  = 6'd0;
 reg        wrfb_par0  = 1'b0;
 reg        wrfb_word0 = 1'b0;
 reg        wrfb_armed = 1'b0;
+reg        wrfb_wmseen= 1'b0;
 reg        wrfb_dma_d = 1'b0;
 always @(posedge clk) begin
 	wrfb_dma_d <= dbg_dma_word;
 	if (phase != PHASE_DATA_IN || !cmd_write) begin
-		wrfb_armed <= 1'b1;
+		wrfb_armed  <= 1'b1;
+		wrfb_wmseen <= 1'b0;
 	end else begin
 		if (stb_ack && wrfb_armed) begin
 			wrfb_armed <= 1'b0;
@@ -2044,9 +2117,15 @@ always @(posedge clk) begin
 		end
 		else if (!wrfb_armed && (dbg_dma_word != wrfb_dma_d) && (wrfb_flips != 8'hFF))
 			wrfb_flips <= wrfb_flips + 8'd1;
+		// first word-mode beat of this write phase: odd parity = the slip trigger
+		if (stb_ack && dbg_dma_word && !wrfb_wmseen) begin
+			wrfb_wmseen <= 1'b1;
+			if (data_cnt[0] && wrfb_oddw != 6'h3F)
+				wrfb_oddw <= wrfb_oddw + 6'd1;
+		end
 	end
 end
-assign dbg_wrfb = { wrfb_cmds, wrfb_flips, wrfb_byte0, 6'd0, wrfb_word0, wrfb_par0 };
+assign dbg_wrfb = { wrfb_cmds, wrfb_flips, wrfb_byte0, wrfb_oddw, wrfb_word0, wrfb_par0 };
 
 // ---- Selection/command handshake observability (PSEL probe) -----------
 // Live state {phase,sel,bsy,req,ack} plus sticky high-water/counters that
@@ -2427,7 +2506,15 @@ reg                 pf_snooped = 1'b0;
 
 wire pf_snoop_hit =
 	(wren_a && (address_a == pf_c_addr || address_a == pf_d_addr ||
-	            (pf_st != PF_IDLE && (address_a == pf_c_tgt || address_a == pf_d_tgt)))) ||
+	            (pf_st != PF_IDLE && (address_a == pf_c_tgt || address_a == pf_d_tgt)) ||
+	            // (2026-07-29) steal-LAUNCH cycle: the address_c read issues
+	            // THIS cycle (pf_st still PF_IDLE, targets not latched yet),
+	            // so the in-flight clause above cannot see a same-cycle
+	            // port-A write to it; no_rw_check M10K returns OLD data on
+	            // the cross-port collision and the stale byte would commit
+	            // to q_c. (address_d needs no term: its read issues NEXT
+	            // cycle, after such a write has landed.)
+	            (pf_steal_c && address_a == address_c))) ||
 	(wren_b && (address_b == pf_c_addr || address_b == pf_d_addr ||
 	            (pf_st != PF_IDLE && (address_b == pf_c_tgt || address_b == pf_d_tgt))));
 

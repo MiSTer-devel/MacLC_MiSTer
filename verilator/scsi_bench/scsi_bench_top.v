@@ -66,7 +66,7 @@ assign io_lba_1 = io_lba[1];
 assign sd_buff_din_0 = sd_buff_din[0];
 assign sd_buff_din_1 = sd_buff_din[1];
 
-ncr5380 #(.DEVS(2), .ENABLE_EMPTY_CD(0)) ncr
+ncr5380 #(.DEVS(2)) ncr
 (
 	.clk(clk),
 	.reset(reset),
