@@ -256,12 +256,17 @@ margin in the core domains than the passing probe build, which means
 **STA slack does not predict this failure** — consistent with the
 historical STA-met-but-HW-marginal `#3` class.
 
-| domain | probes ON | probes OFF |
+CORRECTED like-for-like (both RTL `ceaec45`; the numbers first published
+here were build `4f656e01`'s, a different netlist):
+
+| domain | `24592e25` ON (PASSES) | `cc57535d` OFF (FAILS) |
 |---|---|---|
-| worst setup (pll_hdmi) | +0.464 | +0.317 |
-| `emu\|pll` general[0] | +1.942 | **+2.310** |
-| `emu\|pll` general[1] | +2.003 | **+2.406** |
-| worst hold | +0.242 | +0.248 |
+| worst setup (pll_hdmi) | +0.399 | +0.317 |
+| `emu\|pll` general[0] | **+1.475** | **+2.310** |
+| `emu\|pll` general[1] | +2.233 | +2.406 |
+| worst hold | +0.250 | +0.248 |
+
+The FAILING build has MORE core-domain margin than the PASSING one.
 
 Registers 35,346 (on) vs 32,928 (off) = 2,418 for the deck + its JTAG
 `sld_hub`; block memory bits identical at 3,975,530 (no RAM migration).
