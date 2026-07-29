@@ -50,6 +50,7 @@ module cd_audio #(
 	output     [31:0] ca_io_lba,
 	input             io_ack,
 	input       [7:0] sd_buff_addr,
+	input       [4:0] sd_buff_addr_hi,  // hps_io addr[12:8]: whole-frame bursts
 	input      [15:0] sd_buff_dout,
 	input             sd_buff_wr,
 
@@ -113,7 +114,11 @@ module cd_audio #(
 	//   [14:10]=mst [16:15]=pstate [18:17]=fst
 	//   [26:19]=toc_fetch_cnt (M_ACQ_REQ fires, wraps)
 	//   [31:27]=frame_fetch_cnt[4:0] (F_REQ fires, wraps)
-	output     [31:0] dbg_cda0
+	output     [31:0] dbg_cda0,
+
+	// Underrun probe word (JTAG CDUR): [31:16]=starvation entries (wraps),
+	// [15:0]=starved clk/256 (7.9 us units at 32.5 MHz clk).
+	output     [31:0] dbg_cdur
 );
 
 // HPS window contract (Main_MiSTer support/maclc/maclc_cd.h)
@@ -250,15 +255,20 @@ assign toc2_q2 = t2b2[0] ? t2o_q1 : t2e_q1;
 assign toc2_q3 = t2b2[0] ? t2e_q1 : t2o_q1;
 
 
-// frame ping-pong: 2 x 1280 x 16 (2352 B payload + 208 B pad per half)
+// frame ping-pong: 2 x 2048 x 16 (1176 words = one 2352 B frame per half).
+// Each half is filled by ONE whole-frame HPS transaction (Main forces
+// blksz=2352 for the AUDIO window, PSX-style): a single sd_ack window with
+// sd_buff_addr streaming 0..1175 continuously — the wide address bits come
+// in via sd_buff_addr_hi. The old 5x512 view cost five ~2.8 ms round-trips
+// per 13.3 ms frame = chronic ~4.5% starvation (CDUR-measured 2026-07-28).
 reg         fr_cap;
 reg         fr_half_w;
-reg  [2:0]  fr_blk;
 reg [11:0]  frame_ra;
 wire [15:0] frame_q;
+wire [10:0] fr_wword = {sd_buff_addr_hi[2:0], sd_buff_addr};
 cd_sdp #(.DW(16), .AW(12)) frame_ram (
 	.clock(clk),
-	.waddr({fr_half_w, fr_blk, sd_buff_addr}), .wdata(sd_buff_dout),
+	.waddr({fr_half_w, fr_wword}), .wdata(sd_buff_dout),
 	.wr(fr_cap && sd_buff_wr),
 	.raddr(frame_ra), .q(frame_q)
 );
@@ -1140,11 +1150,17 @@ wire       sample_half = fr_half_r;
 
 always @(posedge clk) begin
 	if (rst) begin
-		fst <= F_IDLE; fr_cap <= 0; fr_valid <= 2'b00; fr_half_w <= 0; fr_blk <= 0;
+		fst <= F_IDLE; fr_cap <= 0; fr_valid <= 2'b00; fr_half_w <= 0;
 		fr_rd <= 0; fr_act <= 0; fr_lba <= 0; fetch_lba <= 0; fetch_sync <= 1'b1;
 	end else begin
+		// Free the half that FINISHED. sample_half (= fr_half_r) has already
+		// flipped by the clock this block observes frame_done, so indexing by
+		// it freed the half that had just STARTED — the ping-pong degenerated
+		// into fetch-on-demand at every boundary and playback froze for one
+		// fetch duration (~0.5-4 ms, HPS-load dependent) 75x/s: THE original
+		// "not CD quality" graininess (CDUR: 71 starves/s, one per half).
 		if (flush) begin fr_valid <= 2'b00; fetch_sync <= 1'b1; end
-		else if (frame_done) fr_valid[sample_half] <= 1'b0;
+		else if (frame_done) fr_valid[frame_done_half_r] <= 1'b0;
 
 		case (fst)
 		F_IDLE: begin
@@ -1153,14 +1169,15 @@ always @(posedge clk) begin
 			else if ((pstate == ST_PLAY) && mounted && toc_ready &&
 			         !(&fr_valid) && (fetch_lba < stop_lba)) begin
 				fr_half_w <= fr_valid[0] ? 1'b1 : 1'b0;
-				fr_blk    <= 3'd0;
 				fst <= F_REQ;
 			end
 		end
 		F_REQ: begin
 			if (flush) fst <= F_IDLE;
 			else if (ch_grant && !toc_act && !toc_rd && !fr_rd && (mst == M_IDLE)) begin
-				fr_lba <= AUDIO_BLK + (fetch_lba * 32'd5) + {29'd0, fr_blk};
+				// lba = AUDIO window + disc LBA: ONE 2352-byte transaction
+				// fills the whole half (Main keys blksz on this window)
+				fr_lba <= AUDIO_BLK + fetch_lba;
 				fr_rd  <= 1'b1;
 				fr_act <= 1'b1;
 				fr_cap <= 1'b1;
@@ -1173,14 +1190,9 @@ always @(posedge clk) begin
 			if (ack_fall && fr_act) begin
 				fr_act <= 1'b0;
 				fr_cap <= 1'b0;
-				if (fr_blk == 3'd4) begin
-					fr_valid[fr_half_w] <= 1'b1;
-					fetch_lba <= fetch_lba + 32'd1;
-					fst <= F_IDLE;
-				end else begin
-					fr_blk <= fr_blk + 3'd1;
-					fst <= F_REQ;
-				end
+				fr_valid[fr_half_w] <= 1'b1;
+				fetch_lba <= fetch_lba + 32'd1;
+				fst <= F_IDLE;
 			end
 		end
 		default: fst <= F_IDLE;
@@ -1195,14 +1207,31 @@ reg [31:0] acc;
 reg [10:0] widx;
 reg  [1:0] sph;
 reg        frame_done_r;
+reg        frame_done_half_r;   // WHICH half just finished (captured pre-flip)
 assign frame_done = frame_done_r;
+
+// The 44.1 kHz targets are linearly interpolated on the way out (below):
+// sys/audio_out.sv picks AUDIO_L/R up with a free-running 48 kHz zero-order
+// hold, and feeding it the raw stair-step adds audible imaging ("not CD
+// quality" report, 07-28). Interpolating continuously in the 32.5 MHz domain
+// means whatever instant the framework samples, it sees a point on the
+// segment between the previous and current cadence targets — no knowledge of
+// the 48 kHz phase needed. frac16 is a Q16 approximation of the segment
+// phase (increment 89 ~= 65536*44100/32.5MHz per clk, saturating; reset at
+// each pair commit). Interpolation never leaves the [prev,target] range, so
+// the 16-bit output cannot overflow.
+reg signed [15:0] snd_l_t, snd_r_t;   // cadence-tick targets (was snd_l/r)
+reg signed [15:0] snd_l_p, snd_r_p;   // previous targets (segment start)
+reg        [16:0] frac16;             // Q16 segment phase, saturating at 1.0
 
 always @(posedge clk) begin
 	if (rst) begin
-		acc <= 0; widx <= 0; sph <= 0; frame_done_r <= 0;
-		snd_l <= 0; snd_r <= 0; fr_half_r <= 0; frame_ra <= 0;
+		acc <= 0; widx <= 0; sph <= 0; frame_done_r <= 0; frame_done_half_r <= 0;
+		snd_l_t <= 0; snd_r_t <= 0; snd_l_p <= 0; snd_r_p <= 0;
+		frac16 <= 0; fr_half_r <= 0; frame_ra <= 0;
 	end else begin
 		frame_done_r <= 1'b0;
+		if (!frac16[16]) frac16 <= frac16 + 17'd89;
 		if (flush) begin
 			widx <= 0; acc <= 0; sph <= 0; fr_half_r <= 1'b0;
 		end
@@ -1218,25 +1247,79 @@ always @(posedge clk) begin
 				sph <= sph + 2'd1;
 				case (sph)
 				2'd1: frame_ra <= {fr_half_r, widx + 11'd1};
-				2'd2: snd_l <= frame_q;
+				2'd2: begin snd_l_p <= snd_l_t; snd_l_t <= frame_q; end
 				default: begin
-					snd_r <= frame_q; sph <= 2'd0;
+					snd_r_p <= snd_r_t; snd_r_t <= frame_q;
+					frac16 <= 0; sph <= 2'd0;
 					if (widx == 11'd1174) begin
 						widx <= 0;
 						fr_half_r <= ~fr_half_r;
 						frame_done_r <= 1'b1;
+						// nonblocking: captures the PRE-flip half — the one
+						// that just finished playing
+						frame_done_half_r <= fr_half_r;
 					end else widx <= widx + 11'd2;
 				end
 				endcase
 			end
 		end
 		else begin
-			if (pstate != ST_PLAY) begin snd_l <= 0; snd_r <= 0; end
+			if (pstate != ST_PLAY) begin
+				snd_l_t <= 0; snd_r_t <= 0; snd_l_p <= 0; snd_r_p <= 0;
+			end
 			// underrun (half not ready): hold position, emit silence
 			if (pstate != ST_PLAY) acc <= 0;
 		end
 	end
 end
+
+// Interpolated output stage — the only driver of snd_l/snd_r.
+// The output register commits only every 8th clk (246 ns hold, ~92 points
+// per 44.1 kHz sample): sys/audio_out.sv's clk_audio pickup is a STABILITY
+// FILTER — two consecutive 24.576 MHz captures must be EQUAL before a value
+// is accepted (audio_out.sv "if(cl2 == cl1)") — so a bus that moves every
+// clk_sys is rejected outright: the framework freezes through any fast
+// segment and jumps where the ramp flattens (= the "scratchy, sometimes
+// muffled" report on the every-clk version of this stage, 07-28 evening).
+// The 8-clk hold spans ~6 clk_audio captures, so every step is accepted,
+// while the stair-step imaging the interpolation exists to kill stays gone.
+wire        [15:0] seg_f  = frac16[16] ? 16'hFFFF : frac16[15:0];
+wire signed [16:0] seg_dl = {snd_l_t[15], snd_l_t} - {snd_l_p[15], snd_l_p};
+wire signed [16:0] seg_dr = {snd_r_t[15], snd_r_t} - {snd_r_p[15], snd_r_p};
+wire signed [33:0] seg_ml = seg_dl * $signed({1'b0, seg_f});
+wire signed [33:0] seg_mr = seg_dr * $signed({1'b0, seg_f});
+wire signed [16:0] sum_l  = {snd_l_p[15], snd_l_p} + $signed(seg_ml[32:16]);
+wire signed [16:0] sum_r  = {snd_r_p[15], snd_r_p} + $signed(seg_mr[32:16]);
+reg  [2:0] odiv;
+always @(posedge clk) begin
+	if (rst || pstate != ST_PLAY) begin
+		snd_l <= 0; snd_r <= 0; odiv <= 0;
+	end else begin
+		odiv <= odiv + 3'd1;
+		if (odiv == 3'd0) begin
+			snd_l <= sum_l[15:0];
+			snd_r <= sum_r[15:0];
+		end
+	end
+end
+
+// Starvation forensics (CDUR): playing, but the half-frame the sample engine
+// needs has not been delivered, so the output freezes at its last value.
+// HDMI-capture forensics of the 07-20 build measured ~5% of music time in
+// 0.4-4 ms freezes — exactly this condition (the 2-half ping-pong affords
+// 13.3 ms of slack and HPS serving intermittently exceeds it), and it also
+// accounts for the CDS meter's 41.8k changes/s (44.1k x 0.95). Counters
+// wrap; readers diff two snapshots over a known interval.
+reg [15:0] ur_cnt  = 16'd0;
+reg [23:0] ur_clks = 24'd0;
+reg        ur_d    = 1'b0;
+wire       ur_now  = (pstate == ST_PLAY) && !fr_valid[fr_half_r];
+always @(posedge clk) begin
+	ur_d <= ur_now;
+	if (ur_now && !ur_d) ur_cnt  <= ur_cnt  + 16'd1;
+	if (ur_now)          ur_clks <= ur_clks + 24'd1;
+end
+assign dbg_cdur = {ur_cnt, ur_clks[23:8]};
 
 endmodule
 

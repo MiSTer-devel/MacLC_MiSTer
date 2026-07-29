@@ -167,7 +167,9 @@ module emu
 	wire  [VDNUM-1:0] sd_rd;
 	wire  [VDNUM-1:0] sd_wr;
 	wire  [VDNUM-1:0] sd_ack;
-	wire            [7:0] sd_buff_addr;
+	// hps_io drives [12:0] (AW=12 in WIDE mode); [7:0] serves every 512-byte
+	// consumer, [12:8] reach the CD whole-frame burst path (2352 B/txn).
+	wire           [12:0] sd_buff_addr;
 	wire           [15:0] sd_buff_dout;
 	wire           [15:0] sd_buff_din[VDNUM];
 	wire                  sd_buff_wr;
@@ -591,13 +593,17 @@ module emu
 	end
 
 	// ASC samples drive AUDIO_L/R, with CD audio (SCSI CD-ROM playback
-	// engine) mixed in at half gain, saturating. cd_snd_* are silent
-	// (exact zeros) whenever the drive isn't playing.
+	// engine) mixed in at full gain, saturating — the real LC sums the
+	// drive's line out with the DAC at unity, and the previous half-gain
+	// mix was the "CD sounds half as loud" report (07-28). cd_snd_* are
+	// silent (exact zeros) whenever the drive isn't playing, and are
+	// linearly interpolated inside cd_audio.sv so the sys/audio_out 48 kHz
+	// pickup doesn't add stair-step imaging.
 	wire signed [15:0] cd_snd_l, cd_snd_r;
 	wire signed [16:0] audio_mix_l = {asc_sample_l[15], asc_sample_l}
-	                               + {{2{cd_snd_l[15]}}, cd_snd_l[15:1]};
+	                               + {cd_snd_l[15], cd_snd_l};
 	wire signed [16:0] audio_mix_r = {asc_sample_r[15], asc_sample_r}
-	                               + {{2{cd_snd_r[15]}}, cd_snd_r[15:1]};
+	                               + {cd_snd_r[15], cd_snd_r};
 	assign AUDIO_L = (audio_mix_l > 17'sd32767)  ? 16'sd32767 :
 	                 (audio_mix_l < -17'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
 	assign AUDIO_R = (audio_mix_r > 17'sd32767)  ? 16'sd32767 :
@@ -694,8 +700,9 @@ module emu
 	wire scsiIRQ;         // NCR5380 latched IRQ (level) → pseudo-VIA IFR bit 3
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
-	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
+	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w, dbg_wrfb_w;
 	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
+	wire [31:0] dbg_cdur_w;
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
 
@@ -1194,6 +1201,15 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_cda4 (.probe(dbg_cda4_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
+	// CDUR: cd_audio delivery-starvation counters (2026-07-28, the "scratchy /
+	// not CD quality" hunt). [31:16]=starvation entries (wraps), [15:0]=starved
+	// clk/256 (7.9 us units). Healthy playback: both frozen. The 07-20 HDMI
+	// capture measured ~5% starvation duty = CDS 41.8k/s, freezes of 0.4-4 ms.
+	altsource_probe #(
+		.instance_id ("CDUR"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_cdur (.probe(dbg_cdur_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
 	altsource_probe #(
 		.instance_id ("PSDT"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
@@ -1214,6 +1230,15 @@ module emu
 		.instance_id ("PSD3"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
 	) cp_psd3 (.probe(sdma_snap_wr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	// WRFB: write-data-phase first-beat forensics (2026-07-28, the inserted-
+	// byte corruption hunt). Layout (scsi.v dbg_wrfb): [31:24]=write-phase
+	// serial [23:16]=byte/word mode flips this phase [15:8]=first beat's din
+	// [1]=first-beat dbg_dma_word [0]=first-beat data_cnt[0] (law: 0).
+	altsource_probe #(
+		.instance_id ("WRFB"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_wrfb (.probe(dbg_wrfb_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
 	// (PRST reset-source recorder and PFL0/PFL1 floppy probes + capture ring
 	// removed 2026-07-16 — #3 is root-caused/resolved and the 800K floppy
@@ -1327,7 +1352,9 @@ module emu
 		// odd regs alias onto the even reg below them. Reconstruct the real A0
 		// from tg68_a[0], exactly like the SWIM/IWM instance does.
 		.addr({cpuAddr[11:1], tg68_a[0]}),
-		.data_in(cpuDataOut[7:0]),
+		// Full 16-bit write bus: the FIFO must see BOTH byte lanes so MOVE.W/
+		// MOVE.L fills land every sample (see the fifo_pend note in rtl/asc.sv).
+		.data_in(cpuDataOut),
 		.data_out(asc_data_out),
 		.we(!_cpuRW && cpuBusControl),
 		.cpu_as_n(_cpuAS),
@@ -1377,6 +1404,39 @@ module emu
 		.enable_metastability    ("NO")
 	) u_aud_issp (
 		.probe  (aud_probe_bus),
+		.source ()
+	);
+
+	// CD-audio cadence probe (instance "CDS") — for the "CD audio sounds like
+	// half quality / distorted" report. Free-running wrap counters of VALUE
+	// CHANGES on the CD engine's PCM outputs; read twice a known interval
+	// apart (scripts/cd_meters.tcl) and diff mod 2^16:
+	//   ~44_100 changes/s during music  -> full-rate content reaches the mixer;
+	//     the whole digital path (HPS serving, fetch, sample engine) is
+	//     exonerated and the loss is downstream (mix gain / 48 kHz ZOH
+	//     resample in sys_top / analog out).
+	//   ~22_050/s -> literally half-rate content (duplicated samples): defect
+	//     in the serving/engine path.
+	//   Far lower + audible stutter -> underruns (frame fetch starving).
+	reg [15:0] cdl_chg_cnt = 16'd0, cdr_chg_cnt = 16'd0;
+	reg signed [15:0] cdl_prev = 16'sd0, cdr_prev = 16'sd0;
+	always @(posedge clk_sys) begin
+		cdl_prev <= cd_snd_l;
+		cdr_prev <= cd_snd_r;
+		if (cd_snd_l != cdl_prev) cdl_chg_cnt <= cdl_chg_cnt + 16'd1;
+		if (cd_snd_r != cdr_prev) cdr_chg_cnt <= cdr_chg_cnt + 16'd1;
+	end
+	wire [31:0] cds_probe_bus = { cdl_chg_cnt, cdr_chg_cnt };
+	altsource_probe #(
+		.sld_auto_instance_index ("YES"),
+		.sld_instance_index      (0),
+		.instance_id             ("CDS"),
+		.probe_width             (32),
+		.source_width            (0),
+		.source_initial_value    ("0"),
+		.enable_metastability    ("NO")
+	) u_cds_issp (
+		.probe  (cds_probe_bus),
 		.source ()
 	);
 `endif
@@ -1434,8 +1494,10 @@ module emu
 		.dbg_cda2(dbg_cda2_w),
 		.dbg_cda3(dbg_cda3_w),
 		.dbg_cda4(dbg_cda4_w),
+		.dbg_cdur(dbg_cdur_w),
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
+		.dbg_wrfb(dbg_wrfb_w),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),
@@ -1491,7 +1553,8 @@ module emu
 		.io_wr(scsi_wr),
 		.io_ack(scsi_ack),
 
-		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_addr(sd_buff_addr[7:0]),
+		.sd_buff_addr_hi(sd_buff_addr[12:8]),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),

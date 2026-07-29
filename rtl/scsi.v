@@ -44,6 +44,7 @@ module scsi
 	input         io_ack,
 
 	input   [7:0] sd_buff_addr,
+	input   [4:0] sd_buff_addr_hi, // hps_io addr[12:8] (CD whole-frame bursts)
 	input  [15:0] sd_buff_dout,
 	output [15:0] sd_buff_din,
 	input         sd_buff_wr,
@@ -71,11 +72,13 @@ module scsi
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen[5:0] [31]=req
 	output [31:0] dbg_wrstall,
+	output [31:0] dbg_wrfb,     // JTAG WRFB: write-phase first-beat forensics
 	output [31:0] dbg_cda0,     // JTAG CDA0: cd_audio TOC/engine state (see cd_audio.sv)
 	output [31:0] dbg_cda2,     // JTAG CDA2: last 0xC1 CDB {op9, start5, alloc7, alloc8}
 output [31:0] dbg_cda3,     // JTAG CDA3: last play-class CDB {op, cdb3, cdb4, cdb5}
 output [31:0] dbg_cda4,     // JTAG CDA4: last play-class CDB {cdb1, cdb6, cdb7, cdb8}
 	output [31:0] dbg_cda1,     // JTAG CDA1: {toc_rdy,no_media,mounted,ok, sense_asc, sense_key, cmd_cnt, last_op}
+	output [31:0] dbg_cdur,     // JTAG CDUR: cd_audio underrun counters (see cd_audio.sv)
 
 	// ===== BlueSCSI Toolbox dedicated block interface (TOOLBOX_ENABLE only) ====
 	// Isolated from the disk block interface above so the disk read/write path is
@@ -324,9 +327,19 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // the whole OS at the 8ms watchdog ceiling per poll (HW 2026-07-17). With
 // the medium gone the read completes with stale bytes and the driver gets
 // its error through the normal status path instead.
+// wr_pending lives at module scope (declared here, driven by the flush engine
+// below) because io_busy must include it: between a block's req_wr edge and
+// the flush issuing (io_wr rise) — one cycle normally, longer while a previous
+// flush is still in flight — neither io_wr nor io_ack is high, so the old
+// (io_wr | io_ack) busy term dropped REQ for that window and one extra
+// pseudo-DMA word could land in the slot the flush hadn't read yet. TIM3
+// install forensics 2026-07-28: a 7.5 MB write otherwise perfect except the
+// FIRST WORD of one 512-byte block ("Machine Data" blk 81) — this window's
+// exact signature.
+reg    wr_pending;
 wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted && (rd_cur_blk >= rd_hps_blk)) ||
-                 (phase == PHASE_DATA_IN  && (io_wr | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
-                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | (io_ack & ~ca_io_active)));
+                 (phase == PHASE_DATA_IN  && (io_wr | wr_pending | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
+                 (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | wr_pending | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
 	// WRITE with transfer length 0) must complete immediately: data_complete
 	// only sets on an ACK edge, which never comes when the initiator expects
@@ -1118,7 +1131,6 @@ assign io_rd = io_rd_d | ca_io_rd_w;
 
 always @(posedge clk) begin
 	reg old_wr;
-	reg wr_pending;
 	reg rd_busy;            // a read-prefetch sector fetch is outstanding
 
 	// A SCSI bus reset aborts any in-flight/queued disk IO.  Without this,
@@ -1184,7 +1196,8 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.ch_grant(ca_grant),
 		.ca_io_active(ca_io_active), .ca_io_rd(ca_io_rd_w), .ca_io_lba(ca_io_lba),
 		.io_ack(io_ack),
-		.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
+		.sd_buff_addr(sd_buff_addr), .sd_buff_addr_hi(sd_buff_addr_hi),
+		.sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
 		.ast_code(ca_ast_code), .cur_ctrl(ca_cur_ctrl), .cur_trk(ca_cur_trk),
 		.abs_m(ca_abs_m), .abs_s(ca_abs_s), .abs_f(ca_abs_f),
 		.rel_m(ca_rel_m), .rel_s(ca_rel_s), .rel_f(ca_rel_f),
@@ -1201,7 +1214,8 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.toc2_len(ca_t2_len),
 		.disc_audio(ca_disc_audio),
 		.snd_l(cd_snd_l), .snd_r(cd_snd_r),
-		.dbg_cda0(dbg_cda0)
+		.dbg_cda0(dbg_cda0),
+		.dbg_cdur(dbg_cdur)
 	);
 end else begin : g_no_cd_audio
 	assign ca_io_active = 1'b0;
@@ -1225,6 +1239,7 @@ end else begin : g_no_cd_audio
 	assign cd_snd_l = 16'sd0;
 	assign cd_snd_r = 16'sd0;
 	assign dbg_cda0 = 32'd0;
+	assign dbg_cdur = 32'd0;
 end endgenerate
 
 reg  stb_ack;
@@ -1996,6 +2011,42 @@ end
 //               [10:8]=live win_maxphase [7]=live win_read_done [6:0]=0
 assign dbg_wrstall = { brst_valid, brst_maxphase, brst_read_done, brst_sel_seen,
                        brst_count, brst_lastop, win_maxphase, win_read_done, 7'd0 };
+
+// ---- WRFB: write-data-phase first-beat forensics (2026-07-28) -------------
+// For the one-inserted-byte-per-64KB-unit corruption hunt: if a WRITE
+// command's first data beat ever arrives with data_cnt[0]=1, or the
+// byte/word pseudo-DMA mode flips mid-phase, the odd_byte_r lane pairing
+// slips one byte for the rest of the command — exactly the observed
+// signature. Latched per DATA_IN phase of a block-write command; read live
+// while an install runs and correlate against the corrupt 64 KB spans.
+//   [31:24]=write-phase serial (wraps)  [23:16]=mode flips this phase (sat)
+//   [15:8]=first beat's din  [7:2]=0  [1]=first-beat dbg_dma_word
+//   [0]=first-beat data_cnt[0] (law: 0; 1 = the smoking gun)
+reg  [7:0] wrfb_cmds  = 8'd0;
+reg  [7:0] wrfb_flips = 8'd0;
+reg  [7:0] wrfb_byte0 = 8'd0;
+reg        wrfb_par0  = 1'b0;
+reg        wrfb_word0 = 1'b0;
+reg        wrfb_armed = 1'b0;
+reg        wrfb_dma_d = 1'b0;
+always @(posedge clk) begin
+	wrfb_dma_d <= dbg_dma_word;
+	if (phase != PHASE_DATA_IN || !cmd_write) begin
+		wrfb_armed <= 1'b1;
+	end else begin
+		if (stb_ack && wrfb_armed) begin
+			wrfb_armed <= 1'b0;
+			wrfb_cmds  <= wrfb_cmds + 8'd1;
+			wrfb_byte0 <= din;
+			wrfb_par0  <= data_cnt[0];
+			wrfb_word0 <= dbg_dma_word;
+			wrfb_flips <= 8'd0;
+		end
+		else if (!wrfb_armed && (dbg_dma_word != wrfb_dma_d) && (wrfb_flips != 8'hFF))
+			wrfb_flips <= wrfb_flips + 8'd1;
+	end
+end
+assign dbg_wrfb = { wrfb_cmds, wrfb_flips, wrfb_byte0, 6'd0, wrfb_word0, wrfb_par0 };
 
 // ---- Selection/command handshake observability (PSEL probe) -----------
 // Live state {phase,sel,bsy,req,ack} plus sticky high-water/counters that

@@ -76,6 +76,7 @@ module ncr5380
 	input  [DEVS-1:0] io_ack,
 
 	input        [7:0] sd_buff_addr,
+	input        [4:0] sd_buff_addr_hi,  // hps_io addr[12:8]: CD whole-frame bursts
 	input       [15:0] sd_buff_dout,
 	output      [15:0] sd_buff_din[DEVS],
 	input              sd_buff_wr,
@@ -148,12 +149,14 @@ module ncr5380
 	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen [31]=req
 	output      [31:0] dbg_wr,
+	output      [31:0] dbg_wrfb,  // JTAG WRFB: write first-beat forensics (data-phase-routed)
 	// JTAG CDA0/CDA1: CD-audio engine + CD target command visibility
 	output      [31:0] dbg_cda0,
 	output      [31:0] dbg_cda1,
 	output      [31:0] dbg_cda2,
 	output      [31:0] dbg_cda3,
-	output      [31:0] dbg_cda4
+	output      [31:0] dbg_cda4,
+	output      [31:0] dbg_cdur
 );
 	parameter DEVS = 2;
 	// Read-prefetch ring depth for the CD target. 3 => 8 sectors / 4KB = two
@@ -651,6 +654,7 @@ module ncr5380
 	wire [31:0]     target_wrsnap[DEVS];   // JTAG debug: first-word-write capture
 	wire [31:0]     target_selsnap[DEVS];  // JTAG debug: selection/command handshake
 	wire [31:0]     target_wrstall[DEVS];  // JTAG debug: write-stall snapshot (PSCW)
+	wire [31:0]     target_wrfb[DEVS];     // JTAG debug: write first-beat forensics (WRFB)
 	wire [DEVS-1:0] target_bsy;
 
 	// Count SCSI bus resets (Mac asserting ICR.RST) -- the abort/retry signal.
@@ -715,6 +719,7 @@ module ncr5380
 		.dbg_cda2 ( dbg_cda2 ),
 		.dbg_cda3 ( dbg_cda3 ),
 		.dbg_cda4 ( dbg_cda4 ),
+		.dbg_cdur ( dbg_cdur ),
 		.sel    ( scsi_sel ),
 		.cd_enable ( cd_enable ),
 		// Selection requires a free bus — a wedged-BUSY device must not let a
@@ -755,6 +760,7 @@ module ncr5380
 		.io_ack ( cd_io_ack ),
 
 		.sd_buff_addr( sd_buff_addr ),
+		.sd_buff_addr_hi( sd_buff_addr_hi ),
 		.sd_buff_dout( sd_buff_dout ),
 		.sd_buff_din( cd_sd_buff_din ),
 		// Frame sd_buff_wr by EITHER slot session that fills a buffer inside this
@@ -784,7 +790,8 @@ module ncr5380
 		.dbg_dma_lowbyte( dma_write_low_byte ),
 		.dbg_wrsnap( ),
 		.dbg_selsnap( ),
-		.dbg_wrstall( )
+		.dbg_wrstall( ),
+		.dbg_wrfb( )
 	);
 
 	generate
@@ -835,6 +842,7 @@ module ncr5380
 				.io_ack ( io_ack[i] & target_bsy[i] ),
 
 				.sd_buff_addr( sd_buff_addr ),
+				.sd_buff_addr_hi( 5'd0 ),   // whole-frame bursts are CD-only
 				.sd_buff_dout( sd_buff_dout ),
 				.sd_buff_din( sd_buff_din[i] ),
 				.sd_buff_wr( sd_buff_wr & target_bsy[i] ),
@@ -857,7 +865,8 @@ module ncr5380
 				.dbg_dma_lowbyte( dma_write_low_byte ),
 				.dbg_wrsnap( target_wrsnap[i] ),
 				.dbg_selsnap( target_selsnap[i] ),
-				.dbg_wrstall( target_wrstall[i] )
+				.dbg_wrstall( target_wrstall[i] ),
+				.dbg_wrfb( target_wrfb[i] )
 			);
 		end
 	endgenerate
@@ -947,6 +956,18 @@ module ncr5380
 			if (target_phase[j] == 3'd3 || target_phase[j] == 3'd2) dbg_wr_mux = target_wrstall[j];
 	end
 	assign dbg_wr = dbg_wr_mux;
+
+	// WRFB: same data-phase routing as PSCW; the latches persist after the
+	// phase ends, so a read between commands returns the LAST write's beats
+	// for whichever target held a data phase most recently in the mux scan.
+	reg [31:0] dbg_wrfb_mux;
+	always begin : wrfb_mux
+		integer k;
+		dbg_wrfb_mux = target_wrfb[DEVS-1];
+		for (k = 0; k < DEVS; k = k + 1)
+			if (target_phase[k] == 3'd3 || target_phase[k] == 3'd2) dbg_wrfb_mux = target_wrfb[k];
+	end
+	assign dbg_wrfb = dbg_wrfb_mux;
 
 	// NOTE: lbmactwo's JTAG In-System Source/Probe (altsource_probe) blocks for
 	// target_wrsnap/target_selsnap were removed in the MacLC port — this core has

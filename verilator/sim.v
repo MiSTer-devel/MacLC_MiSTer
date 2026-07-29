@@ -641,7 +641,9 @@ module emu
 		// odd ASC registers (MODE/FIFOMODE/CLOCK) don't alias onto the even reg
 		// below them. Same fix as the SWIM/IWM instance above.
 		.addr({cpuAddr[11:1], tg68_a[0]}),
-		.data_in(cpuDataOut[7:0]),
+		// Full 16-bit write bus: the FIFO must see BOTH byte lanes so MOVE.W/
+		// MOVE.L fills land every sample (see the fifo_pend note in rtl/asc.sv).
+		.data_in(cpuDataOut),
 		.data_out(asc_data_out),
 		.we(!_cpuRW && cpuBusControl),
 		.cpu_as_n(_cpuAS),
@@ -849,6 +851,7 @@ module emu
 		.io_ack(sd_ack[1:0]),
 
 		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_addr_hi(5'd0),   // sim HPS model serves 512-byte blocks only
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(scsi_buff_din),
 		.sd_buff_wr(sd_buff_wr),
