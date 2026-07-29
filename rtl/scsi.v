@@ -281,15 +281,24 @@ always @(posedge clk) begin
 		if (phase != PHASE_DATA_IN)
 			wm_beat2 <= 1'b0;
 		else if (stb_ack) begin
-			if (!dbg_dma_word)
-				wm_beat2 <= 1'b0;
-			else if (!wm_beat2) begin   // beat A: high byte on din, low byte stable in the ncr latch
+			// Test wm_beat2 FIRST: once a word pair is in flight the next beat
+			// IS beat B by construction, so the decision must not consult the
+			// live mode signal. dbg_dma_word (= ncr dma_word_latched) re-latches
+			// on the NEXT CPU bus-cycle RISE, which is not DREQ-gated and can
+			// land in the ~3-clock gap between the pair's two ACKs. If that next
+			// access is byte-mode (the driver flips modes constantly — WRFB
+			// measured up to 254 flips in one phase) a mode-first test would
+			// mistake beat B for a byte beat, store the stale high byte still on
+			// din, and re-slip the lane the fix exists to protect.
+			if (wm_beat2) begin         // beat B: din stale, serve the captured low byte
+				store_low <= 1'b1;
+				wm_beat2  <= 1'b0;
+			end else if (dbg_dma_word) begin
+				// beat A: high byte on din, low byte stable in the ncr latch
 				odd_byte_r <= dbg_dma_lowbyte;
 				wm_beat2   <= 1'b1;
-			end else begin              // beat B: din stale, serve the captured low byte
-				store_low  <= 1'b1;
-				wm_beat2   <= 1'b0;
 			end
+			// byte beat: store din (store_low stays 0), wm_beat2 already clear
 		end
 	end
 end
