@@ -1163,6 +1163,38 @@ module emu
 	wire [7:0]  dbg_flp_raw;
 	wire [21:0] dbg_flp_gcr_addr;
 
+	// ── Always-on marginality anchor (2026-07-29) ───────────────────────────
+	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
+	// path on hardware (Finder colour-icon noise → error-11 / F-Line bombs)
+	// while every probe-bearing fit passes; STA is met either way and does not
+	// predict it (docs/resume_probes_off_hunt_2026-07-29.md §5). A two-way
+	// bisect isolated the protective effect to the fanout of the 11 top-level
+	// ISSP probes below — NOT the dbg_probes observer deck: observer-only
+	// (54b6c8e1) bombed the Finder on boot 1; ISSP-only (063c2354) passed the
+	// full colour-icon gate + 3-boot soak. These sink registers keep exactly
+	// the same nets loaded in every build — deliberately, with no JTAG hub —
+	// so the fitter keeps treating the SCSI capture/status cones as live
+	// logic. preserve+noprune = no merging, no retiming, no sweeping. Do NOT
+	// remove, ifdef, or XOR-fold them (a reduction would let synthesis
+	// restructure the cones); ~352 FFs is the entire cost.
+	(* preserve, noprune *) reg [31:0] anchor_cda0, anchor_cda1, anchor_cda2,
+	                                   anchor_cda3, anchor_cda4, anchor_cdur;
+	(* preserve, noprune *) reg [31:0] anchor_psdt, anchor_psds, anchor_psd2,
+	                                   anchor_psd3, anchor_wrfb;
+	always @(posedge clk_sys) begin
+		anchor_cda0 <= dbg_cda0_w;
+		anchor_cda1 <= dbg_cda1_w;
+		anchor_cda2 <= dbg_cda2_w;
+		anchor_cda3 <= dbg_cda3_w;
+		anchor_cda4 <= dbg_cda4_w;
+		anchor_cdur <= dbg_cdur_w;
+		anchor_psdt <= {sdma_berr_cnt, 1'b0, sdma_stall_max};
+		anchor_psds <= {15'd0, sdma_snapped, sdma_snap_scsi2};
+		anchor_psd2 <= sdma_snap_ncr;
+		anchor_psd3 <= sdma_snap_wr;
+		anchor_wrfb <= dbg_wrfb_w;
+	end
+
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
