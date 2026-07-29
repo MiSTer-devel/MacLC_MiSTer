@@ -49,7 +49,16 @@ static uint64_t cyc = 0;
 static VerilatedFstC* tfp = nullptr;
 #endif
 
-static uint8_t ramp(uint64_t off) { return (uint8_t)(off & 0xff); }
+// Data pattern. NOT a plain (off & 0xff) ramp: that has period 256, so the
+// content of every ring block is byte-identical to the block that occupied
+// the same ring slot one ring-depth earlier — a stale-slot serve (the
+// 2026-07-29 CD boundary bug: bytes served from the slot's PREVIOUS
+// occupant) verifies as CLEAN against it. Folding the higher offset bytes
+// in makes every 512-multiple displacement change the value, so stale
+// serves from any block distance are detectable.
+static uint8_t ramp(uint64_t off) {
+	return (uint8_t)((off & 0xff) ^ ((off >> 8) & 0xff) ^ ((off >> 16) & 0xff));
+}
 
 // ---------------- HPS block-device model ----------------
 // READ fetch (io_rd): (latency) -> io_ack=1, stream 256 words into the target
@@ -308,9 +317,18 @@ static void reset_dut(int id_slot) {
 // ---------------- one full READ(6) run ----------------
 // M_MIX: deterministic pseudo-random interleave of byte/word/longword reads
 // with per-read (ds, gap) jitter — torture for the width-latch state machine.
-enum Mode { M_BYTE, M_WORD, M_LONG, M_MIX };
+// M_LONGSKEW / M_WORDSKEW: the Mac driver consumes a byte/word PREFIX before
+// switching to its wide blind-transfer loop, so the wide-access grid is
+// SKEWED off the 512-byte block grid and every block boundary is crossed
+// mid-access: longskew = word prefix + longword body (din_pair_next capture
+// reaches 2 bytes into the next ring block — the 2026-07-29 CD defect),
+// wordskew = byte prefix + odd-aligned word body (din_pair itself crosses).
+// Both need the host to catch the fetch frontier (hps latency > host pace)
+// to expose a serve of not-yet-filled ring bytes.
+enum Mode { M_BYTE, M_WORD, M_LONG, M_MIX, M_LONGSKEW, M_WORDSKEW };
 static const char* mode_name(Mode m) {
-	return m == M_BYTE ? "byte" : m == M_WORD ? "word" : m == M_LONG ? "long" : "mix";
+	return m == M_BYTE ? "byte" : m == M_WORD ? "word" : m == M_LONG ? "long" :
+	       m == M_MIX ? "mix" : m == M_LONGSKEW ? "longskew" : "wordskew";
 }
 
 static uint32_t lcg_state;
@@ -394,6 +412,78 @@ static RunResult run_read(Mode mode, int sectors, int ds, int gap, int hps_lat,
 			got.push_back((uint8_t)(v1 & 0xff));
 			got.push_back((uint8_t)(v2 >> 8));
 			got.push_back((uint8_t)(v2 & 0xff));
+		}
+	} else if (mode == M_LONGSKEW) {
+		// word prefix, longword body, word tail — every 512-boundary is
+		// crossed by a longword whose SECOND word (din_pair_next capture at
+		// the end of cycle 1) lies in the next block.
+		int d = 0;
+		{
+			uint16_t v; ReadRec r; r.idx = 0;
+			if (!dma_read16(true, false, false, ds, gap, v, r)) { res.dreq_timeout = true; aborted = true; }
+			else {
+				if (r.unstable) res.unstable++;
+				push_rec(r);
+				got.push_back((uint8_t)(v >> 8));
+				got.push_back((uint8_t)(v & 0xff));
+				d = 2;
+			}
+		}
+		while (!aborted && len - d >= 6) {
+			uint16_t v1, v2; ReadRec r1, r2; r1.idx = d; r2.idx = d + 2;
+			if (!dma_read16(true, true, false, ds, gap, v1, r1)) { res.dreq_timeout = true; aborted = true; break; }
+			if (r1.unstable) res.unstable++;
+			push_rec(r1);
+			if (!dma_read16(true, true, true, ds, gap, v2, r2)) { res.dreq_timeout = true; aborted = true; break; }
+			if (r2.unstable) res.unstable++;
+			push_rec(r2);
+			got.push_back((uint8_t)(v1 >> 8));
+			got.push_back((uint8_t)(v1 & 0xff));
+			got.push_back((uint8_t)(v2 >> 8));
+			got.push_back((uint8_t)(v2 & 0xff));
+			d += 4;
+		}
+		if (!aborted && d < len) {          // final word (d == len-2)
+			uint16_t v; ReadRec r; r.idx = d;
+			if (!dma_read16(true, false, false, ds, gap, v, r)) { res.dreq_timeout = true; aborted = true; }
+			else {
+				if (r.unstable) res.unstable++;
+				push_rec(r);
+				got.push_back((uint8_t)(v >> 8));
+				got.push_back((uint8_t)(v & 0xff));
+			}
+		}
+	} else if (mode == M_WORDSKEW) {
+		// byte prefix, odd-aligned word body, byte tail — every 512-boundary
+		// is crossed INSIDE din_pair itself (bytes 511|512 in one word).
+		int d = 0;
+		{
+			uint16_t v; ReadRec r; r.idx = 0;
+			if (!dma_read16(false, false, false, ds, gap, v, r)) { res.dreq_timeout = true; aborted = true; }
+			else {
+				if (r.unstable) res.unstable++;
+				push_rec(r);
+				got.push_back((uint8_t)(v & 0xff));
+				d = 1;
+			}
+		}
+		while (!aborted && len - d >= 3) {
+			uint16_t v; ReadRec r; r.idx = d;
+			if (!dma_read16(true, false, false, ds, gap, v, r)) { res.dreq_timeout = true; aborted = true; break; }
+			if (r.unstable) res.unstable++;
+			push_rec(r);
+			got.push_back((uint8_t)(v >> 8));
+			got.push_back((uint8_t)(v & 0xff));
+			d += 2;
+		}
+		if (!aborted && d < len) {          // final byte (d == len-1)
+			uint16_t v; ReadRec r; r.idx = d;
+			if (!dma_read16(false, false, false, ds, gap, v, r)) { res.dreq_timeout = true; aborted = true; }
+			else {
+				if (r.unstable) res.unstable++;
+				push_rec(r);
+				got.push_back((uint8_t)(v & 0xff));
+			}
 		}
 	} else { // M_MIX: width + pacing jitter, seeded by the sweep params
 		lcg_state = 0xC0FFEE ^ (ds * 7919) ^ (gap * 104729) ^ hps_lat;
@@ -591,7 +681,7 @@ int main(int argc, char** argv) {
 	(void)wave;
 #endif
 
-	Mode modes[4] = { M_BYTE, M_WORD, M_LONG, M_MIX };
+	Mode modes[6] = { M_BYTE, M_WORD, M_LONG, M_MIX, M_LONGSKEW, M_WORDSKEW };
 
 	// write-mode single runs (separate path: verifies the flushed image)
 	if (one_mode && (!strcmp(one_mode, "wbyte") || !strcmp(one_mode, "wword"))) {
@@ -619,6 +709,8 @@ int main(int argc, char** argv) {
 			else if (!strcmp(one_mode, "word")) m = M_WORD;
 			else if (!strcmp(one_mode, "long")) m = M_LONG;
 			else if (!strcmp(one_mode, "mix")) m = M_MIX;
+			else if (!strcmp(one_mode, "longskew")) m = M_LONGSKEW;
+			else if (!strcmp(one_mode, "wordskew")) m = M_WORDSKEW;
 		}
 		int ds = one_ds >= 0 ? one_ds : 0;
 		int gap = one_gap >= 0 ? one_gap : 2;

@@ -383,7 +383,27 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 // FIRST WORD of one 512-byte block ("Machine Data" blk 81) — this window's
 // exact signature.
 reg    wr_pending;
-wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted && (rd_cur_blk >= rd_hps_blk)) ||
+// (2026-07-29) rd_ahead_blk: block of the FURTHEST byte one pseudo-DMA
+// transaction can consume. The host-face serves din_pair/din_pair_next =
+// bytes data_cnt..data_cnt+3, and a longword read CAPTURES the +2/+3 pair
+// (its ACK-suppressed second word, ncr5380 dma_second_word_data) at the END
+// of its FIRST bus cycle. When the driver's byte/word prefix skews the
+// longword grid off the 512-byte block grid, that capture crosses into the
+// NEXT ring block — which the old stall (rd_cur_blk only) never validated.
+// At a just-in-time fill the capture read the ring slot's PREVIOUS occupant:
+// TIM Voices 1 fork 0x18200 got 0x8080 (the bytes exactly one ring-depth =
+// 4 KB earlier) instead of 0x3840; deterministic, 2 runs x 2 builds
+// (docs/resume_prompt_2026-07-29.md §8, CD sector 49385+512). Stall REQ
+// until every byte the transaction can touch is in the ring. rd_ahead_needed
+// clamps at the transfer TAIL, where +3 pokes past the last armed block: no
+// fetch would ever arrive (deadlock), and the host never consumes those
+// bytes (the driver's trailing word/byte reads stay inside the armed length
+// and data_complete ends the phase first).
+wire [22:0] rd_ahead_blk    = (data_cnt + 32'd3) >> 9;
+wire        rd_ahead_needed = (rd_ahead_blk < rd_blk_total);
+wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
+                  ((rd_cur_blk >= rd_hps_blk) ||
+                   (rd_ahead_needed && (rd_ahead_blk >= rd_hps_blk)))) ||
                  (phase == PHASE_DATA_IN  && (io_wr | wr_pending | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
                  (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | wr_pending | (io_ack & ~ca_io_active)));
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
@@ -2486,7 +2506,15 @@ reg                 pf_snooped = 1'b0;
 
 wire pf_snoop_hit =
 	(wren_a && (address_a == pf_c_addr || address_a == pf_d_addr ||
-	            (pf_st != PF_IDLE && (address_a == pf_c_tgt || address_a == pf_d_tgt)))) ||
+	            (pf_st != PF_IDLE && (address_a == pf_c_tgt || address_a == pf_d_tgt)) ||
+	            // (2026-07-29) steal-LAUNCH cycle: the address_c read issues
+	            // THIS cycle (pf_st still PF_IDLE, targets not latched yet),
+	            // so the in-flight clause above cannot see a same-cycle
+	            // port-A write to it; no_rw_check M10K returns OLD data on
+	            // the cross-port collision and the stale byte would commit
+	            // to q_c. (address_d needs no term: its read issues NEXT
+	            // cycle, after such a write has landed.)
+	            (pf_steal_c && address_a == address_c))) ||
 	(wren_b && (address_b == pf_c_addr || address_b == pf_d_addr ||
 	            (pf_st != PF_IDLE && (address_b == pf_c_tgt || address_b == pf_d_tgt))));
 
