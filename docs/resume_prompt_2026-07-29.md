@@ -183,6 +183,19 @@ preserved by a disk-to-disk copy — so it enters on the READ side.
   serving-boundary bug. Next step: instrument the CD read/serve path
   around the 512 B sub-boundary handling.
 
+### Also OPEN (pre-existing, user-confirmed "for a while") — colour-icon
+### display corruption
+Seen on the probes-off boot 3 in the Finder: custom COLOUR icons render
+as multicolour noise (volume icons, System Folder icons, Trash, the TIM
+Voices doc icon) while plain 1-bit folder icons, all window chrome,
+menus and text render perfectly. The selectivity — colour icons only —
+points at the 4/8bpp colour path rather than the scaler or a fit
+problem, which lines up with the known 4/8bpp colour issue that the
+DDR3-video-channel work is meant to fix (video fetch off SDRAM onto
+cached DDR3). NOT caused by the write fix or by dropping the probe deck:
+the user confirms it predates both. Do not score it against a boot gate;
+score the gate on boot + main-loop responsiveness.
+
 ## Mission 2 — the probes-off marginality
 
 ### The facts
@@ -201,7 +214,36 @@ preserved by a disk-to-disk copy — so it enters on the READ side.
   historical `#3` class (SCSI CSR reads) is the prime suspect and the
   Finder-wedge symptom (blocked on disk I/O) matches.
 
-### The hunt (attributes only — no behavioral RTL in this mission)
+### RESOLVED 2026-07-29 — probes-off now PASSES, no anchors needed
+
+A probes-off fit of the POST-write-fix netlist (`ceaec45`, SEED 5, md5
+`cc57535d`, STA +0.248) **passes the boot gate 3/3** with a responsive
+main loop (menus open on demand — the historical failure was a live
+cursor over a blocked main loop). The attribute hunt below was never
+needed and should NOT be started unless the symptom returns.
+
+Most likely cause of the earlier failures: the write fix changed the SCSI
+cone structurally (new `wm_beat2`/`store_low` registers; the data-source
+mux moved off the `data_cnt[0]` parity path), which relieved the marginal
+path the probe instances had been accidentally anchoring. The A/B backs
+this up — the probes-off build has MORE margin in the core domains than
+the probe build, not less:
+
+| domain | probes ON | probes OFF |
+|---|---|---|
+| worst setup (pll_hdmi) | +0.464 | +0.317 |
+| `emu\|pll` general[0] | +1.942 | **+2.310** |
+| `emu\|pll` general[1] | +2.003 | **+2.406** |
+| worst hold | +0.242 | +0.248 |
+
+Registers 35,346 (on) vs 32,928 (off) = 2,418 for the deck + its JTAG
+`sld_hub`; block memory bits identical at 3,975,530 (no RAM migration).
+Report pair archived at `scratch/m2/probes_{on,off}.{map,fit,sta}.rpt`.
+
+**Consequence: releases no longer need to ship the probe decks.** The
+07-28 user-approved deviation is retired.
+
+### The hunt (attributes only — no behavioral RTL) — ONLY IF IT RETURNS
 1. Diff `map.rpt`/`fit.rpt` between the probe build and a probes-off build
    for the SCSI cones (register duplication/retiming reports name nets).
 2. Add targeted anchors on OUR side: `(* preserve *)`/`(* syn_keep *)` RTL
