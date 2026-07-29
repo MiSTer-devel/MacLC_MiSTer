@@ -1,5 +1,39 @@
 # Resume — the probes-off marginality hunt (2026-07-29)
 
+## ✅ RESOLVED 2026-07-29 (same day, later session) — hunt CLOSED
+
+The §4.1 bisect ran and landed the fix. Do not re-run the hunt.
+
+- **Bisect:** `USE_DBG_PROBES` split into two macros (commit `42c3ac6`).
+  Observer-only fit `54b6c8e1` **FAILED** ("Finder" bad F-Line bomb on
+  boot 1; control `24592e25` clean on the same volume minutes later).
+  ISSP-only fit `063c2354` **PASSED** the full §3 gate + 3-boot soak.
+  ⇒ The anchor is the fanout of the **11 top-level ISSP probes** (the
+  sdma stall/snap capture cone — whose loads pin `dbg_scsi2_w` /
+  `dbg_ncr_w` / `dbg_wr_w` out of `scsi.v`/`ncr5380.sv` — plus the
+  CD-audio taps and WRFB). The `dbg_probes` observer deck is irrelevant.
+- **Fix (commit `4dfb463`):** always-on `(* preserve, noprune *)` sink
+  registers in `MacLC.sv` reading exactly the 11 probe words, compiled
+  into EVERY build. ~352 FFs, no RAM delta, **no JTAG hub**.
+- **Validation:** release-config fit `56b8ba1b` (both macros off, no
+  `sld_hub`, STA worst +0.245) passed the full §3 Finder colour-icon
+  gate; boots 1/2/3 all md5-identical to the known-good reference
+  (`947f213c...`), clean shutdowns between. RBF archived as
+  `scratch/MacLC_ANCHOR_56b8ba1bs5.rbf`; bench parked at menu with it
+  in `_Unstable/MacLC.rbf`.
+- **Standing law:** the anchor regs must never be removed, ifdef'd, or
+  XOR-folded (see the comment block in `MacLC.sv`). Per-fit marginality
+  remains PERMANENT — every future release fit still gets the §3 gate;
+  the anchor makes probes-off fits survivable, not gate-exempt.
+- Bench note: the games fixture on the box is the user's own restore
+  (md5 `ebf3f382`, ≠ the `d57c4521` pristine); dirty copy preserved as
+  `.damaged728`. MiSTer moved to **192.168.99.143** (subnet change;
+  `local.env` already updated).
+
+Everything below is the historical dossier as written before the fix.
+
+---
+
 Paste the block below as the opening message of the next session.
 Everything after it is the supporting dossier.
 
