@@ -1711,7 +1711,10 @@ wire       cmd_cd_audio_nop = (CDROM != 0) && ((op_code == 8'hc8) || (op_code ==
                                                // 2026-07-20). SEEK(6)/(10) carry the
                                                // same Annex-C stop-audio semantics.
                                                (op_code == 8'h01) ||
-                                               (op_code == 8'h0b) || (op_code == 8'h2b));
+                                               (op_code == 8'h0b) || (op_code == 8'h2b) ||
+                                               // PLAY AUDIO(10)/(12) LBA forms (gap
+                                               // pass 2026-07-29; BlueSCSI 2379/2393)
+                                               (op_code == 8'h45) || (op_code == 8'ha5));
 wire       cmd_cd_toc43  = (CDROM != 0) && (op_code == 8'h43);  // standard READ TOC (any format)
 // old-style format select in the CONTROL byte (cmd[9][7:6]) — the AppleCD
 // driver's actual dialect on the 8004 identity (2026-07-19 capture: 0x80).
@@ -1892,6 +1895,7 @@ reg [31:0] dbg_play_cdb  = 32'd0;
 reg [31:0] dbg_play_cdb2 = 32'd0;
 wire cmd_play_class = (op_code == 8'h47) || (op_code == 8'h48) ||
                       (op_code == 8'h4b) || (op_code == 8'h4e) ||
+                      (op_code == 8'h45) || (op_code == 8'ha5) ||
                       (op_code == 8'hc8) || (op_code == 8'hc9) ||
                       (op_code == 8'hca) || (op_code == 8'hcb) ||
                       (op_code == 8'hcd) ||

@@ -419,6 +419,9 @@ reg  [7:0] c_op, c_1, c_2, c_3, c_4, c_5, c_6, c_7, c_8, c_9;
 reg        cmd_pend;
 reg [31:0] c_addr;                      // resolved target address
 reg [31:0] c_next;                      // start of following track (track mode)
+// PLAY AUDIO(10)/(12) "from current position" sentinel (BlueSCSI 2551)
+wire       play_lba_ff = (c_2 == 8'hFF) && (c_3 == 8'hFF) &&
+                         (c_4 == 8'hFF) && (c_5 == 8'hFF);
 reg  [6:0] c_trk;                       // 0-based requested track
 reg  [6:0] c_trk2;                      // 0-based index whose START bounds the play
                                         // (vendor: c_trk+1; 0x48: end-track+1)
@@ -973,6 +976,19 @@ always @(posedge clk) begin
 					if (!toc_valid) begin c_addr <= 32'd0; c_next <= leadout_lba; end
 				end
 			end
+			8'h45, 8'ha5: begin                            // PLAY AUDIO(10)/(12), LBA form
+				// Gap pass 2026-07-29; oracle BlueSCSI doPlayAudio (2379/2393):
+				// LBA 0xFFFFFFFF = play from CURRENT position (resolved before
+				// anything else, 2551); length 0 = seek-only, which falls into
+				// the 47/48 zero-length arm below via c_addr == c_next. Length
+				// is in frames: (10) = cdb7..8, (12) = cdb6..9. The LBA is
+				// already in the engine's sector domain (same as cur_lba).
+				c_addr <= play_lba_ff ? cur_lba : {c_2, c_3, c_4, c_5};
+				c_next <= (play_lba_ff ? cur_lba : {c_2, c_3, c_4, c_5}) +
+				          ((c_op == 8'h45) ? {16'd0, c_7, c_8}
+				                           : {c_6, c_7, c_8, c_9});
+				mst <= M_APPLY;
+			end
 			8'h4b:                                         // PAUSE/RESUME (cdb8 bit0 = resume)
 				if (c_8[0]) begin
 					if (pstate == ST_PAUSE) pstate <= ST_PLAY;
@@ -1041,7 +1057,7 @@ always @(posedge clk) begin
 					else if (stop_lba <= c_addr) stop_lba <= leadout_lba;
 				end
 			end
-			8'h47, 8'h48: begin                            // standard range play
+			8'h47, 8'h48, 8'h45, 8'ha5: begin              // standard range play
 				if (c_addr == c_next) begin
 					// Zero-length play = SEEK-ONLY per SCSI-2 (BlueSCSI
 					// doPlayAudio length==0: "update the position without
