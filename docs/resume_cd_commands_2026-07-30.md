@@ -53,6 +53,26 @@ hardware gate at 23:11. Same netlist + same seed ⇒ same bits. So the
 commits are not merely "equivalent to" the validated build; they **are**
 it. (Useful trick for this project generally.)
 
+## 4b. Hardware verdict on the candidate
+
+Release candidate **`a512d428`** (seed 5, STA met +0.180 ns,
+`scratch/MacLC_CDCMDS_a512d428s5.rbf`) — the whole branch:
+
+| boot | config | result |
+|---|---|---|
+| 1 | CD detached | PASS `94fedd19`, input liveness proven, clean shutdown |
+| 2 | CD attached | PASS `94fedd19`; **disc mounts**, AppleCD player shows "Audio CD", Track 01, slider at full |
+| 3–4 | CD attached | PASS `94fedd19` ×2, clean shutdowns (`scratch/soak.sh`) |
+
+Every boot screenshot is byte-identical to the known-good baseline.
+Sim gates on the final tree: `gapcmds` PASS, `cdvol` PASS, `longskew`
+40 sectors 0 mismatches, full disk read/write sweep 0 failing cells.
+
+**Not yet done: an audible playback test on this candidate** — the user
+was asleep and the bench speakers are audible to them. Everything
+silent about the audio path is green; a 30-second listen is the only
+remaining check before release.
+
 ## 5. ★ Bench law: detach the CD before gating
 
 The hang that faked all those failures is triggered by having a CUE/BIN
