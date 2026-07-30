@@ -528,6 +528,7 @@ wire [7:0] cmd_dout =
 		cmd_cd_subq?cd_subq_dout:
 		cmd_cd_subq43?cd_subq43_dout:
 		cmd_cd_astat?cd_astat_dout:
+		cmd_cd_hdr?cd_hdr_dout:
 		cmd_tb_devinfo?tb_devinfo_dout:
 		cmd_tb_debug?tb_debug_dout:
 		(cmd_tb_fs_in || cmd_cdc_in)?tb_serve:
@@ -544,6 +545,7 @@ wire [15:0] cmd_dout_pair =
 		cmd_cd_subq?{cd_subq_dout, cd_subq_dout_next}:
 		cmd_cd_subq43?{cd_subq43_dout, cd_subq43_dout_next}:
 		cmd_cd_astat?{cd_astat_dout, cd_astat_dout_next}:
+		cmd_cd_hdr?{cd_hdr_dout, cd_hdr_dout_next}:
 		cmd_tb_devinfo?{tb_devinfo_dout, tb_devinfo_dout_next}:
 		cmd_tb_debug?{tb_debug_dout, tb_debug_dout_next}:
 		(cmd_tb_fs_in || cmd_cdc_in)?tb_serve_pair:
@@ -560,6 +562,7 @@ wire [15:0] cmd_dout_pair_next =
 		cmd_cd_subq?{cd_subq_dout_next2, cd_subq_dout_next3}:
 		cmd_cd_subq43?{cd_subq43_dout_next2, cd_subq43_dout_next3}:
 		cmd_cd_astat?{cd_astat_dout_next2, cd_astat_dout_next3}:
+		cmd_cd_hdr?{cd_hdr_dout_next2, cd_hdr_dout_next3}:
 		cmd_tb_devinfo?{tb_devinfo_dout_next2, tb_devinfo_dout_next3}:
 		cmd_tb_debug?{tb_debug_dout_next2, tb_debug_dout_next3}:
 		(cmd_tb_fs_in || cmd_cdc_in)?tb_serve_pair_next:
@@ -1527,6 +1530,8 @@ wire [31:0] data_len =
 		                {16'd0, cmd[7], cmd[8]} : 32'd64):
 		 cmd_cd_subq?32'd9:               // READ Q SUBCODE: fixed 9 bytes
 		 cmd_cd_astat?32'd6:              // AUDIO STATUS: fixed 6 bytes
+		 cmd_cd_hdr?(({16'd0, cmd[7], cmd[8]} < 32'd16) ?
+		             {16'd0, cmd[7], cmd[8]} : 32'd16):  // READ HEADER: exact alloc, cap 16 (8 real, zero-filled)
 		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
 		 cmd_inquiry?((alloc_len < INQUIRY_LEN) ? alloc_len : INQUIRY_LEN):
 		 cmd_mode_sense?((CDROM != 0) ? (cd_ms0e ? ((alloc_len < 32'd28) ? alloc_len : 32'd28)
@@ -1718,9 +1723,29 @@ wire       cmd_cd_t43f0  = cmd_cd_toc43 && !cmd_cd_t43f2 && !cmd_cd_t43f1;
 wire       cmd_cd_subq43 = (CDROM != 0) && (op_code == 8'h42);  // standard READ SUB-CHANNEL
 wire       cmd_cd_prevent   = (CDROM != 0) && (op_code == 8'h1e);  // PREVENT/ALLOW MEDIUM REMOVAL
 wire       cmd_cd_startstop = (CDROM != 0) && (op_code == 8'h1b);  // START/STOP UNIT
-// (READ HEADER 0x44 — gap pass — deliberately NOT implemented: it added
-// another arm to the shared serve mux and the fit failed the hardware gate,
-// 2026-07-29. See docs/SCSI_CMD_GAPS.md.)
+// READ HEADER (0x44, gap pass 2026-07-29): 8 bytes {mode, 0,0,0, address}.
+// LBA form only — the MSF form needs an LBA→MSF divide the serve path does
+// not have, so MSF-bit asks CHECK with ILLEGAL REQUEST/invalid field (clean
+// rejection beats wrong data; zero observed askers, BlueSCSI 2327 is the
+// oracle). Mode: 0 for a pure-audio disc, else 1 — per-LBA track typing
+// needs a TOC walk the serve path doesn't have; documented limitation for
+// mixed-mode discs in docs/SCSI_CMD_GAPS.md.
+wire       cmd_cd_hdr       = (CDROM != 0) && (op_code == 8'h44);
+wire       cd_hdr_msf_rej   = cmd_cd_hdr && cmd[1][1];
+function [7:0] cd_hdr_byte;
+	input [31:0] cnt;
+	begin
+		cd_hdr_byte = (cnt == 32'd0) ? (ca_disc_audio ? 8'h00 : 8'h01) :
+		              (cnt == 32'd4) ? cmd[2] :
+		              (cnt == 32'd5) ? cmd[3] :
+		              (cnt == 32'd6) ? cmd[4] :
+		              (cnt == 32'd7) ? cmd[5] : 8'h00;
+	end
+endfunction
+wire [7:0] cd_hdr_dout       = cd_hdr_byte(data_cnt);
+wire [7:0] cd_hdr_dout_next  = cd_hdr_byte(data_cnt_next);
+wire [7:0] cd_hdr_dout_next2 = cd_hdr_byte(data_cnt_next2);
+wire [7:0] cd_hdr_dout_next3 = cd_hdr_byte(data_cnt_next3);
 
 // ----- BlueSCSI Toolbox vendor commands (0xD0-0xD9) ----------------------
 // M0 = the RTL-serviceable subset that needs NO host filesystem, so the Mac
@@ -1806,7 +1831,7 @@ wire  cmd_ok_cd = cmd_read || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_read_capacity || cmd_mode_select || cmd_mode_sense ||
 		  cmd_request_sense || cmd_cd_eject || cmd_cd_toc || cmd_cd_subq ||
 		  cmd_cd_astat || cmd_cd_actl || cmd_cd_audio_nop ||
-		  cmd_cd_toc43 || cmd_cd_subq43 ||
+		  cmd_cd_toc43 || cmd_cd_subq43 || cmd_cd_hdr ||
 		  cmd_cd_prevent || cmd_cd_startstop || cmd_cdc_tb;
 
 wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
@@ -1816,7 +1841,7 @@ wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
 // MacOS "hammer the drive asking the user to format it", cd.cpp:1214).
 wire  cd_needs_media = cmd_test_unit_ready || cmd_read || cmd_read_capacity ||
 		  cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_actl ||
-		  cmd_cd_toc43 || cmd_cd_subq43 ||
+		  cmd_cd_toc43 || cmd_cd_subq43 || cmd_cd_hdr ||
 		  cmd_cd_audio_nop;
 wire  cd_no_media = (CDROM != 0) && !mounted && cd_needs_media;
 
@@ -1899,6 +1924,9 @@ always @(posedge clk) begin
 		end else if (cd_audio_read_rej) begin
 			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
 			cd_sense_asc <= 8'h64; // illegal mode for this track
+		end else if (cd_hdr_msf_rej) begin
+			cd_sense_key <= 4'h5;  // ILLEGAL REQUEST
+			cd_sense_asc <= 8'h24; // invalid field in CDB (READ HEADER MSF form)
 		end else if (cmd_cd_eject_any) begin
 			if (cd_prevent) begin
 				cd_sense_key <= 4'h5; // ILLEGAL REQUEST
@@ -1981,7 +2009,7 @@ always @(posedge clk) begin
 				// is this a supported and valid command?
 				// (CDROM: media-dependent commands CHECK with the no-disc
 				// sense while unmounted; a prevent-blocked EJECT CHECKs too.)
-				if(cmd_ok && !cd_no_media && !cd_audio_read_rej) begin
+				if(cmd_ok && !cd_no_media && !cd_audio_read_rej && !cd_hdr_msf_rej) begin
 					// yes, continue
 					status <= (cmd_cd_eject_any && cd_prevent) ? `STATUS_CHECK_CONDITION : `STATUS_OK;
 
@@ -2003,7 +2031,7 @@ always @(posedge clk) begin
 					if(cmd_tb_fs_in || cmd_cdc_tb) phase <= PHASE_TB;   // toolbox fs DataIn OR CD-changer (list/count DataIn + set status-only): HPS round-trip
 						else if(cmd_tb_send_end) phase <= PHASE_TB;       // SEND END: no payload, straight to round-trip
 						else if(cmd_tb_send_pay) phase <= PHASE_DATA_IN;  // SEND PREP/DATA: collect the DataOut payload first
-						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_toc43 || cmd_cd_subq43) phase <= PHASE_DATA_OUT;
+						else if(cmd_read || cmd_inquiry || cmd_read_capacity || cmd_mode_sense || cmd_read_buffer || cmd_request_sense || cmd_tb_devinfo || cmd_tb_debug_get || cmd_cd_toc || cmd_cd_subq || cmd_cd_astat || cmd_cd_toc43 || cmd_cd_subq43 || cmd_cd_hdr) phase <= PHASE_DATA_OUT;
 					// these commands receive dataa
 					else if(cmd_write || cmd_mode_select || cmd_write_buffer || cmd_cd_actl) phase <= PHASE_DATA_IN;
 					// and all other valid commands are just "ok"
