@@ -1648,7 +1648,7 @@ wire [7:0] op_code = cmd[0];
 wire [2:0] cmd_group = op_code[7:5];
 
 // check if a complete command has been received
-wire       cmd_cpl = cmd6_cpl || cmd10_cpl;
+wire       cmd_cpl = cmd6_cpl || cmd10_cpl || cmd12_cpl;
 wire       cmd6_cpl = (cmd_group == 3'b000) && (cmd_cnt == 6);
 // BlueSCSI Toolbox vendor commands (0xD0-0xDA, group 110) are 10-byte CDBs.
 // Decode ONLY this exact range as 10-byte (not the whole vendor group 110) so
@@ -1663,6 +1663,15 @@ wire       cmd_apple_cd_op = (CDROM != 0) && (op_code[7:4] == 4'hc);
 wire       cmd10_cpl = (((cmd_group == 3'b010) || (cmd_group == 3'b001)) && (cmd_cnt == 10))
                        || (cmd_toolbox_op && (cmd_cnt == 10))
                        || (cmd_apple_cd_op && (cmd_cnt == 10));
+// Group 5 (0xA0-0xBF) = 12-byte CDBs. Until now NOTHING completed them: the
+// target sat in PHASE_CMD_IN forever, so any 12-byte command from any
+// initiator WEDGED the bus (latent, never hit because MacOS sends none).
+// Completing them makes unknown group-5 opcodes CHECK with invalid-op — the
+// correct SCSI answer — and makes the already-decoded 0xA5 PLAY AUDIO(12)
+// actually reachable. Only cmd[0..9] are stored (the array is 10 deep and
+// out-of-range writes are discarded); every group-5 command we serve keeps
+// its operands inside that window, and bytes 10-11 are reserved + CONTROL.
+wire       cmd12_cpl = (cmd_group == 3'b101) && (cmd_cnt == 12);
 
 // https://en.wikipedia.org/wiki/SCSI_command
 wire       cmd_read = cmd_read6 || cmd_read10;
@@ -1726,6 +1735,12 @@ wire       cmd_cd_t43f0  = cmd_cd_toc43 && !cmd_cd_t43f2 && !cmd_cd_t43f1;
 wire       cmd_cd_subq43 = (CDROM != 0) && (op_code == 8'h42);  // standard READ SUB-CHANNEL
 wire       cmd_cd_prevent   = (CDROM != 0) && (op_code == 8'h1e);  // PREVENT/ALLOW MEDIUM REMOVAL
 wire       cmd_cd_startstop = (CDROM != 0) && (op_code == 8'h1b);  // START/STOP UNIT
+// SET CD SPEED (0xBB, 12-byte CDB — needs cmd12_cpl above). Accept-noop: the
+// requested read/write speeds are advisory and our serve rate is fixed by the
+// HPS ring, so GOOD with no state change is the honest answer (BlueSCSI 2451
+// treats it the same way). Rejecting it would make speed-setting utilities
+// report a drive fault for a request that costs us nothing to honour.
+wire       cmd_cd_setspeed  = (CDROM != 0) && (op_code == 8'hbb);
 // READ HEADER (0x44, gap pass 2026-07-29): 8 bytes {mode, 0,0,0, address}.
 // LBA form only — the MSF form needs an LBA→MSF divide the serve path does
 // not have, so MSF-bit asks CHECK with ILLEGAL REQUEST/invalid field (clean
@@ -1835,7 +1850,7 @@ wire  cmd_ok_cd = cmd_read || cmd_inquiry || cmd_test_unit_ready ||
 		  cmd_request_sense || cmd_cd_eject || cmd_cd_toc || cmd_cd_subq ||
 		  cmd_cd_astat || cmd_cd_actl || cmd_cd_audio_nop ||
 		  cmd_cd_toc43 || cmd_cd_subq43 || cmd_cd_hdr ||
-		  cmd_cd_prevent || cmd_cd_startstop || cmd_cdc_tb;
+		  cmd_cd_prevent || cmd_cd_startstop || cmd_cd_setspeed || cmd_cdc_tb;
 
 wire  cmd_ok = (CDROM != 0) ? cmd_ok_cd : cmd_ok_hd;
 
