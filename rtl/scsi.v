@@ -303,6 +303,64 @@ always @(posedge clk) begin
 	end
 end
 
+// ── MODE SELECT parameter parser: CD Audio Control page 0x0E (2026-07-29) ──
+// The AppleCD Audio Player's VOLUME SLIDER is a MODE SELECT(6) carrying mode
+// page 0x0E; until now every MODE SELECT byte was accepted and DISCARDED, so
+// the slider was a silent no-op (docs/SCSI_CMD_GAPS.md item 2). Latch the four
+// output ports' {channel, volume} and echo them in MODE SENSE page 0x0E (the
+// player reads the slider position back); ports 0/1 scale the CD-DA PCM in
+// cd_audio.sv. Parameter list framing (Snow target.rs 0x15 / [SPC] 6.7):
+// 4-byte header (byte 3 = block descriptor length, 0 or 8) + descriptor +
+// pages of {code, len, body}; page 0x0E body carries the ports at [6..13].
+// Only the FIRST page is parsed (multi-page selects unobserved on Mac); the
+// PF bit is not gated (BlueSCSI-permissive — a non-page payload cannot match
+// code 0x0E at the page-code offset in practice). Byte extraction samples in
+// the SAME cycle the sector-buffer dprams write (buffer0_wr/buffer1_wr) with
+// their EXACT beat-role data expression (store_low ? odd_byte_r : din) — the
+// f38c06f pairing law: never consult the live mode signal, the beat's ROLE
+// decides the source. data_cnt has not advanced yet in that cycle (advance is
+// on the ack FALLING edge), so it still indexes the byte being stored.
+// State survives SCSI bus resets like the real drive (sys_rst clears it);
+// defaults = Snow/BlueSCSI power-on page: ports 0/1 = channels 1/2 at full
+// volume, ports 2/3 (rear) muted.
+reg [7:0] cd_ap_ch0, cd_ap_vol0, cd_ap_ch1, cd_ap_vol1,
+          cd_ap_ch2, cd_ap_vol2, cd_ap_ch3, cd_ap_vol3;
+reg [7:0]  msel_bdlen;
+reg [7:0]  msel_page;
+wire [7:0]  msel_din  = store_low ? odd_byte_r : din;
+wire [31:0] msel_pgoff = data_cnt - {24'd0, msel_bdlen} - 32'd4;
+always @(posedge clk) begin
+	if (sys_rst) begin
+		cd_ap_ch0 <= 8'h01; cd_ap_vol0 <= 8'hFF;
+		cd_ap_ch1 <= 8'h02; cd_ap_vol1 <= 8'hFF;
+		cd_ap_ch2 <= 8'h04; cd_ap_vol2 <= 8'h00;
+		cd_ap_ch3 <= 8'h08; cd_ap_vol3 <= 8'h00;
+		msel_bdlen <= 8'd0; msel_page <= 8'd0;
+	end else if ((CDROM != 0) && (phase != PHASE_DATA_IN)) begin
+		msel_bdlen <= 8'd0;               // fresh command: assume no block
+		msel_page  <= 8'd0;               // descriptor until byte 3 says so
+	end else if ((CDROM != 0) && cmd_mode_select &&
+	             (buffer0_wr || buffer1_wr)) begin
+		if (data_cnt == 32'd3) msel_bdlen <= msel_din;
+		if (data_cnt >= 32'd4) begin
+			if (msel_pgoff == 32'd0) msel_page <= msel_din;
+			else if (msel_page == 8'h0E) begin
+				case (msel_pgoff)         // page header = 2 B; body[6..13]
+				32'd8:  cd_ap_ch0  <= msel_din;
+				32'd9:  cd_ap_vol0 <= msel_din;
+				32'd10: cd_ap_ch1  <= msel_din;
+				32'd11: cd_ap_vol1 <= msel_din;
+				32'd12: cd_ap_ch2  <= msel_din;
+				32'd13: cd_ap_vol2 <= msel_din;
+				32'd14: cd_ap_ch3  <= msel_din;
+				32'd15: cd_ap_vol3 <= msel_din;
+				default: ;
+				endcase
+			end
+		end
+	end
+end
+
 scsi_dpram #(.ADDRWIDTH(BUF_AW)) buffer1
 (
 	.clock(clk),
@@ -786,6 +844,11 @@ wire [7:0] cd_subq_dout_next3  = cd_subq_byte(data_cnt_next3);
 // standard 0x42 READ SUB-CHANNEL, format 1 (current position), MSF form,
 // 16 bytes: {00, status, u16be len=12, 01, adr_ctrl, track, index=1,
 // {0,M,S,F} abs, {0,M,S,F} rel} — binary values (Snow is the reference).
+// (Formats 2/3 MCN/ISRC — gap item 1 — deliberately NOT implemented here:
+// adding the format dispatch deepened this serve mux, which merges into
+// ncr5380's shared din_pair host-face that DISK reads also traverse, and
+// the resulting fit failed the hardware gate (2026-07-29). Revisit only
+// with a registered/flattened serve, never as a nested ternary.)
 function [7:0] cd_subq43_byte;
 	input [31:0] cnt;
 	begin
@@ -931,14 +994,47 @@ function [7:0] cd_mode_sense_byte;
 	end
 endfunction
 
+// CDROM MODE SENSE(6) page 0x0E (CD Audio Control): the standard 12-byte
+// header+descriptor, then {0x0E, len 14, IMMED, 0,0,0, 75, 75, four
+// {channel, volume} pairs} — Snow's CDU-8004 layout. The port bytes echo
+// the MODE SELECT-writable state above, so the AppleCD player's volume
+// slider reads back its real position instead of snapping to default.
+function [7:0] cd_ms0e_byte;
+	input [31:0] cnt;
+	begin
+		cd_ms0e_byte =
+			(cnt == 32'd0 )?8'd27:                      // mode data length = 28-1
+			(cnt == 32'd2 )?8'h80:                      // WP (read-only medium)
+			(cnt == 32'd3 )?8'd8:                       // block descriptor length
+			(cnt == 32'd5 )?capacity[23:16]:
+			(cnt == 32'd6 )?capacity[15:8]:
+			(cnt == 32'd7 )?capacity[7:0]:
+			(cnt == 32'd10)?8'h08:                      // block length 0x000800 = 2048
+			(cnt == 32'd12)?8'h0E:                      // page code
+			(cnt == 32'd13)?8'h0E:                      // page length = 14
+			(cnt == 32'd14)?8'h04:                      // IMMED=1, SOTC=0
+			(cnt == 32'd18)?8'd75:                      // obsolete (75, Snow)
+			(cnt == 32'd19)?8'd75:
+			(cnt == 32'd20)?cd_ap_ch0:
+			(cnt == 32'd21)?cd_ap_vol0:
+			(cnt == 32'd22)?cd_ap_ch1:
+			(cnt == 32'd23)?cd_ap_vol1:
+			(cnt == 32'd24)?cd_ap_ch2:
+			(cnt == 32'd25)?cd_ap_vol2:
+			(cnt == 32'd26)?cd_ap_ch3:
+			(cnt == 32'd27)?cd_ap_vol3:
+			8'h00;
+	end
+endfunction
+
 // Page select: CDROM response, else 0x31 detection page vs. the default.
-wire [7:0] mode_sense_dout       = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt)       : cd_mode_sense_byte(data_cnt))
+wire [7:0] mode_sense_dout       = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt)       : cd_ms31 ? mode_sense_p31_byte(data_cnt)       : cd_mode_sense_byte(data_cnt))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt)       : mode_sense_def_dout;
-wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt_next)  : cd_mode_sense_byte(data_cnt_next))
+wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next)  : cd_ms31 ? mode_sense_p31_byte(data_cnt_next)  : cd_mode_sense_byte(data_cnt_next))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next)  : mode_sense_def_dout_next;
-wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt_next2) : cd_mode_sense_byte(data_cnt_next2))
+wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next2) : cd_ms31 ? mode_sense_p31_byte(data_cnt_next2) : cd_mode_sense_byte(data_cnt_next2))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next2) : mode_sense_def_dout_next2;
-wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? (cd_ms31 ? mode_sense_p31_byte(data_cnt_next3) : cd_mode_sense_byte(data_cnt_next3))
+wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next3) : cd_ms31 ? mode_sense_p31_byte(data_cnt_next3) : cd_mode_sense_byte(data_cnt_next3))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next3) : mode_sense_def_dout_next3;
 
 // Default MODE SENSE(6) response (unchanged; served for every page except 0x31).
@@ -1259,6 +1355,8 @@ generate if (CDROM != 0) begin : g_cd_audio
 		.cdb1(cmd[1]), .cdb2(cmd[2]), .cdb3(cmd[3]), .cdb4(cmd[4]),
 		.cdb5(cmd[5]), .cdb6(cmd[6]), .cdb7(cmd[7]), .cdb8(cmd[8]), .cdb9(cmd[9]),
 		.read_stb(ca_read_stb), .eject_stb(ca_eject_stb),
+		.ap_ch0(cd_ap_ch0), .ap_vol0(cd_ap_vol0),   // page 0x0E audio ports
+		.ap_ch1(cd_ap_ch1), .ap_vol1(cd_ap_vol1),   // (the volume slider)
 		.ch_grant(ca_grant),
 		.ca_io_active(ca_io_active), .ca_io_rd(ca_io_rd_w), .ca_io_lba(ca_io_lba),
 		.io_ack(io_ack),
@@ -1363,6 +1461,10 @@ wire [31:0] sense_len = (tlen == 16'd256) ? 32'd4 : {16'd0, tlen};
 // are <<2-scaled at latch time.
 localparam [31:0] INQUIRY_LEN = (CDROM != 0) ? 32'd54 : 32'd36;
 wire        cd_ms30    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h30);
+// Page 0x0E (CD Audio Control) asks get the audio-port page; 0x3F ("all
+// pages") keeps today's header-only default — the AppleCD driver asks for
+// 0x0E directly (Snow dispatch) and changing 0x3F would touch proven paths.
+wire        cd_ms0e    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h0E);
 // CD-changer detection: serve the BlueSCSI Toolbox page-0x31 magic on the CD
 // target so a Toolbox client (MacAtrium) recognizes it as a CD changer (its probe
 // = MODE SENSE page 0x31 magic + INQUIRY CD-ROM). UNGATED (CDCHANGER_ENABLE, not
@@ -1413,7 +1515,8 @@ wire [31:0] data_len =
 		 cmd_cd_astat?32'd6:              // AUDIO STATUS: fixed 6 bytes
 		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
 		 cmd_inquiry?((alloc_len < INQUIRY_LEN) ? alloc_len : INQUIRY_LEN):
-		 cmd_mode_sense?((CDROM != 0) ? (cd_ms31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
+		 cmd_mode_sense?((CDROM != 0) ? (cd_ms0e ? ((alloc_len < 32'd28) ? alloc_len : 32'd28)
+		                               : cd_ms31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
 		                               : cd_ms30 ? ((alloc_len < 32'd36) ? alloc_len : 32'd36)
 		                                         : ((alloc_len < 32'd12) ? alloc_len : 32'd12))
 		                              : (mode_sense_p31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
@@ -1601,6 +1704,9 @@ wire       cmd_cd_t43f0  = cmd_cd_toc43 && !cmd_cd_t43f2 && !cmd_cd_t43f1;
 wire       cmd_cd_subq43 = (CDROM != 0) && (op_code == 8'h42);  // standard READ SUB-CHANNEL
 wire       cmd_cd_prevent   = (CDROM != 0) && (op_code == 8'h1e);  // PREVENT/ALLOW MEDIUM REMOVAL
 wire       cmd_cd_startstop = (CDROM != 0) && (op_code == 8'h1b);  // START/STOP UNIT
+// (READ HEADER 0x44 — gap pass — deliberately NOT implemented: it added
+// another arm to the shared serve mux and the fit failed the hardware gate,
+// 2026-07-29. See docs/SCSI_CMD_GAPS.md.)
 
 // ----- BlueSCSI Toolbox vendor commands (0xD0-0xD9) ----------------------
 // M0 = the RTL-serviceable subset that needs NO host filesystem, so the Mac

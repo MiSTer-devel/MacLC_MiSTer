@@ -43,6 +43,13 @@ module cd_audio #(
 	input             read_stb,         // data READ latched: stop playback
 	input             eject_stb,
 
+	// CD Audio Control page 0x0E output ports 0/1 (MODE SELECT-writable in
+	// scsi.v — the AppleCD player's volume slider). channel: 0x01 = left
+	// source, 0x02 = right, anything else mutes the port (Snow
+	// make_out_sample); volume: linear 0..255 PCM scale.
+	input       [7:0] ap_ch0, ap_vol0,
+	input       [7:0] ap_ch1, ap_vol1,
+
 	// shared HPS io channel
 	input             ch_grant,
 	output            ca_io_active,     // owns the channel (request/ack window)
@@ -1290,6 +1297,19 @@ wire signed [33:0] seg_ml = seg_dl * $signed({1'b0, seg_f});
 wire signed [33:0] seg_mr = seg_dr * $signed({1'b0, seg_f});
 wire signed [16:0] sum_l  = {snd_l_p[15], snd_l_p} + $signed(seg_ml[32:16]);
 wire signed [16:0] sum_r  = {snd_r_p[15], snd_r_p} + $signed(seg_mr[32:16]);
+// CD Audio Control page 0x0E port scaling (2026-07-29 — the volume slider).
+// Source routing per port channel byte (0x01 = left, 0x02 = right, other =
+// mute; Snow make_out_sample), then a linear volume scale: (s * vol) >> 8 —
+// 255 = -0.034 dB (inaudible vs Snow's exact /255), 0 = true mute. Applied
+// to the interpolated value BEFORE the 8-clk commit register, so the
+// framework's stability-filter contract (output holds ≥8 clk_sys) is
+// untouched.
+wire signed [15:0] ap_src_l = (ap_ch0 == 8'h01) ? sum_l[15:0] :
+                              (ap_ch0 == 8'h02) ? sum_r[15:0] : 16'sd0;
+wire signed [15:0] ap_src_r = (ap_ch1 == 8'h02) ? sum_r[15:0] :
+                              (ap_ch1 == 8'h01) ? sum_l[15:0] : 16'sd0;
+wire signed [24:0] ap_scl_l = ap_src_l * $signed({1'b0, ap_vol0});
+wire signed [24:0] ap_scl_r = ap_src_r * $signed({1'b0, ap_vol1});
 reg  [2:0] odiv;
 always @(posedge clk) begin
 	if (rst || pstate != ST_PLAY) begin
@@ -1297,8 +1317,8 @@ always @(posedge clk) begin
 	end else begin
 		odiv <= odiv + 3'd1;
 		if (odiv == 3'd0) begin
-			snd_l <= sum_l[15:0];
-			snd_r <= sum_r[15:0];
+			snd_l <= ap_scl_l[23:8];
+			snd_r <= ap_scl_r[23:8];
 		end
 	end
 end

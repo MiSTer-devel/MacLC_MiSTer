@@ -70,6 +70,7 @@ ncr5380 #(.DEVS(2)) ncr
 (
 	.clk(clk),
 	.reset(reset),
+	.cd_enable(1'b1),      // CD target (ID 3) selectable — cdvol mode pokes it
 	.bus_cs(bus_cs),
 	.bus_rs(bus_rs),
 	.ior(ior),

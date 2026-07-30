@@ -642,6 +642,74 @@ static RunResult run_write(bool word_mode, int sectors, int gap, int hps_lat,
 	return res;
 }
 
+// ---------------- CD volume page test (cdvol) ----------------
+// Drives the CD target (ID 3, selectable via cd_enable with no media): sends
+// MODE SELECT(6) page 0x0E with distinctive port volumes, reads them back
+// with MODE SENSE(6) page 0x0E, and checks the echo byte-for-byte. This is
+// the AppleCD Audio Player volume-slider transaction (2026-07-29 feature).
+// Everything is PIO — the parameter transfer exercises the byte-beat parse.
+static int run_cdvol() {
+	reset_dut(0);
+
+	// ---- selection (CD target = SCSI ID 3) ----
+	reg_write(WREG_ODR, (uint8_t)(1 << 3));
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) { printf("cdvol: CD target did not select\n"); return 1; }
+	reg_write(WREG_ICR, ICR_DATA);
+
+	// ---- MODE SELECT(6): param list = 4B header (bdlen 0) + page 0x0E ----
+	static const uint8_t msel[20] = {
+		0x00, 0x00, 0x00, 0x00,            // mode parameter header, bdlen=0
+		0x0E, 0x0E,                        // page code, page length 14
+		0x04, 0x00, 0x00, 0x00, 75, 75,    // IMMED; obsolete 75/75
+		0x01, 0x55,                        // port 0: channel L, volume 0x55
+		0x02, 0x66,                        // port 1: channel R, volume 0x66
+		0x04, 0x11,                        // port 2
+		0x08, 0x22                         // port 3
+	};
+	uint8_t cdb_sel[6] = { 0x15, 0x10, 0, 0, sizeof(msel), 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(cdb_sel[i])) { printf("cdvol: MODE SELECT CDB stalled at %d\n", i); return 1; }
+	for (size_t i = 0; i < sizeof(msel); i++)
+		if (!pio_put(msel[i])) { printf("cdvol: MODE SELECT data stalled at %zu\n", i); return 1; }
+	reg_write(WREG_ICR, 0);                // release the data bus before status
+	int st = pio_get(), msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("cdvol: MODE SELECT status %02x msg %02x\n", st, msg); return 1; }
+
+	// ---- re-select, MODE SENSE(6) page 0x0E, verify the echo ----
+	reg_write(WREG_ODR, (uint8_t)(1 << 3));
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) { printf("cdvol: reselect failed\n"); return 1; }
+	reg_write(WREG_ICR, ICR_DATA);
+	uint8_t cdb_sns[6] = { 0x1A, 0x00, 0x0E, 0, 28, 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(cdb_sns[i])) { printf("cdvol: MODE SENSE CDB stalled at %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);                // release the data bus: DataIn follows
+	uint8_t got[28];
+	for (int i = 0; i < 28; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("cdvol: MODE SENSE data stalled at %d\n", i); return 1; }
+		got[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+
+	static const uint8_t expect_tail[8] = { 0x01, 0x55, 0x02, 0x66, 0x04, 0x11, 0x08, 0x22 };
+	int fails = 0;
+	if (got[0] != 27)   { printf("cdvol: mode data length %02x != 27\n", got[0]); fails++; }
+	if (got[12] != 0x0E || got[13] != 0x0E)
+		{ printf("cdvol: page hdr %02x %02x != 0E 0E\n", got[12], got[13]); fails++; }
+	for (int i = 0; i < 8; i++)
+		if (got[20 + i] != expect_tail[i]) {
+			printf("cdvol: port byte [%d] = %02x expect %02x\n", 20 + i, got[20 + i], expect_tail[i]);
+			fails++;
+		}
+	if (st != 0x00 || msg != 0x00) { printf("cdvol: MODE SENSE status %02x msg %02x\n", st, msg); fails++; }
+	printf("cdvol: %s (sense page:", fails ? "FAIL" : "PASS");
+	for (int i = 0; i < 28; i++) printf(" %02x", got[i]);
+	printf(")\n");
+	return fails ? 1 : 0;
+}
+
 // ---------------- main ----------------
 int main(int argc, char** argv) {
 	Verilated::commandArgs(argc, argv);
@@ -682,6 +750,14 @@ int main(int argc, char** argv) {
 #endif
 
 	Mode modes[6] = { M_BYTE, M_WORD, M_LONG, M_MIX, M_LONGSKEW, M_WORDSKEW };
+
+	if (one_mode && !strcmp(one_mode, "cdvol")) {
+		int rc = run_cdvol();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
 
 	// write-mode single runs (separate path: verifies the flushed image)
 	if (one_mode && (!strcmp(one_mode, "wbyte") || !strcmp(one_mode, "wword"))) {
