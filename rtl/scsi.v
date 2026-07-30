@@ -844,15 +844,29 @@ wire [7:0] cd_subq_dout_next3  = cd_subq_byte(data_cnt_next3);
 // standard 0x42 READ SUB-CHANNEL, format 1 (current position), MSF form,
 // 16 bytes: {00, status, u16be len=12, 01, adr_ctrl, track, index=1,
 // {0,M,S,F} abs, {0,M,S,F} rel} — binary values (Snow is the reference).
-// (Formats 2/3 MCN/ISRC — gap item 1 — deliberately NOT implemented here:
-// adding the format dispatch deepened this serve mux, which merges into
-// ncr5380's shared din_pair host-face that DISK reads also traverse, and
-// the resulting fit failed the hardware gate (2026-07-29). Revisit only
-// with a registered/flattened serve, never as a nested ternary.)
+// Formats 2 (MCN/UPC) and 3 (ISRC) — gap item 1 of docs/SCSI_CMD_GAPS.md,
+// closed 2026-07-29 — serve the honest BlueSCSI-style layouts: correct
+// header (audio status + u16be data length 20), format echo at byte 4,
+// and VALID=0 with zeroed digits (no disc metadata exists in the image
+// containers we serve, and that is the truthful SCSI answer). Format 0
+// and unknown formats keep today's position-layout serve (defensive:
+// never observed, and CHECKing them — Snow's choice — risks proven
+// driver paths for no gain).
 function [7:0] cd_subq43_byte;
 	input [31:0] cnt;
 	begin
-		cd_subq43_byte = (cnt == 32'd1)  ? ca_ast_std :
+		cd_subq43_byte =
+		    (cmd[3] == 8'h02) ? (            // MCN: 24 B, MCVAL=0, digits 0
+		                 (cnt == 32'd1)  ? ca_ast_std :
+		                 (cnt == 32'd3)  ? 8'd20 :
+		                 (cnt == 32'd4)  ? 8'h02 : 8'h00) :
+		    (cmd[3] == 8'h03) ? (            // ISRC: 24 B, TCVAL=0, track echo
+		                 (cnt == 32'd1)  ? ca_ast_std :
+		                 (cnt == 32'd3)  ? 8'd20 :
+		                 (cnt == 32'd4)  ? 8'h03 :
+		                 (cnt == 32'd6)  ? cmd[6] : 8'h00) :
+		                 (                   // format 1 (and 0/unknown fallback)
+		                 (cnt == 32'd1)  ? ca_ast_std :
 		                 (cnt == 32'd3)  ? 8'd12 :
 		                 (cnt == 32'd4)  ? 8'h01 :
 		                 (cnt == 32'd5)  ? ca_cur_ctrl :
@@ -863,7 +877,7 @@ function [7:0] cd_subq43_byte;
 		                 (cnt == 32'd11) ? ca_abs_f :
 		                 (cnt == 32'd13) ? ca_rel_m :
 		                 (cnt == 32'd14) ? ca_rel_s :
-		                 (cnt == 32'd15) ? ca_rel_f : 8'h00;
+		                 (cnt == 32'd15) ? ca_rel_f : 8'h00);
 	end
 endfunction
 wire [7:0] cd_subq43_dout       = cd_subq43_byte(data_cnt);

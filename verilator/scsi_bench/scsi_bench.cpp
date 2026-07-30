@@ -710,6 +710,184 @@ static int run_cdvol() {
 	return fails ? 1 : 0;
 }
 
+// ---------------- 0x42 sub-channel format guard test (subqfmt) ----------------
+// Snow-parity (2026-07-29): READ SUB-CHANNEL format 1 serves the position
+// payload; formats 0/2/3 CHECK with ILLEGAL REQUEST / ASC 0x24 (invalid field
+// in CDB) and the following REQUEST SENSE must report exactly that. A format-1
+// ask afterwards must serve again with GOOD status (sense cleared). Needs the
+// harness's cd_img_mounted=1 (media-gated 0x42 CHECKs no-disc otherwise).
+static bool select_cd() {
+	reg_write(WREG_ODR, (uint8_t)(1 << 3));
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) return false;
+	reg_write(WREG_ICR, ICR_DATA);
+	return true;
+}
+
+static int run_subqfmt() {
+	reset_dut(0);
+	int fails = 0;
+
+	static const uint8_t bad_fmts[3] = { 0x00, 0x02, 0x03 };
+	for (int f = 0; f < 3; f++) {
+		// rejected ask: no DataIn phase, straight CHECK CONDITION status
+		if (!select_cd()) { printf("subqfmt: select failed (fmt %02x)\n", bad_fmts[f]); return 1; }
+		uint8_t cdb[10] = { 0x42, 0x02, 0x40, bad_fmts[f], 0, 0, 0, 0, 24, 0 };
+		for (int i = 0; i < 10; i++)
+			if (!pio_put(cdb[i])) { printf("subqfmt: CDB stalled (fmt %02x byte %d)\n", bad_fmts[f], i); return 1; }
+		reg_write(WREG_ICR, 0);            // release the data bus before status
+		int st = pio_get(), msg = pio_get();
+		if (st != 0x02 || msg != 0x00) {
+			printf("subqfmt: fmt %02x status %02x msg %02x (want CHECK 02/00)\n", bad_fmts[f], st, msg);
+			fails++;
+		}
+
+		// REQUEST SENSE: key 5 (ILLEGAL REQUEST), ASC 0x24 (invalid field)
+		if (!select_cd()) { printf("subqfmt: sense select failed\n"); return 1; }
+		uint8_t cdb_rs[6] = { 0x03, 0, 0, 0, 18, 0 };
+		for (int i = 0; i < 6; i++)
+			if (!pio_put(cdb_rs[i])) { printf("subqfmt: SENSE CDB stalled at %d\n", i); return 1; }
+		reg_write(WREG_ICR, 0);
+		uint8_t sns[18];
+		for (int i = 0; i < 18; i++) {
+			int v = pio_get();
+			if (v < 0) { printf("subqfmt: sense data stalled at %d\n", i); return 1; }
+			sns[i] = (uint8_t)v;
+		}
+		st = pio_get(); msg = pio_get();
+		if (st != 0x00 || msg != 0x00) { printf("subqfmt: SENSE status %02x msg %02x\n", st, msg); fails++; }
+		if ((sns[2] & 0x0F) != 0x05 || sns[12] != 0x24) {
+			printf("subqfmt: fmt %02x sense key %x asc %02x (want 5/24)\n",
+			       bad_fmts[f], sns[2] & 0x0F, sns[12]);
+			fails++;
+		}
+	}
+
+	// format 1 must still serve: 16 bytes, GOOD status, len/format echo
+	if (!select_cd()) { printf("subqfmt: fmt1 select failed\n"); return 1; }
+	uint8_t cdb1[10] = { 0x42, 0x02, 0x40, 0x01, 0, 0, 0, 0, 16, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(cdb1[i])) { printf("subqfmt: fmt1 CDB stalled at %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t got[16];
+	for (int i = 0; i < 16; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("subqfmt: fmt1 data stalled at %d (fmt1 rejected?)\n", i); return 1; }
+		got[i] = (uint8_t)v;
+	}
+	int st = pio_get(), msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("subqfmt: fmt1 status %02x msg %02x\n", st, msg); fails++; }
+	if (got[3] != 12 || got[4] != 0x01) {
+		printf("subqfmt: fmt1 payload len %02x fmtcode %02x (want 0c/01)\n", got[3], got[4]);
+		fails++;
+	}
+
+	printf("subqfmt: %s\n", fails ? "FAIL" : "PASS");
+	return fails ? 1 : 0;
+}
+
+// ---------------- gap-pass command tests (gapcmds) ----------------
+// Coverage the 2026-07-29 gap pass never had (it was only "boots in sim"):
+// 0x42 formats 2/3 SERVED layouts, 0x44 READ HEADER LBA form + MSF reject,
+// 0x45 PLAY AUDIO(10) acceptance. Run only on a build that carries them.
+static int run_gapcmds() {
+	reset_dut(0);
+	int fails = 0;
+
+	// --- 0x42 format 2 (MCN): 24 B, hdr len 20, format echo at [4] ---
+	if (!select_cd()) { printf("gapcmds: select failed (f2)\n"); return 1; }
+	uint8_t c_f2[10] = { 0x42, 0x02, 0x40, 0x02, 0, 0, 0, 0, 24, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_f2[i])) { printf("gapcmds: f2 CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t g2[24];
+	for (int i = 0; i < 24; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: f2 data stalled at %d (not implemented?)\n", i); return 1; }
+		g2[i] = (uint8_t)v;
+	}
+	int st = pio_get(), msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: f2 status %02x msg %02x\n", st, msg); fails++; }
+	if (g2[3] != 20 || g2[4] != 0x02) {
+		printf("gapcmds: f2 len %02x fmt %02x (want 14/02)\n", g2[3], g2[4]); fails++;
+	}
+
+	// --- 0x42 format 3 (ISRC): format echo + track echo at [6] ---
+	if (!select_cd()) { printf("gapcmds: select failed (f3)\n"); return 1; }
+	uint8_t c_f3[10] = { 0x42, 0x02, 0x40, 0x03, 0, 0, 0x05, 0, 24, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_f3[i])) { printf("gapcmds: f3 CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t g3[24];
+	for (int i = 0; i < 24; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: f3 data stalled at %d\n", i); return 1; }
+		g3[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: f3 status %02x msg %02x\n", st, msg); fails++; }
+	if (g3[3] != 20 || g3[4] != 0x03 || g3[6] != 0x05) {
+		printf("gapcmds: f3 len %02x fmt %02x trk %02x (want 14/03/05)\n", g3[3], g3[4], g3[6]);
+		fails++;
+	}
+
+	// --- 0x44 READ HEADER, LBA form: 8 B, LBA echoed at [4..7] ---
+	if (!select_cd()) { printf("gapcmds: select failed (hdr)\n"); return 1; }
+	uint8_t c_hdr[10] = { 0x44, 0x00, 0x00, 0x00, 0x12, 0x34, 0, 0, 8, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_hdr[i])) { printf("gapcmds: hdr CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t gh[8];
+	for (int i = 0; i < 8; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: hdr data stalled at %d (0x44 absent?)\n", i); return 1; }
+		gh[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: hdr status %02x msg %02x\n", st, msg); fails++; }
+	if (gh[4] != 0x00 || gh[5] != 0x00 || gh[6] != 0x12 || gh[7] != 0x34) {
+		printf("gapcmds: hdr addr %02x%02x%02x%02x (want 00001234)\n", gh[4], gh[5], gh[6], gh[7]);
+		fails++;
+	}
+
+	// --- 0x44 MSF form must CHECK with 5/0x24 ---
+	if (!select_cd()) { printf("gapcmds: select failed (hdr msf)\n"); return 1; }
+	uint8_t c_hm[10] = { 0x44, 0x02, 0, 0, 0, 0, 0, 0, 8, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_hm[i])) { printf("gapcmds: hdrmsf CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x02) { printf("gapcmds: hdrmsf status %02x (want CHECK 02)\n", st); fails++; }
+	if (!select_cd()) { printf("gapcmds: sense select failed\n"); return 1; }
+	uint8_t c_rs[6] = { 0x03, 0, 0, 0, 18, 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(c_rs[i])) { printf("gapcmds: sense CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t sns[18];
+	for (int i = 0; i < 18; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: sense stalled at %d\n", i); return 1; }
+		sns[i] = (uint8_t)v;
+	}
+	(void)pio_get(); (void)pio_get();
+	if ((sns[2] & 0x0F) != 0x05 || sns[12] != 0x24) {
+		printf("gapcmds: hdrmsf sense %x/%02x (want 5/24)\n", sns[2] & 0x0F, sns[12]);
+		fails++;
+	}
+
+	// --- 0x45 PLAY AUDIO(10) LBA form: command accepted, GOOD status ---
+	if (!select_cd()) { printf("gapcmds: select failed (play)\n"); return 1; }
+	uint8_t c_pl[10] = { 0x45, 0x00, 0x00, 0x00, 0x00, 0x64, 0, 0x00, 0x0A, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_pl[i])) { printf("gapcmds: play CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: play status %02x msg %02x\n", st, msg); fails++; }
+
+	printf("gapcmds: %s\n", fails ? "FAIL" : "PASS");
+	return fails ? 1 : 0;
+}
+
 // ---------------- main ----------------
 int main(int argc, char** argv) {
 	Verilated::commandArgs(argc, argv);
@@ -750,6 +928,22 @@ int main(int argc, char** argv) {
 #endif
 
 	Mode modes[6] = { M_BYTE, M_WORD, M_LONG, M_MIX, M_LONGSKEW, M_WORDSKEW };
+
+	if (one_mode && !strcmp(one_mode, "gapcmds")) {
+		int rc = run_gapcmds();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "subqfmt")) {
+		int rc = run_subqfmt();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
 
 	if (one_mode && !strcmp(one_mode, "cdvol")) {
 		int rc = run_cdvol();

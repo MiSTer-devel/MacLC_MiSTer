@@ -71,6 +71,9 @@ ncr5380 #(.DEVS(2)) ncr
 	.clk(clk),
 	.reset(reset),
 	.cd_enable(1'b1),      // CD target (ID 3) selectable — cdvol mode pokes it
+	.cd_img_mounted(1'b1), // virtual disc present: media-gated CD commands
+	                       // (0x42 subqfmt mode) reach their own sense paths
+	                       // instead of CHECKing NOT READY/no-disc first
 	.bus_cs(bus_cs),
 	.bus_rs(bus_rs),
 	.ior(ior),
