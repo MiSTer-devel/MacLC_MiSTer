@@ -195,7 +195,17 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   CD audio + the AppleCD Audio Player (listing, transport, FF/RW scan)
   fully working as of 2026-07-20 (standard SCSI-2 dialect on the
   CDU-8004 identity; BlueSCSI + Snow are the byte oracles; command gaps
-  logged in docs/SCSI_CMD_GAPS.md). Flat 2048-byte images (ISO/TOAST)
+  logged in docs/SCSI_CMD_GAPS.md). The **volume slider** works as of
+  2026-07-29 (MODE SELECT/SENSE page 0x0E scales the CD-DA PCM),
+  alongside 0x42 sub-channel formats 2/3, 0x44 READ HEADER, 0x45 PLAY
+  AUDIO, 0xBB SET CD SPEED and mode page 0x2A — see
+  docs/resume_cd_commands_2026-07-30.md.
+- **★ Gating CD work: DETACH the CD image from the boot config first**
+  (`mv /media/fat/config/MACLC.s4 …bak`), and OSD-mount after the
+  desktop is up. The open CUE/CHD-at-boot-attach hang fires
+  intermittently on ANY build — including known-good ones — and has
+  repeatedly been misread as "this build fails the hardware gate".
+  Two boots of the same RBF can differ, so one boot is never a verdict. Flat 2048-byte images (ISO/TOAST)
   work on a stock Main_MiSTer; CUE/BIN (2352) and CHD need the Main
   fork's `support/maclc/maclc_cd` layer (branch
   `add-bluescsi-toolbox-for-MacLC`) — the validated binary ships in

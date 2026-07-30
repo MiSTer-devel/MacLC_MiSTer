@@ -39,7 +39,7 @@ async def run(host, port, steps):
         for step in steps:
             if step.startswith("sleep:"):
                 await asyncio.sleep(float(step.split(":", 1)[1]))
-            elif step.startswith(("kbd:", "kbdRaw:")):
+            elif step.startswith(("kbd:", "kbdRaw:", "kbdRawDown:", "kbdRawUp:")):
                 await ws.send(step)
                 print(f"sent {step}")
                 await asyncio.sleep(0.12)  # let the remote coalesce events

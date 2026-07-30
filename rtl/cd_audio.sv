@@ -43,6 +43,13 @@ module cd_audio #(
 	input             read_stb,         // data READ latched: stop playback
 	input             eject_stb,
 
+	// CD Audio Control page 0x0E output ports 0/1 (MODE SELECT-writable in
+	// scsi.v — the AppleCD player's volume slider). channel: 0x01 = left
+	// source, 0x02 = right, anything else mutes the port (Snow
+	// make_out_sample); volume: linear 0..255 PCM scale.
+	input       [7:0] ap_ch0, ap_vol0,
+	input       [7:0] ap_ch1, ap_vol1,
+
 	// shared HPS io channel
 	input             ch_grant,
 	output            ca_io_active,     // owns the channel (request/ack window)
@@ -412,6 +419,9 @@ reg  [7:0] c_op, c_1, c_2, c_3, c_4, c_5, c_6, c_7, c_8, c_9;
 reg        cmd_pend;
 reg [31:0] c_addr;                      // resolved target address
 reg [31:0] c_next;                      // start of following track (track mode)
+// PLAY AUDIO(10)/(12) "from current position" sentinel (BlueSCSI 2551)
+wire       play_lba_ff = (c_2 == 8'hFF) && (c_3 == 8'hFF) &&
+                         (c_4 == 8'hFF) && (c_5 == 8'hFF);
 reg  [6:0] c_trk;                       // 0-based requested track
 reg  [6:0] c_trk2;                      // 0-based index whose START bounds the play
                                         // (vendor: c_trk+1; 0x48: end-track+1)
@@ -966,6 +976,19 @@ always @(posedge clk) begin
 					if (!toc_valid) begin c_addr <= 32'd0; c_next <= leadout_lba; end
 				end
 			end
+			8'h45, 8'ha5: begin                            // PLAY AUDIO(10)/(12), LBA form
+				// Gap pass 2026-07-29; oracle BlueSCSI doPlayAudio (2379/2393):
+				// LBA 0xFFFFFFFF = play from CURRENT position (resolved before
+				// anything else, 2551); length 0 = seek-only, which falls into
+				// the 47/48 zero-length arm below via c_addr == c_next. Length
+				// is in frames: (10) = cdb7..8, (12) = cdb6..9. The LBA is
+				// already in the engine's sector domain (same as cur_lba).
+				c_addr <= play_lba_ff ? cur_lba : {c_2, c_3, c_4, c_5};
+				c_next <= (play_lba_ff ? cur_lba : {c_2, c_3, c_4, c_5}) +
+				          ((c_op == 8'h45) ? {16'd0, c_7, c_8}
+				                           : {c_6, c_7, c_8, c_9});
+				mst <= M_APPLY;
+			end
 			8'h4b:                                         // PAUSE/RESUME (cdb8 bit0 = resume)
 				if (c_8[0]) begin
 					if (pstate == ST_PAUSE) pstate <= ST_PLAY;
@@ -1034,7 +1057,7 @@ always @(posedge clk) begin
 					else if (stop_lba <= c_addr) stop_lba <= leadout_lba;
 				end
 			end
-			8'h47, 8'h48: begin                            // standard range play
+			8'h47, 8'h48, 8'h45, 8'ha5: begin              // standard range play
 				if (c_addr == c_next) begin
 					// Zero-length play = SEEK-ONLY per SCSI-2 (BlueSCSI
 					// doPlayAudio length==0: "update the position without
@@ -1290,6 +1313,30 @@ wire signed [33:0] seg_ml = seg_dl * $signed({1'b0, seg_f});
 wire signed [33:0] seg_mr = seg_dr * $signed({1'b0, seg_f});
 wire signed [16:0] sum_l  = {snd_l_p[15], snd_l_p} + $signed(seg_ml[32:16]);
 wire signed [16:0] sum_r  = {snd_r_p[15], snd_r_p} + $signed(seg_mr[32:16]);
+// CD Audio Control page 0x0E port scaling (2026-07-29 — the volume slider).
+// Source routing per port channel byte (0x01 = left, 0x02 = right, other =
+// mute; Snow make_out_sample), then the hardware volume law: a Q15 gain from
+// cd_vol_lut.vh, gain = (vol/255)^5, so 255 is exact unity and 0 exact mute.
+//
+// The law was MEASURED, not assumed (docs/cd_volume_law_2026-07-30.md): a
+// linear (s*vol)>>8 — what MAME, Snow and BlueSCSI all do — compresses the
+// AppleCD player's whole 16-step ladder into 5.85 dB with 0.10 dB steps at
+// the top, while a real Quadra 800 + AppleCD drive spans 28.0 dB with even
+// ~2.00 dB steps. Fit over the bytes the player actually sends gives an
+// exponent of 5.
+//
+// Applied to the interpolated value BEFORE the 8-clk commit register, so the
+// framework's stability-filter contract (output holds ≥8 clk_sys) is
+// untouched.
+wire signed [15:0] ap_src_l = (ap_ch0 == 8'h01) ? sum_l[15:0] :
+                              (ap_ch0 == 8'h02) ? sum_r[15:0] : 16'sd0;
+wire signed [15:0] ap_src_r = (ap_ch1 == 8'h02) ? sum_r[15:0] :
+                              (ap_ch1 == 8'h01) ? sum_l[15:0] : 16'sd0;
+`include "cd_vol_lut.vh"
+wire [15:0] ap_gain_l = cd_vol_gain(ap_vol0);
+wire [15:0] ap_gain_r = cd_vol_gain(ap_vol1);
+wire signed [31:0] ap_scl_l = ap_src_l * $signed({1'b0, ap_gain_l});
+wire signed [31:0] ap_scl_r = ap_src_r * $signed({1'b0, ap_gain_r});
 reg  [2:0] odiv;
 always @(posedge clk) begin
 	if (rst || pstate != ST_PLAY) begin
@@ -1297,8 +1344,8 @@ always @(posedge clk) begin
 	end else begin
 		odiv <= odiv + 3'd1;
 		if (odiv == 3'd0) begin
-			snd_l <= sum_l[15:0];
-			snd_r <= sum_r[15:0];
+			snd_l <= ap_scl_l[30:15];
+			snd_r <= ap_scl_r[30:15];
 		end
 	end
 end

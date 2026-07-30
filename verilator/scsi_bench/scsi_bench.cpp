@@ -642,6 +642,238 @@ static RunResult run_write(bool word_mode, int sectors, int gap, int hps_lat,
 	return res;
 }
 
+// ---------------- CD volume page test (cdvol) ----------------
+// Drives the CD target (ID 3, selectable via cd_enable with no media): sends
+// MODE SELECT(6) page 0x0E with distinctive port volumes, reads them back
+// with MODE SENSE(6) page 0x0E, and checks the echo byte-for-byte. This is
+// the AppleCD Audio Player volume-slider transaction (2026-07-29 feature).
+// Everything is PIO — the parameter transfer exercises the byte-beat parse.
+static int run_cdvol() {
+	reset_dut(0);
+
+	// ---- selection (CD target = SCSI ID 3) ----
+	reg_write(WREG_ODR, (uint8_t)(1 << 3));
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) { printf("cdvol: CD target did not select\n"); return 1; }
+	reg_write(WREG_ICR, ICR_DATA);
+
+	// ---- MODE SELECT(6): param list = 4B header (bdlen 0) + page 0x0E ----
+	static const uint8_t msel[20] = {
+		0x00, 0x00, 0x00, 0x00,            // mode parameter header, bdlen=0
+		0x0E, 0x0E,                        // page code, page length 14
+		0x04, 0x00, 0x00, 0x00, 75, 75,    // IMMED; obsolete 75/75
+		0x01, 0x55,                        // port 0: channel L, volume 0x55
+		0x02, 0x66,                        // port 1: channel R, volume 0x66
+		0x04, 0x11,                        // port 2
+		0x08, 0x22                         // port 3
+	};
+	uint8_t cdb_sel[6] = { 0x15, 0x10, 0, 0, sizeof(msel), 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(cdb_sel[i])) { printf("cdvol: MODE SELECT CDB stalled at %d\n", i); return 1; }
+	for (size_t i = 0; i < sizeof(msel); i++)
+		if (!pio_put(msel[i])) { printf("cdvol: MODE SELECT data stalled at %zu\n", i); return 1; }
+	reg_write(WREG_ICR, 0);                // release the data bus before status
+	int st = pio_get(), msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("cdvol: MODE SELECT status %02x msg %02x\n", st, msg); return 1; }
+
+	// ---- re-select, MODE SENSE(6) page 0x0E, verify the echo ----
+	reg_write(WREG_ODR, (uint8_t)(1 << 3));
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) { printf("cdvol: reselect failed\n"); return 1; }
+	reg_write(WREG_ICR, ICR_DATA);
+	uint8_t cdb_sns[6] = { 0x1A, 0x00, 0x0E, 0, 28, 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(cdb_sns[i])) { printf("cdvol: MODE SENSE CDB stalled at %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);                // release the data bus: DataIn follows
+	uint8_t got[28];
+	for (int i = 0; i < 28; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("cdvol: MODE SENSE data stalled at %d\n", i); return 1; }
+		got[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+
+	static const uint8_t expect_tail[8] = { 0x01, 0x55, 0x02, 0x66, 0x04, 0x11, 0x08, 0x22 };
+	int fails = 0;
+	if (got[0] != 27)   { printf("cdvol: mode data length %02x != 27\n", got[0]); fails++; }
+	if (got[12] != 0x0E || got[13] != 0x0E)
+		{ printf("cdvol: page hdr %02x %02x != 0E 0E\n", got[12], got[13]); fails++; }
+	for (int i = 0; i < 8; i++)
+		if (got[20 + i] != expect_tail[i]) {
+			printf("cdvol: port byte [%d] = %02x expect %02x\n", 20 + i, got[20 + i], expect_tail[i]);
+			fails++;
+		}
+	if (st != 0x00 || msg != 0x00) { printf("cdvol: MODE SENSE status %02x msg %02x\n", st, msg); fails++; }
+	printf("cdvol: %s (sense page:", fails ? "FAIL" : "PASS");
+	for (int i = 0; i < 28; i++) printf(" %02x", got[i]);
+	printf(")\n");
+	return fails ? 1 : 0;
+}
+
+// ---------------- CD target selection helper ----------------
+// Selects the CD target (SCSI ID 3). Needs the harness's cd_img_mounted=1,
+// or media-gated CD commands CHECK with the no-disc sense first.
+static bool select_cd() {
+	reg_write(WREG_ODR, (uint8_t)(1 << 3));
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) return false;
+	reg_write(WREG_ICR, ICR_DATA);
+	return true;
+}
+
+// ---------------- gap-pass command tests (gapcmds) ----------------
+// Coverage the 2026-07-29 gap pass never had (it was only "boots in sim"):
+// 0x42 formats 2/3 SERVED layouts, 0x44 READ HEADER LBA form + MSF reject,
+// 0x45 PLAY AUDIO(10) acceptance. Run only on a build that carries them.
+static int run_gapcmds() {
+	reset_dut(0);
+	int fails = 0;
+
+	// --- 0x42 format 2 (MCN): 24 B, hdr len 20, format echo at [4] ---
+	if (!select_cd()) { printf("gapcmds: select failed (f2)\n"); return 1; }
+	uint8_t c_f2[10] = { 0x42, 0x02, 0x40, 0x02, 0, 0, 0, 0, 24, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_f2[i])) { printf("gapcmds: f2 CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t g2[24];
+	for (int i = 0; i < 24; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: f2 data stalled at %d (not implemented?)\n", i); return 1; }
+		g2[i] = (uint8_t)v;
+	}
+	int st = pio_get(), msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: f2 status %02x msg %02x\n", st, msg); fails++; }
+	if (g2[3] != 20 || g2[4] != 0x02) {
+		printf("gapcmds: f2 len %02x fmt %02x (want 14/02)\n", g2[3], g2[4]); fails++;
+	}
+
+	// --- 0x42 format 3 (ISRC): format echo + track echo at [6] ---
+	if (!select_cd()) { printf("gapcmds: select failed (f3)\n"); return 1; }
+	uint8_t c_f3[10] = { 0x42, 0x02, 0x40, 0x03, 0, 0, 0x05, 0, 24, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_f3[i])) { printf("gapcmds: f3 CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t g3[24];
+	for (int i = 0; i < 24; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: f3 data stalled at %d\n", i); return 1; }
+		g3[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: f3 status %02x msg %02x\n", st, msg); fails++; }
+	if (g3[3] != 20 || g3[4] != 0x03 || g3[6] != 0x05) {
+		printf("gapcmds: f3 len %02x fmt %02x trk %02x (want 14/03/05)\n", g3[3], g3[4], g3[6]);
+		fails++;
+	}
+
+	// --- 0x44 READ HEADER, LBA form: 8 B, LBA echoed at [4..7] ---
+	if (!select_cd()) { printf("gapcmds: select failed (hdr)\n"); return 1; }
+	uint8_t c_hdr[10] = { 0x44, 0x00, 0x00, 0x00, 0x12, 0x34, 0, 0, 8, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_hdr[i])) { printf("gapcmds: hdr CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t gh[8];
+	for (int i = 0; i < 8; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: hdr data stalled at %d (0x44 absent?)\n", i); return 1; }
+		gh[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: hdr status %02x msg %02x\n", st, msg); fails++; }
+	if (gh[4] != 0x00 || gh[5] != 0x00 || gh[6] != 0x12 || gh[7] != 0x34) {
+		printf("gapcmds: hdr addr %02x%02x%02x%02x (want 00001234)\n", gh[4], gh[5], gh[6], gh[7]);
+		fails++;
+	}
+
+	// --- 0x44 MSF form must CHECK with 5/0x24 ---
+	if (!select_cd()) { printf("gapcmds: select failed (hdr msf)\n"); return 1; }
+	uint8_t c_hm[10] = { 0x44, 0x02, 0, 0, 0, 0, 0, 0, 8, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_hm[i])) { printf("gapcmds: hdrmsf CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x02) { printf("gapcmds: hdrmsf status %02x (want CHECK 02)\n", st); fails++; }
+	if (!select_cd()) { printf("gapcmds: sense select failed\n"); return 1; }
+	uint8_t c_rs[6] = { 0x03, 0, 0, 0, 18, 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(c_rs[i])) { printf("gapcmds: sense CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t sns[18];
+	for (int i = 0; i < 18; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: sense stalled at %d\n", i); return 1; }
+		sns[i] = (uint8_t)v;
+	}
+	(void)pio_get(); (void)pio_get();
+	if ((sns[2] & 0x0F) != 0x05 || sns[12] != 0x24) {
+		printf("gapcmds: hdrmsf sense %x/%02x (want 5/24)\n", sns[2] & 0x0F, sns[12]);
+		fails++;
+	}
+
+	// --- 0xA5 PLAY AUDIO(12): 12-byte CDB must COMPLETE (cmd12_cpl) ---
+	// Before group-5 completion existed this hung the target in CMD_IN forever.
+	if (!select_cd()) { printf("gapcmds: select failed (play12)\n"); return 1; }
+	uint8_t c_p12[12] = { 0xA5, 0x00, 0x00, 0x00, 0x00, 0x64, 0, 0, 0, 0x0A, 0, 0 };
+	for (int i = 0; i < 12; i++)
+		if (!pio_put(c_p12[i])) { printf("gapcmds: play12 CDB stalled %d (12B CDB unsupported?)\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: play12 status %02x msg %02x\n", st, msg); fails++; }
+
+	// --- 0xBB SET CD SPEED (12-byte): accept-noop, GOOD ---
+	if (!select_cd()) { printf("gapcmds: select failed (speed)\n"); return 1; }
+	uint8_t c_sp[12] = { 0xBB, 0, 0x01, 0x76, 0x01, 0x76, 0, 0, 0, 0, 0, 0 };
+	for (int i = 0; i < 12; i++)
+		if (!pio_put(c_sp[i])) { printf("gapcmds: speed CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: setspeed status %02x msg %02x\n", st, msg); fails++; }
+
+	// --- MODE SENSE(6) page 0x2A: capability payload, 38 bytes ---
+	if (!select_cd()) { printf("gapcmds: select failed (ms2a)\n"); return 1; }
+	uint8_t c_2a[6] = { 0x1A, 0x00, 0x2A, 0, 38, 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(c_2a[i])) { printf("gapcmds: ms2a CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t m2a[38];
+	for (int i = 0; i < 38; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: ms2a data stalled at %d (page absent?)\n", i); return 1; }
+		m2a[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: ms2a status %02x msg %02x\n", st, msg); fails++; }
+	if (m2a[0] != 37 || m2a[12] != 0x2A || m2a[13] != 0x18) {
+		printf("gapcmds: ms2a hdr len %02x page %02x plen %02x (want 25/2A/18)\n",
+		       m2a[0], m2a[12], m2a[13]); fails++;
+	}
+	if (m2a[16] != 0x71 || m2a[19] != 0x03 || m2a[22] != 0x01 || m2a[23] != 0x00) {
+		printf("gapcmds: ms2a caps %02x mute/vol %02x levels %02x%02x (want 71/03/0100)\n",
+		       m2a[16], m2a[19], m2a[22], m2a[23]); fails++;
+	}
+
+	// --- unknown 12-byte opcode: must CHECK invalid-op, NOT wedge ---
+	if (!select_cd()) { printf("gapcmds: select failed (unk12)\n"); return 1; }
+	uint8_t c_uk[12] = { 0xAF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	for (int i = 0; i < 12; i++)
+		if (!pio_put(c_uk[i])) { printf("gapcmds: unk12 CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x02) { printf("gapcmds: unk12 status %02x (want CHECK 02)\n", st); fails++; }
+
+	// --- 0x45 PLAY AUDIO(10) LBA form: command accepted, GOOD status ---
+	if (!select_cd()) { printf("gapcmds: select failed (play)\n"); return 1; }
+	uint8_t c_pl[10] = { 0x45, 0x00, 0x00, 0x00, 0x00, 0x64, 0, 0x00, 0x0A, 0 };
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(c_pl[i])) { printf("gapcmds: play CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: play status %02x msg %02x\n", st, msg); fails++; }
+
+	printf("gapcmds: %s\n", fails ? "FAIL" : "PASS");
+	return fails ? 1 : 0;
+}
+
 // ---------------- main ----------------
 int main(int argc, char** argv) {
 	Verilated::commandArgs(argc, argv);
@@ -682,6 +914,22 @@ int main(int argc, char** argv) {
 #endif
 
 	Mode modes[6] = { M_BYTE, M_WORD, M_LONG, M_MIX, M_LONGSKEW, M_WORDSKEW };
+
+	if (one_mode && !strcmp(one_mode, "gapcmds")) {
+		int rc = run_gapcmds();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "cdvol")) {
+		int rc = run_cdvol();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
 
 	// write-mode single runs (separate path: verifies the flushed image)
 	if (one_mode && (!strcmp(one_mode, "wbyte") || !strcmp(one_mode, "wword"))) {
