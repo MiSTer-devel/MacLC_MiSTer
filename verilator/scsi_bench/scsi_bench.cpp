@@ -810,6 +810,34 @@ static int run_gapcmds() {
 		fails++;
 	}
 
+	// --- 0xA5 PLAY AUDIO(12): 12-byte CDB must COMPLETE (cmd12_cpl) ---
+	// Before group-5 completion existed this hung the target in CMD_IN forever.
+	if (!select_cd()) { printf("gapcmds: select failed (play12)\n"); return 1; }
+	uint8_t c_p12[12] = { 0xA5, 0x00, 0x00, 0x00, 0x00, 0x64, 0, 0, 0, 0x0A, 0, 0 };
+	for (int i = 0; i < 12; i++)
+		if (!pio_put(c_p12[i])) { printf("gapcmds: play12 CDB stalled %d (12B CDB unsupported?)\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: play12 status %02x msg %02x\n", st, msg); fails++; }
+
+	// --- 0xBB SET CD SPEED (12-byte): accept-noop, GOOD ---
+	if (!select_cd()) { printf("gapcmds: select failed (speed)\n"); return 1; }
+	uint8_t c_sp[12] = { 0xBB, 0, 0x01, 0x76, 0x01, 0x76, 0, 0, 0, 0, 0, 0 };
+	for (int i = 0; i < 12; i++)
+		if (!pio_put(c_sp[i])) { printf("gapcmds: speed CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: setspeed status %02x msg %02x\n", st, msg); fails++; }
+
+	// --- unknown 12-byte opcode: must CHECK invalid-op, NOT wedge ---
+	if (!select_cd()) { printf("gapcmds: select failed (unk12)\n"); return 1; }
+	uint8_t c_uk[12] = { 0xAF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	for (int i = 0; i < 12; i++)
+		if (!pio_put(c_uk[i])) { printf("gapcmds: unk12 CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	st = pio_get(); msg = pio_get();
+	if (st != 0x02) { printf("gapcmds: unk12 status %02x (want CHECK 02)\n", st); fails++; }
+
 	// --- 0x45 PLAY AUDIO(10) LBA form: command accepted, GOOD status ---
 	if (!select_cd()) { printf("gapcmds: select failed (play)\n"); return 1; }
 	uint8_t c_pl[10] = { 0x45, 0x00, 0x00, 0x00, 0x00, 0x64, 0, 0x00, 0x0A, 0 };
