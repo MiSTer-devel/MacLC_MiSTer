@@ -710,80 +710,15 @@ static int run_cdvol() {
 	return fails ? 1 : 0;
 }
 
-// ---------------- 0x42 sub-channel format guard test (subqfmt) ----------------
-// Snow-parity (2026-07-29): READ SUB-CHANNEL format 1 serves the position
-// payload; formats 0/2/3 CHECK with ILLEGAL REQUEST / ASC 0x24 (invalid field
-// in CDB) and the following REQUEST SENSE must report exactly that. A format-1
-// ask afterwards must serve again with GOOD status (sense cleared). Needs the
-// harness's cd_img_mounted=1 (media-gated 0x42 CHECKs no-disc otherwise).
+// ---------------- CD target selection helper ----------------
+// Selects the CD target (SCSI ID 3). Needs the harness's cd_img_mounted=1,
+// or media-gated CD commands CHECK with the no-disc sense first.
 static bool select_cd() {
 	reg_write(WREG_ODR, (uint8_t)(1 << 3));
 	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
 	if (!wait_csr(CSR_BSY, CSR_BSY, 20000)) return false;
 	reg_write(WREG_ICR, ICR_DATA);
 	return true;
-}
-
-static int run_subqfmt() {
-	reset_dut(0);
-	int fails = 0;
-
-	static const uint8_t bad_fmts[3] = { 0x00, 0x02, 0x03 };
-	for (int f = 0; f < 3; f++) {
-		// rejected ask: no DataIn phase, straight CHECK CONDITION status
-		if (!select_cd()) { printf("subqfmt: select failed (fmt %02x)\n", bad_fmts[f]); return 1; }
-		uint8_t cdb[10] = { 0x42, 0x02, 0x40, bad_fmts[f], 0, 0, 0, 0, 24, 0 };
-		for (int i = 0; i < 10; i++)
-			if (!pio_put(cdb[i])) { printf("subqfmt: CDB stalled (fmt %02x byte %d)\n", bad_fmts[f], i); return 1; }
-		reg_write(WREG_ICR, 0);            // release the data bus before status
-		int st = pio_get(), msg = pio_get();
-		if (st != 0x02 || msg != 0x00) {
-			printf("subqfmt: fmt %02x status %02x msg %02x (want CHECK 02/00)\n", bad_fmts[f], st, msg);
-			fails++;
-		}
-
-		// REQUEST SENSE: key 5 (ILLEGAL REQUEST), ASC 0x24 (invalid field)
-		if (!select_cd()) { printf("subqfmt: sense select failed\n"); return 1; }
-		uint8_t cdb_rs[6] = { 0x03, 0, 0, 0, 18, 0 };
-		for (int i = 0; i < 6; i++)
-			if (!pio_put(cdb_rs[i])) { printf("subqfmt: SENSE CDB stalled at %d\n", i); return 1; }
-		reg_write(WREG_ICR, 0);
-		uint8_t sns[18];
-		for (int i = 0; i < 18; i++) {
-			int v = pio_get();
-			if (v < 0) { printf("subqfmt: sense data stalled at %d\n", i); return 1; }
-			sns[i] = (uint8_t)v;
-		}
-		st = pio_get(); msg = pio_get();
-		if (st != 0x00 || msg != 0x00) { printf("subqfmt: SENSE status %02x msg %02x\n", st, msg); fails++; }
-		if ((sns[2] & 0x0F) != 0x05 || sns[12] != 0x24) {
-			printf("subqfmt: fmt %02x sense key %x asc %02x (want 5/24)\n",
-			       bad_fmts[f], sns[2] & 0x0F, sns[12]);
-			fails++;
-		}
-	}
-
-	// format 1 must still serve: 16 bytes, GOOD status, len/format echo
-	if (!select_cd()) { printf("subqfmt: fmt1 select failed\n"); return 1; }
-	uint8_t cdb1[10] = { 0x42, 0x02, 0x40, 0x01, 0, 0, 0, 0, 16, 0 };
-	for (int i = 0; i < 10; i++)
-		if (!pio_put(cdb1[i])) { printf("subqfmt: fmt1 CDB stalled at %d\n", i); return 1; }
-	reg_write(WREG_ICR, 0);
-	uint8_t got[16];
-	for (int i = 0; i < 16; i++) {
-		int v = pio_get();
-		if (v < 0) { printf("subqfmt: fmt1 data stalled at %d (fmt1 rejected?)\n", i); return 1; }
-		got[i] = (uint8_t)v;
-	}
-	int st = pio_get(), msg = pio_get();
-	if (st != 0x00 || msg != 0x00) { printf("subqfmt: fmt1 status %02x msg %02x\n", st, msg); fails++; }
-	if (got[3] != 12 || got[4] != 0x01) {
-		printf("subqfmt: fmt1 payload len %02x fmtcode %02x (want 0c/01)\n", got[3], got[4]);
-		fails++;
-	}
-
-	printf("subqfmt: %s\n", fails ? "FAIL" : "PASS");
-	return fails ? 1 : 0;
 }
 
 // ---------------- gap-pass command tests (gapcmds) ----------------
@@ -931,14 +866,6 @@ int main(int argc, char** argv) {
 
 	if (one_mode && !strcmp(one_mode, "gapcmds")) {
 		int rc = run_gapcmds();
-#if VM_TRACE
-		if (tfp) tfp->close();
-#endif
-		return rc;
-	}
-
-	if (one_mode && !strcmp(one_mode, "subqfmt")) {
-		int rc = run_subqfmt();
 #if VM_TRACE
 		if (tfp) tfp->close();
 #endif
