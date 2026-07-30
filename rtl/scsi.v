@@ -1044,14 +1044,44 @@ function [7:0] cd_ms0e_byte;
 	end
 endfunction
 
+// CDROM MODE SENSE(6) page 0x2A (MM Capabilities and Mechanical Status): the
+// standard 12-byte header+descriptor, then {0x2A, len 0x18, 24 payload bytes}
+// = 38 total. Payload bytes are Snow's (mod.rs 0x2A), which is [MMC4] E.3.3
+// truncated at byte 26 as a non-CD-R drive should:
+//   [2] 0x71 multi-session | Mode 2 Form 2 | Mode 2 Form 1 | audio play
+//   [4] 0x28 tray loading mechanism | eject
+//   [5] 0x03 separate channel mute | separate volume levels
+//   [8:9] 256 volume levels supported (matches the page 0x0E port range)
+function [7:0] cd_ms2a_byte;
+	input [31:0] cnt;
+	begin
+		cd_ms2a_byte =
+			(cnt == 32'd0 )?8'd37:                      // mode data length = 38-1
+			(cnt == 32'd2 )?8'h80:                      // WP (read-only medium)
+			(cnt == 32'd3 )?8'd8:                       // block descriptor length
+			(cnt == 32'd5 )?capacity[23:16]:
+			(cnt == 32'd6 )?capacity[15:8]:
+			(cnt == 32'd7 )?capacity[7:0]:
+			(cnt == 32'd10)?8'h08:                      // block length 0x000800 = 2048
+			(cnt == 32'd12)?8'h2A:                      // page code
+			(cnt == 32'd13)?8'h18:                      // page length = 24
+			(cnt == 32'd16)?8'h71:                      // payload[2]
+			(cnt == 32'd18)?8'h28:                      // payload[4]
+			(cnt == 32'd19)?8'h03:                      // payload[5]
+			(cnt == 32'd22)?8'h01:                      // payload[8]  256 volume
+			(cnt == 32'd23)?8'h00:                      // payload[9]  levels
+			8'h00;
+	end
+endfunction
+
 // Page select: CDROM response, else 0x31 detection page vs. the default.
-wire [7:0] mode_sense_dout       = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt)       : cd_ms31 ? mode_sense_p31_byte(data_cnt)       : cd_mode_sense_byte(data_cnt))
+wire [7:0] mode_sense_dout       = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt) : cd_ms2a ? cd_ms2a_byte(data_cnt)       : cd_ms31 ? mode_sense_p31_byte(data_cnt)       : cd_mode_sense_byte(data_cnt))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt)       : mode_sense_def_dout;
-wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next)  : cd_ms31 ? mode_sense_p31_byte(data_cnt_next)  : cd_mode_sense_byte(data_cnt_next))
+wire [7:0] mode_sense_dout_next  = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next) : cd_ms2a ? cd_ms2a_byte(data_cnt_next)  : cd_ms31 ? mode_sense_p31_byte(data_cnt_next)  : cd_mode_sense_byte(data_cnt_next))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next)  : mode_sense_def_dout_next;
-wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next2) : cd_ms31 ? mode_sense_p31_byte(data_cnt_next2) : cd_mode_sense_byte(data_cnt_next2))
+wire [7:0] mode_sense_dout_next2 = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next2) : cd_ms2a ? cd_ms2a_byte(data_cnt_next2) : cd_ms31 ? mode_sense_p31_byte(data_cnt_next2) : cd_mode_sense_byte(data_cnt_next2))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next2) : mode_sense_def_dout_next2;
-wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next3) : cd_ms31 ? mode_sense_p31_byte(data_cnt_next3) : cd_mode_sense_byte(data_cnt_next3))
+wire [7:0] mode_sense_dout_next3 = (CDROM != 0)   ? (cd_ms0e ? cd_ms0e_byte(data_cnt_next3) : cd_ms2a ? cd_ms2a_byte(data_cnt_next3) : cd_ms31 ? mode_sense_p31_byte(data_cnt_next3) : cd_mode_sense_byte(data_cnt_next3))
                                  : mode_sense_p31 ? mode_sense_p31_byte(data_cnt_next3) : mode_sense_def_dout_next3;
 
 // Default MODE SENSE(6) response (unchanged; served for every page except 0x31).
@@ -1482,6 +1512,13 @@ wire        cd_ms30    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h30
 // pages") keeps today's header-only default — the AppleCD driver asks for
 // 0x0E directly (Snow dispatch) and changing 0x3F would touch proven paths.
 wire        cd_ms0e    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h0E);
+// Page 0x2A (MM Capabilities & Mechanical Status): advertises what this drive
+// can actually do — audio play, multi-session, Mode 2 Form 1/2, tray load with
+// eject, separate channel mute AND separate volume levels, 256 volume steps.
+// The volume claims are the ones that matter: they are exactly what the page
+// 0x0E audio-port path implements, so a utility that probes 0x2A before
+// showing volume controls now gets a truthful yes. Snow layout (mod.rs 0x2A).
+wire        cd_ms2a    = (CDROM != 0) && cmd_mode_sense && (cmd[2][5:0] == 6'h2A);
 // CD-changer detection: serve the BlueSCSI Toolbox page-0x31 magic on the CD
 // target so a Toolbox client (MacAtrium) recognizes it as a CD changer (its probe
 // = MODE SENSE page 0x31 magic + INQUIRY CD-ROM). UNGATED (CDCHANGER_ENABLE, not
@@ -1535,6 +1572,7 @@ wire [31:0] data_len =
 		 cmd_cd_actl?{24'd0, cmd[8]}:     // AUDIO CONTROL: DataOut of CDB[8] bytes (discarded)
 		 cmd_inquiry?((alloc_len < INQUIRY_LEN) ? alloc_len : INQUIRY_LEN):
 		 cmd_mode_sense?((CDROM != 0) ? (cd_ms0e ? ((alloc_len < 32'd28) ? alloc_len : 32'd28)
+		                               : cd_ms2a ? ((alloc_len < 32'd38) ? alloc_len : 32'd38)
 		                               : cd_ms31 ? ((alloc_len < 32'd56) ? alloc_len : 32'd56)
 		                               : cd_ms30 ? ((alloc_len < 32'd36) ? alloc_len : 32'd36)
 		                                         : ((alloc_len < 32'd12) ? alloc_len : 32'd12))

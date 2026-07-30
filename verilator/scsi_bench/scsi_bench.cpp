@@ -829,6 +829,29 @@ static int run_gapcmds() {
 	st = pio_get(); msg = pio_get();
 	if (st != 0x00 || msg != 0x00) { printf("gapcmds: setspeed status %02x msg %02x\n", st, msg); fails++; }
 
+	// --- MODE SENSE(6) page 0x2A: capability payload, 38 bytes ---
+	if (!select_cd()) { printf("gapcmds: select failed (ms2a)\n"); return 1; }
+	uint8_t c_2a[6] = { 0x1A, 0x00, 0x2A, 0, 38, 0 };
+	for (int i = 0; i < 6; i++)
+		if (!pio_put(c_2a[i])) { printf("gapcmds: ms2a CDB stalled %d\n", i); return 1; }
+	reg_write(WREG_ICR, 0);
+	uint8_t m2a[38];
+	for (int i = 0; i < 38; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("gapcmds: ms2a data stalled at %d (page absent?)\n", i); return 1; }
+		m2a[i] = (uint8_t)v;
+	}
+	st = pio_get(); msg = pio_get();
+	if (st != 0x00 || msg != 0x00) { printf("gapcmds: ms2a status %02x msg %02x\n", st, msg); fails++; }
+	if (m2a[0] != 37 || m2a[12] != 0x2A || m2a[13] != 0x18) {
+		printf("gapcmds: ms2a hdr len %02x page %02x plen %02x (want 25/2A/18)\n",
+		       m2a[0], m2a[12], m2a[13]); fails++;
+	}
+	if (m2a[16] != 0x71 || m2a[19] != 0x03 || m2a[22] != 0x01 || m2a[23] != 0x00) {
+		printf("gapcmds: ms2a caps %02x mute/vol %02x levels %02x%02x (want 71/03/0100)\n",
+		       m2a[16], m2a[19], m2a[22], m2a[23]); fails++;
+	}
+
 	// --- unknown 12-byte opcode: must CHECK invalid-op, NOT wedge ---
 	if (!select_cd()) { printf("gapcmds: select failed (unk12)\n"); return 1; }
 	uint8_t c_uk[12] = { 0xAF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
