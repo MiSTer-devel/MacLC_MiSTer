@@ -1315,17 +1315,28 @@ wire signed [16:0] sum_l  = {snd_l_p[15], snd_l_p} + $signed(seg_ml[32:16]);
 wire signed [16:0] sum_r  = {snd_r_p[15], snd_r_p} + $signed(seg_mr[32:16]);
 // CD Audio Control page 0x0E port scaling (2026-07-29 — the volume slider).
 // Source routing per port channel byte (0x01 = left, 0x02 = right, other =
-// mute; Snow make_out_sample), then a linear volume scale: (s * vol) >> 8 —
-// 255 = -0.034 dB (inaudible vs Snow's exact /255), 0 = true mute. Applied
-// to the interpolated value BEFORE the 8-clk commit register, so the
+// mute; Snow make_out_sample), then the hardware volume law: a Q15 gain from
+// cd_vol_lut.vh, gain = (vol/255)^5, so 255 is exact unity and 0 exact mute.
+//
+// The law was MEASURED, not assumed (docs/cd_volume_law_2026-07-30.md): a
+// linear (s*vol)>>8 — what MAME, Snow and BlueSCSI all do — compresses the
+// AppleCD player's whole 16-step ladder into 5.85 dB with 0.10 dB steps at
+// the top, while a real Quadra 800 + AppleCD drive spans 28.0 dB with even
+// ~2.00 dB steps. Fit over the bytes the player actually sends gives an
+// exponent of 5.
+//
+// Applied to the interpolated value BEFORE the 8-clk commit register, so the
 // framework's stability-filter contract (output holds ≥8 clk_sys) is
 // untouched.
 wire signed [15:0] ap_src_l = (ap_ch0 == 8'h01) ? sum_l[15:0] :
                               (ap_ch0 == 8'h02) ? sum_r[15:0] : 16'sd0;
 wire signed [15:0] ap_src_r = (ap_ch1 == 8'h02) ? sum_r[15:0] :
                               (ap_ch1 == 8'h01) ? sum_l[15:0] : 16'sd0;
-wire signed [24:0] ap_scl_l = ap_src_l * $signed({1'b0, ap_vol0});
-wire signed [24:0] ap_scl_r = ap_src_r * $signed({1'b0, ap_vol1});
+`include "cd_vol_lut.vh"
+wire [15:0] ap_gain_l = cd_vol_gain(ap_vol0);
+wire [15:0] ap_gain_r = cd_vol_gain(ap_vol1);
+wire signed [31:0] ap_scl_l = ap_src_l * $signed({1'b0, ap_gain_l});
+wire signed [31:0] ap_scl_r = ap_src_r * $signed({1'b0, ap_gain_r});
 reg  [2:0] odiv;
 always @(posedge clk) begin
 	if (rst || pstate != ST_PLAY) begin
@@ -1333,8 +1344,8 @@ always @(posedge clk) begin
 	end else begin
 		odiv <= odiv + 3'd1;
 		if (odiv == 3'd0) begin
-			snd_l <= ap_scl_l[23:8];
-			snd_r <= ap_scl_r[23:8];
+			snd_l <= ap_scl_l[30:15];
+			snd_r <= ap_scl_r[30:15];
 		end
 	end
 end
