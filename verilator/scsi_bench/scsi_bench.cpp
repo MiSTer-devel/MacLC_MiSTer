@@ -81,7 +81,12 @@ struct TbHps {
 	std::vector<uint8_t> upload;               // SEND destination bytes
 	std::string          upload_name;
 	bool                 upload_open = false;
-	uint8_t              tail[512];            // last LBA-1 request block
+	// Tail request blocks LBA 1..TB_TAIL_BLKS, flattened: payload byte P >= 496
+	// sits at tail[P - 496]. 512-byte chunks use one block; a 4 KB large-send
+	// chunk spans eight (mirrors Main_MiSTer 952994d).
+	static const uint32_t CHUNK_MAX = 4096;
+	static const uint32_t TAIL_BLKS = (CHUNK_MAX + 16 - 1) / 512;   // 8
+	uint8_t              tail[TAIL_BLKS * 512];
 	uint64_t             reqs = 0, fills = 0;
 
 	TbHps() { memset(tail, 0, sizeof(tail)); }
@@ -133,8 +138,8 @@ struct TbHps {
 		if (!upload_open) { status = 0x02; return; }
 		uint32_t off   = ((uint32_t)buf[3]<<16)|((uint32_t)buf[4]<<8)|buf[5];        // 512-blocks
 		uint32_t bytes = buf[6] ? (uint32_t)buf[6]*512 : (((uint32_t)buf[1]<<8)|buf[2]);
-		if (bytes > 512) bytes = 512;
-		uint8_t chunk[512];
+		if (bytes > CHUNK_MAX) bytes = CHUNK_MAX;
+		uint8_t chunk[CHUNK_MAX];
 		uint32_t head = bytes < 496 ? bytes : 496;
 		memcpy(chunk, buf + 16, head);
 		if (bytes > 496) memcpy(chunk + 496, tail, bytes - 496);   // tail block
@@ -150,7 +155,7 @@ struct TbHps {
 
 	void request(uint32_t lba, const uint8_t* buf) {
 		reqs++;
-		if (lba == 1) { memcpy(tail, buf, 512); return; }   // SEND payload tail block
+		if (lba >= 1 && lba <= TAIL_BLKS) { memcpy(tail + (lba-1)*512, buf, 512); return; }
 		if (lba != 0) return;
 		resp.clear(); status = 0x02;
 		switch (buf[0]) {
@@ -1214,6 +1219,59 @@ static int run_toolbox() {
 			printf("toolbox: upload %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
 			       bad, SRC, first, tbx.upload[first], src[first]);
 			fails++;
+		}
+	}
+
+	// ---- SEND with LARGE (block-encoded) chunks: CAP_LARGE_SEND, stage 1.
+	// CDB[6] = block count, so one 0xD4 carries 4 KB in a single DataOut phase.
+	// The payload spans buffer bytes 16..4111 = sectors 0..8, so the core must
+	// ship EIGHT tail blocks (LBA 1..8) before the CDB block — a single-tail
+	// core drops everything past byte 527. Deliberately uses a size that is NOT
+	// a whole number of 4 KB chunks so the final short chunk is exercised too.
+	{
+		const int SRC = 4096 * 2 + 1536;           // 2 full 4 KB chunks + 3 blocks
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0xC5000 + i);
+
+		uint8_t name[33] = {};
+		memcpy(name, "large.bin", 9);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "LARGE PREP");
+		if (st != 0x00) { printf("toolbox: LARGE PREP status %02x\n", st); return 1; }
+
+		int blk = 0;
+		while (blk * 512 < SRC) {
+			int left   = SRC - blk * 512;
+			int blocks = (left + 511) / 512; if (blocks > 8) blocks = 8;
+			int bytes  = blocks * 512;
+			std::vector<uint8_t> chunk(bytes, 0xFF);        // client sends full blocks
+			int valid = (left < bytes) ? left : bytes;
+			memcpy(chunk.data(), &src[blk * 512], valid);
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			cdb[6] = (uint8_t)blocks;                        // block encoding
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			char what[40]; snprintf(what, sizeof(what), "LARGE DATA blk%d x%d", blk, blocks);
+			st = tb_cmd(cdb, chunk.data(), bytes, nullptr, 0, what);
+			if (st != 0x00) { printf("toolbox: %s status %02x\n", what, st); return 1; }
+			blk += blocks;
+		}
+
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "LARGE END");
+		if (st != 0x00) { printf("toolbox: LARGE END status %02x\n", st); return 1; }
+
+		if (tbx.upload.size() < (size_t)SRC) {
+			printf("toolbox: large upload %zu bytes, want >= %d\n", tbx.upload.size(), SRC);
+			fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < SRC; i++)
+				if (tbx.upload[i] != src[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: large upload %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, SRC, first, tbx.upload[first], src[first]);
+				fails++;
+			} else printf("toolbox: large-send %d bytes OK (4 KB chunks, 8 tail blocks)\n", SRC);
 		}
 	}
 

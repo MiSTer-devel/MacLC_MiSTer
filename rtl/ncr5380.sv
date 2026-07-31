@@ -805,13 +805,14 @@ module ncr5380
 			// boot target; the Toolbox driver locates it by INQUIRY page 0x31, not
 			// by ID. NOTE: the boot SCSI ID lives in PRAM — an existing install
 			// blessed for ID 6 needs a PRAM reset / re-bless to boot from ID 0.
-			// TB_ADDRW(11) on the Toolbox target = 4 KB tb buffer (8 sectors):
-			// a 512-byte SEND DATA payload sits at buffer bytes 16..527 (it
-			// wrapped onto the CDB at 512 B, losing 16 bytes per block) and a
-			// 0xD1 GET fetches its full 4096-byte block instead of serving one
-			// sector eight times. Ported from MacIIvi 205800b (2026-07-31).
+			// TB_ADDRW(12) on the Toolbox target = 8 KB tb buffer (16 sectors).
+			// 11 (4 KB) fixed the 512-byte case — the payload sits at buffer
+			// bytes 16..527, so on a 512-byte buffer it wrapped onto the CDB and
+			// lost 16 bytes per block (MacIIvi 205800b). 12 is what a 4 KB
+			// large-send chunk needs: bytes 16..4111 do NOT fit in 4 KB, and the
+			// extra headroom is what lets the core advertise CAP_LARGE_SEND.
 			scsi #(.ID(i[2:0]), .TOOLBOX_ENABLE(i == 0),
-			       .TB_ADDRW(i == 0 ? 11 : 8)) target
+			       .TB_ADDRW(i == 0 ? 12 : 8)) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),

@@ -1158,7 +1158,8 @@ reg [3:0]  tb_settle;   // status-latch settle for the registered port-B (q_b) r
                         // of the status block (word 0 = status/sig, word 1 = length).
 reg [17:0] tb_to;       // tb read-completion watchdog (~8-17 ms); see TBS_STAT.
 reg        old_tb_ack;
-reg [3:0]  tb_fetch_sec;    // which 512B sector the HPS fill is landing (multi-block LIST; TB_ADDRW>8)
+reg [4:0]  tb_fetch_sec;    // which 512B sector the HPS fill is landing (multi-block LIST; TB_ADDRW>8)
+                            // 5 bits: TB_ADDRW=12 gives TB_MAXSEC=16, which does not fit in 4.
 reg  [6:0] tb_retry;        // status-block re-looks (re-issued reads) this round trip
 // A slow HPS answer must not read as "no handler". The SD is mounted
 // sync,dirsync, so one SEND chunk is a synchronous card write; when the card
@@ -1196,14 +1197,17 @@ wire       tb_col_wr1 = tb_collect && stb_ack &&  data_cnt[0];
 // tb buffer word address, computed at 11b (max = 8 sectors) then sliced to
 // TB_ADDRW. On single-sector targets (TB_ADDRW=8) the high bits are always 0
 // (tb_fetch_sec=0, data_cnt<512), so the slice reproduces the old data_cnt[8:1].
-wire [10:0] tb_b_addr11 = (tb_state == TBS_LOAD)   ? {7'd0, tb_load_w}
-                        : tb_collect               ? (11'd8 + {3'd0, data_cnt[8:1]})
-                        :                             data_cnt[11:1];
-wire [TB_ADDRW-1:0] tb_b_addr = tb_b_addr11[TB_ADDRW-1:0];
+// 13 bits so a multi-block SEND fits: a 4 KB chunk sits at bytes 16..4111, i.e.
+// words 8..2055, which overflows the old 11-bit form (and the old collect slice
+// data_cnt[8:1] wrapped the payload back onto itself at 512 bytes).
+wire [12:0] tb_b_addr13 = (tb_state == TBS_LOAD)   ? {9'd0, tb_load_w}
+                        : tb_collect               ? (13'd8 + {1'b0, data_cnt[12:1]})
+                        :                             data_cnt[13:1];
+wire [TB_ADDRW-1:0] tb_b_addr = tb_b_addr13[TB_ADDRW-1:0];
 // HPS fill address: sector tb_fetch_sec at word offset tb_fetch_sec*256, so a
 // multi-sector LIST lands contiguously (LBA 1+k -> words k*256..k*256+255).
-wire [10:0] tb_hps_addr11 = {tb_fetch_sec[2:0], sd_buff_addr[7:0]};
-wire [TB_ADDRW-1:0] tb_hps_addr = tb_hps_addr11[TB_ADDRW-1:0];
+wire [12:0] tb_hps_addr13 = {tb_fetch_sec[4:0], sd_buff_addr[7:0]};
+wire [TB_ADDRW-1:0] tb_hps_addr = tb_hps_addr13[TB_ADDRW-1:0];
 wire       tb_b_wr0   = (tb_state == TBS_LOAD) || tb_col_wr0;
 wire       tb_b_wr1   = (tb_state == TBS_LOAD) || tb_col_wr1;
 wire [7:0] tb_load_b0 = cmd[{tb_load_w[2:0], 1'b0}];   // even CDB byte
@@ -1236,16 +1240,16 @@ wire [15:0] tb_serve_pair_next = data_cnt[0] ? {tb1_dout_next, tb0_dout_next2} :
 // Multi-sector LIST fetch (TB_ADDRW>8): the HPS returns tb_len bytes across
 // ceil(tb_len/512) sectors (LBA 1..N). TB_MAXSEC bounds it to the buffer; with
 // TB_ADDRW=8 => TB_MAXSEC=1 => single-block (file Toolbox behaviour preserved).
-localparam [3:0] TB_MAXSEC = 1 << (TB_ADDRW - 8);
+localparam [4:0] TB_MAXSEC = 1 << (TB_ADDRW - 8);   // 5 bits: TB_ADDRW=12 => 16
 wire [6:0] tb_nsec_raw = tb_len[15:9] + {6'd0, |tb_len[8:0]};  // ceil(tb_len/512)
-wire [3:0] tb_nsec = (tb_nsec_raw == 7'd0)         ? 4'd1
-                   : (tb_nsec_raw > {3'd0,TB_MAXSEC}) ? TB_MAXSEC
-                   :                                  tb_nsec_raw[3:0];
+wire [4:0] tb_nsec = (tb_nsec_raw == 7'd0)         ? 5'd1
+                   : (tb_nsec_raw > {2'd0,TB_MAXSEC}) ? TB_MAXSEC
+                   :                                  tb_nsec_raw[4:0];
 // Never SERVE more than the buffer actually holds. tb_nsec clamps the FETCH at
 // TB_MAXSEC sectors; without the matching clamp on the served length an HPS
 // response longer than the buffer is served from wrapped/stale words (the
 // alloc-overserve wedge class), silently corrupting the tail of a GET.
-localparam [15:0] TB_SRV_MAX = {3'd0, TB_MAXSEC, 9'd0};        // TB_MAXSEC * 512
+localparam [15:0] TB_SRV_MAX = {2'd0, TB_MAXSEC, 9'd0};        // TB_MAXSEC * 512
 wire [15:0] tb_srv_len = (tb_len > TB_SRV_MAX) ? TB_SRV_MAX : tb_len;
 
 // Round-trip FSM. Drives tb_state / tb_rd / tb_wr / tb_lba; the MAIN phase FSM
@@ -1255,12 +1259,12 @@ always @(posedge clk) begin
 	if (rst) begin
 		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
 		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
-		tb_fetch_sec <= 4'd0; tb_retry <= 7'd0;
+		tb_fetch_sec <= 5'd0; tb_retry <= 7'd0;
 	end else if (TOOLBOX_ENABLE || CDCHANGER_ENABLE) begin
 		case (tb_state)
 		TBS_IDLE: begin
 			tb_load_w <= 4'd0;
-			tb_fetch_sec <= 4'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
+			tb_fetch_sec <= 5'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
 			tb_retry <= 7'd0;                    // per-round-trip
 			if (phase == PHASE_TB) tb_state <= TBS_LOAD;
 		end
@@ -1272,7 +1276,7 @@ always @(posedge clk) begin
 					// 16..527, so its last 16 bytes are in buffer sector 1.
 					// Ship that tail FIRST (LBA 1) — the handler then has the
 					// whole payload when the CDB block (LBA 0) runs it.
-					tb_fetch_sec <= 4'd1;
+					tb_fetch_sec <= 5'd1;
 					tb_wr_r <= 1'b1; tb_lba_r <= 32'd1; tb_to <= 18'd0; tb_state <= TBS_REQ2;
 				end else begin
 					tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
@@ -1282,12 +1286,21 @@ always @(posedge clk) begin
 		// watchdog as TBS_STAT/TBS_DATA: this is the one NEW transfer in the
 		// round-trip, and a missed ack here would wedge the SCSI bus rather than
 		// just corrupt 16 bytes.
+		// Ships tail sectors 1..tb_tail_last, one per pass, then falls through to
+		// the CDB block. A 512-byte chunk has one tail sector (the classic
+		// 16-byte remainder); a 4 KB chunk has eight, which is exactly the
+		// LBA 1..TB_TAIL_BLKS range Main's handler flattens into tb_tail.
 		TBS_REQ2: begin
 			if (tb_ack) tb_wr_r <= 1'b0;
 			tb_to <= tb_to + 1'b1;
 			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
-				tb_fetch_sec <= 4'd0;   // sector-0 addressing for the CDB/status block
-				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
+				if (tb_fetch_sec < tb_tail_last) begin
+					tb_fetch_sec <= tb_fetch_sec + 5'd1;
+					tb_wr_r <= 1'b1; tb_lba_r <= tb_lba_r + 32'd1; tb_to <= 18'd0;
+				end else begin
+					tb_fetch_sec <= 5'd0;   // sector-0 addressing for the CDB/status block
+					tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_to <= 18'd0; tb_state <= TBS_REQ;
+				end
 			end
 		end
 		// request: HPS reads the CDB and runs the handler
@@ -1332,7 +1345,7 @@ always @(posedge clk) begin
 				tb_status <= tb0_dout;                       // byte 0 = SCSI status
 				tb_len    <= {tb0_dout_next, tb1_dout_next}; // bytes 2,3 = length
 				if ({tb0_dout_next, tb1_dout_next} != 16'd0) begin
-					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 4'd0; tb_to <= 18'd0;
+					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 5'd0; tb_to <= 18'd0;
 					tb_state <= TBS_DATA;
 				end else tb_state <= TBS_RDY;                // status-only
 			end else if (tb_retry != TB_RETRY_MAX) begin
@@ -1370,7 +1383,7 @@ always @(posedge clk) begin
 			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
 				if ((tb_fetch_sec + 4'd1) >= tb_nsec) tb_state <= TBS_RDY;
 				else begin
-					tb_fetch_sec <= tb_fetch_sec + 4'd1;
+					tb_fetch_sec <= tb_fetch_sec + 5'd1;
 					tb_lba_r     <= tb_lba_r + 32'd1;
 					tb_rd_r      <= 1'b1;
 					tb_to        <= 18'd0;
@@ -1685,7 +1698,7 @@ wire [31:0] data_len =
 		 // the Mac to the SD card", HW 2026-07-30; scsi_bench --mode toolbox
 		 // stalls at byte 386 of 512 without this). The HPS trims to the CDB
 		 // count when it writes.
-		 cmd_tb_send_data?32'd512:
+		 cmd_tb_send_data?tb_send_len:
 		 { 16'd0, tlen };                 // mode select etc have length in bytes
 
 always @(posedge clk) begin
@@ -1930,7 +1943,23 @@ wire       cmd_tb_send_data = TOOLBOX_ENABLE && (op_code == 8'hd4);   // SEND FI
 wire       cmd_tb_send_end  = TOOLBOX_ENABLE && (op_code == 8'hd5);   // SEND FILE END (no payload)
 wire       cmd_tb_send      = cmd_tb_send_prep || cmd_tb_send_data || cmd_tb_send_end;
 wire       cmd_tb_send_pay  = cmd_tb_send_prep || cmd_tb_send_data;   // has a DataOut payload
-wire       tb_send_tail     = cmd_tb_send_data && (TB_ADDRW > 8);     // ship buffer sector 1 too
+wire       tb_send_tail     = cmd_tb_send_data && (TB_ADDRW > 8);     // ship buffer sector 1.. too
+// SEND chunk size. The DataOut phase is ALWAYS a whole number of 512-byte
+// blocks: CDB[6] gives the block count (large-send encoding), and when it is
+// zero the client is a v0 legacy sender that still pushes one full block and
+// puts the VALID byte count in CDB[1..2]. Deriving the phase length from the
+// valid count is what broke every short final chunk (see data_len) — the count
+// only tells the HPS how much of the block to write.
+//
+// Clamped to TB_SEND_CAP so a client that ignores our advertised capability
+// cannot overrun the buffer: the payload sits at byte 16, so 16 + N must fit in
+// 2 * 2^TB_ADDRW bytes. TB_ADDRW=12 (8 KB) holds 4 KB comfortably.
+localparam [31:0] TB_SEND_CAP = (TB_ADDRW >= 12) ? 32'd4096 : 32'd512;
+wire [31:0] tb_send_raw = (cmd[6] != 8'd0) ? {15'd0, cmd[6], 9'd0} : 32'd512;
+wire [31:0] tb_send_len = (tb_send_raw > TB_SEND_CAP) ? TB_SEND_CAP : tb_send_raw;
+// Last buffer sector the payload touches = (16 + N - 1) >> 9. Sector 0 is the
+// CDB block, so sectors 1..tb_tail_last are the tail blocks to ship first.
+wire [4:0]  tb_tail_last = (tb_send_len[15:0] + 16'd15) >> 9;
 wire       cmd_tb_debug     = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd6);      // TOGGLE DEBUG
 wire       cmd_tb_debug_get = cmd_tb_debug && (cmd[1] != 8'd0);    // CDB[1]!=0 -> read flag
 wire       tb_devinfo_caps  = cmd_tb_devinfo && (cmd[1] == 8'h01); // subcmd 1 = capabilities
@@ -1980,10 +2009,22 @@ assign tb_srv_hold = tb_srv_active && (tb_srv_settle != 4'd0);
 // 0xFF (absent). subcmd 0x01 GET CAPABILITIES -> API version 0 + cap flags; M0
 // has no host transfer path so advertise 0x00 (force v0 paths) -> all zero.
 // Bump caps when the HPS round trip lands (M2/M3).
-wire [7:0] tb_devinfo_dout       = tb_devinfo_caps ? 8'h00 : (data_cnt       == {29'd0, ID}) ? 8'h00 : 8'hff;
-wire [7:0] tb_devinfo_dout_next  = tb_devinfo_caps ? 8'h00 : (data_cnt_next  == {29'd0, ID}) ? 8'h00 : 8'hff;
-wire [7:0] tb_devinfo_dout_next2 = tb_devinfo_caps ? 8'h00 : (data_cnt_next2 == {29'd0, ID}) ? 8'h00 : 8'hff;
-wire [7:0] tb_devinfo_dout_next3 = tb_devinfo_caps ? 8'h00 : (data_cnt_next3 == {29'd0, ID}) ? 8'h00 : 8'hff;
+// GET CAPABILITIES payload: byte 0 = API version (0), byte 1 = capability
+// flags. 0x02 = CAP_LARGE_SEND, advertised only when the buffer can actually
+// stage a 4 KB chunk — a client that sees the flag WILL send block-encoded
+// chunks, so never advertise ahead of TB_ADDRW. 0x01 CAP_LARGE_TRANSFERS
+// (multi-block 0xD1 GET) stays off until its read path has bench coverage.
+localparam [7:0] TB_CAPS = (TB_ADDRW >= 12) ? 8'h02 : 8'h00;
+function [7:0] tb_caps_byte;
+	input [31:0] cnt;
+	begin
+		tb_caps_byte = (cnt == 32'd1) ? TB_CAPS : 8'h00;
+	end
+endfunction
+wire [7:0] tb_devinfo_dout       = tb_devinfo_caps ? tb_caps_byte(data_cnt)       : (data_cnt       == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next  = tb_devinfo_caps ? tb_caps_byte(data_cnt_next)  : (data_cnt_next  == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next2 = tb_devinfo_caps ? tb_caps_byte(data_cnt_next2) : (data_cnt_next2 == {29'd0, ID}) ? 8'h00 : 8'hff;
+wire [7:0] tb_devinfo_dout_next3 = tb_devinfo_caps ? tb_caps_byte(data_cnt_next3) : (data_cnt_next3 == {29'd0, ID}) ? 8'h00 : 8'hff;
 
 // TOGGLE DEBUG (0xD6): a stored flag with no side effects, so the client's
 // get/set round-trips succeed. get (CDB[1]!=0) returns the flag byte.
