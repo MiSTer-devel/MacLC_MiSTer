@@ -228,3 +228,37 @@ Branch `toolbox-large-files` (nothing pushed):
 
 Downloads are the last slow leg. The ~230 KiB/s guest data-phase ceiling
 is still above 91, so there may be more after this.
+
+---
+
+## ADDENDUM — caps bit 0 reverted the same day (2026-08-01 PM)
+
+The race fix shipped, but `TB_CAPS = 0x03` did NOT: advertising
+`CAP_LARGE_TRANSFERS` crashes the official BlueSCSI SD Transfer app
+(1.1.0b5) with a guest **"bad F-Line instruction"** bomb at 0% — before
+any data moves, often before its own overwrite prompt — so the fault is
+in the app's capability-dependent setup path, not the serve.
+
+HW A/B, same app / file / procedure, each on its own fresh boot:
+
+| build | caps | fix | official app |
+|---|---|---|---|
+| `5a181d40` | 0x03 | yes | **3 of 4 bombed**; survivor 99 KB/s then hung |
+| `914e07cc` | 0x02 | no  | 2 of 2 clean, 122-123 KB/s |
+| `3aaf1ed1` | 0x02 | yes | 2 of 2 clean, 121-123 KB/s ← **discriminator** |
+
+The third row is the attribution: identical RTL fix, only the caps byte
+differs, app clean. Bit 0 alone is the trigger; the fetch retry is
+exonerated (MacAtrium also ran the fixed multi-block GET path flawlessly
+— 4x 2 MB byte-exact, one under a deliberate SD write storm).
+
+**Shipped: `3aaf1ed1`** (`releases/MacLC_20260801.rbf`, commit `564a9f7`)
+— race fixed AND client-safe, strictly better than the morning's
+`914e07cc`. MacAtrium re-validated byte-exact on it (33 KB/s downloads).
+
+Cost of the revert: MacAtrium downloads 33 KB/s instead of 91. Flipping
+the constant back is one line — but only with a client that survives it.
+
+**Lesson: a capability bit is a CLIENT-BEHAVIOUR switch.** Byte-exactness
+on one client does not clear it; every caps change needs a per-client
+hardware A/B.
