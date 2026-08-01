@@ -2281,7 +2281,10 @@ assign tb_stream_stall = tb_get_stall || tb_col_stall;
 // and still truncated GET at 4096, proving source and binary had diverged.
 // Verify against the box, not the repo. If the running HPS still caps at 4096,
 // this advert costs ~94% of every upload (the 6ded62d regression).
-localparam [7:0] TB_CAPS = 8'h02;
+// A/B 2026-08-01: 0x00 to measure whether the client's 64 KB GETs are keyed
+// off the caps advert (the 07-31 "regardless" note only ever observed GETs
+// under 0x02). Ship value is 8'h02.
+localparam [7:0] TB_CAPS = 8'h00;
 function [7:0] tb_caps_byte;
 	input [31:0] cnt;
 	begin

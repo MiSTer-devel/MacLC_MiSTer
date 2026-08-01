@@ -1,12 +1,17 @@
 # Toolbox download: the last byte per 64 KB — CLOSED 2026-08-01 (client bug)
 
-**Outcome: the server side is fixed, proven, and shipped. The residual defect
-is a bug in the guest client app and cannot be fixed from our side.**
+**Outcome: the server side is fixed and proven. The residual defect is a bug
+in the guest client app. A working mitigation exists: `TB_CAPS=0x00` (build
+`c9b3afd7`) makes the app fall back to small chunks in both directions and
+the 2 MB round trip is byte-identical — at the cost of upload speed only
+(192 → ~26 KiB/s; downloads stay ~120 KiB/s because they are guest-disk-bound
+and large GETs never actually bought download speed).**
 
 This doc originally claimed a one-line HPS change would finish the mission.
 That change was necessary and landed (below), but the 32-wrong-byte round trip
 persisted — and a both-ends instrumented session proved the remaining loss
-happens INSIDE the guest app. Do not re-chase this server-side.
+happens INSIDE the guest app. Do not re-chase the last byte server-side; the
+only server-side lever is the caps advert (§2a).
 
 ## 1. What was proven, with instruments on both ends
 
@@ -25,23 +30,37 @@ All 65536 bytes cross the SCSI bus; the app writes 65535 of them (16-bit arm;
 the Mac SCSI Manager's phase cleanup reads and discards the extra byte) and
 advances its file position by the full 16-block ask.
 
-## 2. Why no server-side fix exists (all disproven — do not retry)
+## 2. What is and is not fixable server-side
 
-- **Serve fewer, block-aligned bytes (e.g. 15 blocks):** the app advances by
-  its ASK, not by bytes received — proven by the 07-31 capture where 4096-byte
-  responses landed "spaced 16 apart". Under-serving turns 1 lost byte into a
-  4 KB hole per chunk.
-- **Change what the client asks:** `CDB[6]=16` is hardcoded in the app —
-  the same capture shows 16-block GETs "regardless of what we advertise"
-  (caps byte has no effect on GET chunking).
+Disproven (do not retry):
+
+- **Serve fewer, block-aligned bytes (e.g. 15 blocks) for a 16-block ask:**
+  the app advances by its ASK, not by bytes received — proven by the 07-31
+  capture where 4096-byte responses landed "spaced 16 apart". Under-serving
+  turns 1 lost byte into a 4 KB hole per chunk.
 - **Byte shuffling / overlap tricks:** the client writes the first 65535
   received bytes at `k*65536` and nothing else; the last position of each
   window is unreachable by construction.
 
-Scope of the residual defect: downloads of files **> 65535 bytes** via the SD
-Transfer app lose the last byte of each full 64 KB window (the final short
-chunk is kept intact — files ≤ 65535 bytes round-trip byte-exact). Uploads are
-byte-exact at ~192 KiB/s. Everything else is unaffected.
+### 2a. The caps lever WORKS (2026-08-01, user-prompted A/B)
+
+The 07-31 note "the app issues CDB[6]=16 regardless of what we advertise" was
+an **overclaim** — that capture only ever ran under `TB_CAPS=0x02`. A/B build
+`c9b3afd7` (`TB_CAPS=0x00`, sole change) on the same HPS: the app falls back
+to small chunks in BOTH directions and the 2 MB round trip is **byte-identical
+(pristine md5 `c42818…`)**. Measured: upload ~26 KiB/s (512-byte v0 chunks),
+download ~121 KiB/s app-reported — the SAME download rate as 64 K mode, i.e.
+downloads are guest-disk-bound and large GETs never bought speed. The bits
+cannot be split (GETs go large under 0x02-only), so the choice is:
+
+| config | uploads | downloads | correctness |
+|---|---|---|---|
+| `TB_CAPS=0x02` | ~192 KiB/s | ~120 KiB/s | >64 K downloads lose 1 byte/64 K |
+| `TB_CAPS=0x00` | ~26 KiB/s | ~120 KiB/s | **everything byte-exact** |
+
+Scope of the 0x02 defect: downloads of files **> 65535 bytes** lose the last
+byte of each full 64 KB window (final short chunk intact; files ≤ 65535 bytes
+round-trip exact). Uploads byte-exact in both configs.
 
 ## 3. The client bug itself (for an upstream report)
 
