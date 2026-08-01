@@ -199,7 +199,8 @@ static TbHps tbx;
 // scsi.v bumps lba / rd_hps_blk / sd_buff_sel on the io_ack falling edge.
 struct Hps {
 	enum St { IDLE, WAIT, STREAM, WWAIT, WCAP, FINISH,
-	          TBWWAIT, TBWCAP, TBRWAIT, TBRSTREAM, TBFINISH, TBAHOLD } st = IDLE;
+	          TBWWAIT, TBWCAP, TBRWAIT, TBRSTREAM, TBFINISH, TBAHOLD,
+	          TBRDEFER } st = IDLE;
 	int t = 0, wi = 0, tgt = 0;
 	bool was_write = false;
 	uint32_t lba = 0;
@@ -216,6 +217,19 @@ struct Hps {
 	uint64_t tb_reads = 0;
 	int cur_tb_latency = 600;
 
+	// Deferred-LATCH stall injection (2026-08-01, the GET stale-sector race).
+	// tb_slow_every models a stall AFTER Main latched the request (lba and data
+	// captured at issue, the stream just late). The HW corruption needs the
+	// OTHER stall: Main descheduled BEFORE its poll loop even saw tb_rd, so
+	// nothing is latched until it wakes — and what it then latches is the LIVE
+	// tb_lba, which a watchdog-advancing core has already moved past the stalled
+	// sector. Every tb_defer_every'th tb READ sits unlatched for
+	// tb_defer_latency cycles first. Sized ~1.5 watchdog periods, this skips
+	// exactly one sector on watchdog-as-completion RTL: the field signature
+	// (one 512-byte block served one full ring cycle stale).
+	int tb_defer_every = 0, tb_defer_latency = 0;
+	uint64_t tb_defers = 0;
+
 	// Ack-fall model. The core's 2026-07-21 comment records that on HW the tb
 	// READ ack fall is NOT observed, so the ~8 ms watchdog — not the ack — is
 	// what advances the round trip. This bench completes on the ack fall by
@@ -228,7 +242,7 @@ struct Hps {
 
 	void reset() {
 		st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear();
-		tb_reads = 0; cur_tb_latency = latency;
+		tb_reads = 0; cur_tb_latency = latency; tb_defers = 0;
 	}
 
 	void service() {
@@ -257,9 +271,15 @@ struct Hps {
 			// the target is mid-command in PHASE_TB while the tb transfer runs.
 			if (st == IDLE && top->tb_wr) { lba = top->tb_lba; st = TBWWAIT; t = 0; }
 			else if (st == IDLE && top->tb_rd) {
+				tb_reads++;
+				if (tb_defer_every && (tb_reads % tb_defer_every) == 0) {
+					// Main descheduled BEFORE polling: latch nothing yet.
+					tb_defers++;
+					st = TBRDEFER; t = 0;
+					break;
+				}
 				lba = top->tb_lba;
 				tbx.fill(lba, tbblk);
-				tb_reads++;
 				cur_tb_latency = (tb_slow_every && (tb_reads % tb_slow_every) == 0)
 				                 ? tb_slow_latency : latency;
 				st = TBRWAIT; t = 0;
@@ -344,6 +364,18 @@ struct Hps {
 		// what completes the round trip and the eventual fall arrives stale.
 		case TBAHOLD:
 			if (++t >= tb_ack_hold) { top->tb_ack = 0; st = IDLE; }
+			break;
+		// Main was descheduled before it ever polled: wake up, THEN read the
+		// LIVE request state. A core that advanced its lba while we slept gets
+		// the advanced sector served — and the one it stalled on, never.
+		case TBRDEFER:
+			if (++t >= tb_defer_latency) {
+				if (!top->tb_rd) { st = IDLE; break; }   // request withdrawn
+				lba = top->tb_lba;                       // LIVE lba, the whole point
+				tbx.fill(lba, tbblk);
+				cur_tb_latency = latency;
+				st = TBRWAIT; t = 0;
+			}
 			break;
 		}
 	}
@@ -1458,7 +1490,13 @@ static int run_toolbox() {
 //   7ec4e2b (bad)  : dies on the FIRST command (COUNT) — the HW symptom, where
 //                    every Toolbox command returned CHECK and nothing listed
 //   d4c70e6 (fix)  : byte-for-byte identical to 52715a7 => no divergence
-// A candidate that fails EARLIER or DIFFERENTLY than 52715a7 has changed the
+//   2026-08-01 fetch-retry fix: fails strictly LATER — COUNT, LIST and the
+//                    64 KB GET now pass even under the held ack (the !tb_ack
+//                    issue guards wait it out instead of mis-consuming it);
+//                    remaining failures are confined to the SEND/ship path
+//                    (uploads capture 0 bytes, SHORT chunk wedges), which the
+//                    fix deliberately did not touch.
+// A candidate that fails EARLIER than the current reference has changed the
 // handshake and must not be deployed.
 static int run_toolbox_wdog() {
 	const int saved_patience = csr_patience;
@@ -1546,15 +1584,15 @@ static int run_toolbox_slow() {
 		}
 	}
 
-	// ---- KNOWN GAP probe, reported but NOT counted as a failure --------------
-	// A GET whose data blocks are stalled. TBS_DATA advances on the bare
-	// watchdog and a data block carries no signature, so a stalled sector serves
-	// the previous one's bytes. Verified pre-existing: the same probe fails
-	// identically on 52715a7 (the RTL deployed before any of this work), so it is
-	// a gap, not a regression. Fixing it needs positive fill evidence in the
-	// core; a 2026-07-31 attempt at that broke every Toolbox command on HW and
-	// was reverted. Do not retry it without an HW-faithful model of the
-	// watchdog-primary path this transport actually runs on.
+	// ---- stalled-fill GET (GATING since 2026-08-01) --------------------------
+	// A GET whose data blocks are stalled past the watchdog. This used to be the
+	// KNOWN GAP: TBS_DATA counted a timed-out fetch as resident and served the
+	// slot's previous occupant. The fetch watchdog is a bounded RETRY now (same
+	// TB_RETRY_MAX family as the status re-looks), so a stalled fill must
+	// round-trip byte-exact. This variant stalls AFTER the HPS latched the
+	// request (lba+data staged at issue, stream late); the deferred-latch
+	// variant — Main descheduled before it even polled, the HW corruption mode —
+	// is covered by --mode toolboxget.
 	int gap_bad = 0;
 	{
 		uint8_t buf[4096];
@@ -1564,19 +1602,156 @@ static int run_toolbox_slow() {
 		uint8_t cdb[10] = { 0xD1, 1, 0, 0, 0, 0, 1, 0, 0, 0 };
 		st = tb_cmd(cdb, nullptr, 0, buf, 4096, "SLOW GET");
 		if (st != 0x00 || tbx.resp.size() != 4096) gap_bad = -1;
-		else for (int i = 0; i < 4096; i++) if (buf[i] != tbx.resp[i]) gap_bad++;
+		else {
+			int first = -1;
+			for (int i = 0; i < 4096; i++)
+				if (buf[i] != tbx.resp[i]) { if (first < 0) first = i; gap_bad++; }
+			if (first >= 0)
+				printf("toolboxslow: SLOW GET first bad at %d (sector %d): got %02x want %02x\n",
+				       first, first / 512, buf[first], tbx.resp[first]);
+		}
 	}
 
-	if (gap_bad)
-		printf("toolboxslow: KNOWN GAP (pre-existing, not a regression) - GET under a "
-		       "stalled HPS corrupts %d/4096 bytes; TBS_DATA has no fill evidence to "
-		       "wait on. Not counted as a failure.\n", gap_bad);
+	if (gap_bad) {
+		printf("toolboxslow: GET under a stalled HPS corrupts %d/4096 bytes "
+		       "(stale-sector serve — the fetch watchdog completed instead of retrying)\n",
+		       gap_bad);
+		fails++;
+	}
 
 	hps.tb_slow_every = 0;
 	csr_patience = saved_patience;
 	printf("toolboxslow: %s (tb reads=%llu, %d stalled past the watchdog)\n",
 	       fails ? "FAIL" : "PASS", (unsigned long long)hps.tb_reads,
 	       (int)(hps.tb_reads / 3));
+	return fails ? 1 : 0;
+}
+
+// ---------------- multi-block GET streaming + stalled-HPS race (toolboxget) ----
+// Desk reproduction of the 2026-08-01 hardware corruption: TB_CAPS bit 0 let
+// MacAtrium issue 32 KB multi-block GETs; a 2 MB download corrupted exactly ONE
+// 512-byte sector, byte-identical to the sector 8192 bytes earlier — one full
+// ring cycle back (TB_ADDRW=12 => 16 slots). Mechanism: TBS_DATA / TBS_STREAM
+// treated the read watchdog (&tb_to) as a COMPLETION. A fill the HPS had not
+// even latched yet was counted resident (tb_sec_done++), the fetch advanced to
+// the next LBA, the late HPS then latched the ADVANCED lba — so the stalled
+// sector was never fetched at all and its ring slot served its previous
+// occupant.
+//
+// Part A — sustained cadence: back-to-back multi-block GETs against a prompt
+//   HPS. The ring wraps 4x per 32 KB chunk and slot state carries from chunk
+//   to chunk, which one big GET (run_toolbox's BIG GET) never exercises.
+// Part B — deferred-latch stalls: every 23rd tb READ sits unlatched for ~1.5
+//   watchdog periods (Hps::TBRDEFER — Main descheduled BEFORE its poll saw
+//   tb_rd). On watchdog-as-completion RTL each defer skips a sector and the
+//   byte-exact assertion fails with the served block one ring cycle stale, the
+//   exact HW signature. On fixed RTL the fetch retries the SAME lba and every
+//   byte round-trips.
+//
+// GATING on both parts: this is the bench case the RTL comment demanded before
+// any fix to the known TBS_DATA gap.
+static void tb_get_diag(const uint8_t* got, const std::vector<uint8_t>& ref,
+                        size_t base, int first_bad) {
+	// Field-style block map: whose bytes actually got served?
+	size_t boff = (size_t)(first_bad / 512) * 512;
+	const uint8_t* blk = got + boff;
+	printf("   first bad sector: chunk byte %zu (file byte %zu, ring slot %zu)\n",
+	       boff, base + boff, ((base + boff) / 512) % 16);
+	bool found = false;
+	for (size_t r = 0; r + 512 <= ref.size(); r += 512)
+		if (!memcmp(blk, &ref[r], 512)) {
+			long long delta = ((long long)r - (long long)(base + boff)) / 512;
+			printf("   served bytes match file sector at byte %zu: delta %+lld sectors%s\n",
+			       r, delta, delta == -16 ? "  <-- one full ring cycle stale (the HW signature)" : "");
+			found = true;
+		}
+	if (!found) printf("   served bytes match no 512-byte sector of the file\n");
+}
+
+static int run_toolbox_get() {
+	reset_dut(0);
+	tbx.reset();
+	top->tb_mounted = 1;
+	for (int i = 0; i < 8; i++) tick();
+
+	// One 256 KB file, position-unique content (ramp folds high offset bytes,
+	// so a serve displaced by ANY 512-multiple is detectable).
+	const size_t FSZ = 262144;
+	tbx.files.clear();
+	tbx.files.push_back({ "rt.bin", {} });
+	auto& fdat = tbx.files.back().data;
+	fdat.resize(FSZ);
+	for (size_t i = 0; i < FSZ; i++) fdat[i] = ramp(0x3B0000 + i);
+
+	const int saved_patience = csr_patience;
+	csr_patience = 1000000;            // a deferred fill legitimately holds REQ ~12.5 ms
+
+	int fails = 0;
+	std::vector<uint8_t> buf(65536);
+
+	// One chunked GET: offset/blocks in 4096-byte units (MacAtrium ae7a051 /
+	// official-client CDB form), byte-exact assertion against the file.
+	auto get_chunk = [&](int blocks4k, uint32_t off4k, const char* tag) -> bool {
+		size_t base = (size_t)off4k * 4096;
+		int want = blocks4k * 4096;
+		if (base + want > FSZ) want = (int)(FSZ - base);
+		uint8_t cdb[10] = { 0xD1, 0,
+		                    (uint8_t)(off4k >> 24), (uint8_t)(off4k >> 16),
+		                    (uint8_t)(off4k >> 8),  (uint8_t)off4k,
+		                    (uint8_t)blocks4k, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf.data(), want, tag);
+		if (st != 0x00) { printf("toolboxget: %s status %02x (want 00)\n", tag, st); return false; }
+		int bad = 0, first = -1;
+		for (int i = 0; i < want; i++)
+			if (buf[i] != fdat[base + i]) { if (first < 0) first = i; bad++; }
+		if (bad) {
+			printf("toolboxget: %s %d/%d bytes wrong, first at chunk byte %d "
+			       "(got %02x want %02x)\n", tag, bad, want, first, buf[first], fdat[base + first]);
+			tb_get_diag(buf.data(), fdat, base, first);
+			return false;
+		}
+		return true;
+	};
+
+	// ---- Part A: sustained streaming, prompt HPS ----
+	{
+		char tag[32];
+		for (uint32_t k = 0; k < 6; k++) {          // 6 x 32 KB, back to back
+			snprintf(tag, sizeof(tag), "A32K#%u", k);
+			if (!get_chunk(8, k * 8, tag)) fails++;
+		}
+		if (!get_chunk(16, 48, "A64K")) fails++;     // final 64 KB (128 fills)
+		if (!fails) printf("toolboxget: part A sustained streaming OK (6x32K + 1x64K)\n");
+	}
+
+	// ---- Part B: deferred-latch stalls (the race) ----
+	{
+		hps.tb_reads = 0; hps.tb_defers = 0;
+		hps.tb_defer_every   = 23;                   // hits sectors <16 and >=16
+		hps.tb_defer_latency = 400000;               // ~1.53 watchdog periods
+		int bfails = 0;
+		char tag[32];
+		for (uint32_t k = 0; k < 4; k++) {          // 4 x 32 KB, stalls sprinkled in
+			snprintf(tag, sizeof(tag), "B32K#%u", k);
+			if (!get_chunk(8, k * 8, tag)) bfails++;
+		}
+		hps.tb_defer_every = 0;
+		printf("toolboxget: part B %s (%llu fills deferred past the watchdog)\n",
+		       bfails ? "FAIL — stalled fills served stale sectors"
+		              : "OK — stalled fills retried, byte-exact",
+		       (unsigned long long)hps.tb_defers);
+		if (hps.tb_defers < 5) {
+			printf("toolboxget: part B exercised only %llu defers (want >=5) — "
+			       "stall cadence broken, not a valid pass\n",
+			       (unsigned long long)hps.tb_defers);
+			bfails++;
+		}
+		fails += bfails;
+	}
+
+	csr_patience = saved_patience;
+	printf("toolboxget: %s (tb reqs=%llu fills=%llu)\n", fails ? "FAIL" : "PASS",
+	       (unsigned long long)tbx.reqs, (unsigned long long)tbx.fills);
 	return fails ? 1 : 0;
 }
 
@@ -1647,6 +1822,14 @@ int main(int argc, char** argv) {
 
 	if (one_mode && !strcmp(one_mode, "toolboxslow")) {
 		int rc = run_toolbox_slow();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolboxget")) {
+		int rc = run_toolbox_get();
 #if VM_TRACE
 		if (tfp) tfp->close();
 #endif

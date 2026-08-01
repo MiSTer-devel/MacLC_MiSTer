@@ -469,7 +469,7 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	// only sets on an ACK edge, which never comes when the initiator expects
 	// no data — REQ would be held forever (same deadlock class as the
 	// allocation-length over-serve).
-	wire data_done = data_complete || (data_len == 32'd0) || tb_out_stalled;
+	wire data_done = data_complete || (data_len == 32'd0) || tb_out_stalled || tb_get_abort;
 	wire data_phase_complete = ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN)) && data_done;
 	// Toolbox DataIn serve-settle (driven near the tb FSM, declared here because
 	// REQ consumes it). Zero outside a Toolbox/CD-changer DataIn serve.
@@ -482,6 +482,10 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	wire tb_stream_stall;
 	// 0xD4 SEND DATA inter-byte watchdog; zero outside that DataOut phase.
 	wire tb_out_stalled;
+	// GET fetch-retry budget exhausted mid-serve (tb_get_fault, TBS_STREAM):
+	// force the data phase closed and CHECK instead of serving a stale sector.
+	// Zero outside a Toolbox/CD-changer DataIn serve.
+	wire tb_get_abort;
 	// REQ assertion. Previously this was gated on !sel ("wait for the initiator
 	// to drop SEL before the first REQ"). But the reference implementations
 	// (Snow's NCR5380, MAME) assert REQ as soon as the target is selected and
@@ -1211,12 +1215,16 @@ reg [7:0]  tb_ship_lba;
 // when writing the CDB, so the HPS contract stays 'offset in 512-blocks' and
 // needs no change. v0 512-byte sends reproduce the client's own numbering.
 reg [23:0] tb_send_pos = 24'd0;
-reg  [6:0] tb_retry;        // status-block re-looks (re-issued reads) this round trip
+reg  [6:0] tb_retry;        // status-block re-looks / data-fetch re-arms (per sector)
 // A slow HPS answer must not read as "no handler". The SD is mounted
 // sync,dirsync, so one SEND chunk is a synchronous card write; when the card
 // hits an erase cycle it stalls far past one watchdog period. Re-look up to
 // TB_RETRY_MAX times (~0.8 s total) before giving up. (2026-07-31)
 localparam [6:0] TB_RETRY_MAX = 7'd96;
+// GET data-fetch retry budget exhausted while the serve was mid-phase: force
+// the data phase closed (data_done) and turn the status byte into CHECK — see
+// TBS_STREAM. One-shot per round trip, cleared in TBS_IDLE.
+reg        tb_get_fault = 1'b0;
 
 // Shared-folder availability: latches when the HPS mounts the Toolbox slot.
 // Until then (incl. a stock Main with no handler) fs ops return CHECK (§4a).
@@ -1346,7 +1354,7 @@ always @(posedge clk) begin
 	if (rst) begin
 		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
 		tb_status <= 8'h02; tb_len <= 17'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
-		tb_fetch_sec <= 8'd0; tb_retry <= 7'd0;
+		tb_fetch_sec <= 8'd0; tb_retry <= 7'd0; tb_get_fault <= 1'b0;
 		tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b0; tb_col_slot <= 5'd0; tb_col_lba <= 8'd0;
 		tb_ship_done <= 8'd0; tb_ship_req <= 1'b0; tb_ship_slot <= 5'd0; tb_ship_lba <= 8'd0;
 	end else if (TOOLBOX_ENABLE || CDCHANGER_ENABLE) begin
@@ -1368,6 +1376,7 @@ always @(posedge clk) begin
 			tb_load_w <= 4'd0;
 			tb_fetch_sec <= 8'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
 			tb_retry <= 7'd0;                    // per-round-trip
+			tb_get_fault <= 1'b0;                // consumed by the phase FSM by now
 			// NOTE: tb_sec_done is deliberately NOT cleared here. TBS_RDY drops
 			// through to IDLE the moment the main FSM leaves PHASE_TB -- i.e.
 			// while the Mac is still being served -- so clearing it here stalls
@@ -1530,30 +1539,52 @@ always @(posedge clk) begin
 		// full 17-bit value is known once byte 4 has settled on the primary port.
 		TBS_LATCH2:
 			if (tb_settle != 4'd0) tb_settle <= tb_settle - 1'b1;
-			else begin
+			// !tb_ack: never arm a data fetch into a LIVE ack. A stalled status
+			// read force-latched mid-stream leaves tb_ack high here; the old code
+			// issued anyway, TBS_DATA's ack-clear killed the never-seen request,
+			// and the status stream's own fall then counted as sector 0's
+			// completion — first sector served stale with no fetch ever leaving
+			// the core (toolboxslow SLOW GET, 510/4096). Waiting cannot deadlock:
+			// a stuck-high ack already parks TBS_REQ unbounded today.
+			else if (!tb_ack) begin
 				tb_len[16] <= tb0_dout[0];
 				if ({tb0_dout[0], tb_len[15:0]} != 17'd0) begin
 					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 8'd0; tb_to <= 18'd0;
 					// Arm the streaming accounting HERE -- a fetch is starting, and this
 					// is the only point where "no sector is resident yet" is true.
-					tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b1;
+					// tb_retry restarts too: whatever the status re-looks consumed
+					// must not shrink the data path's per-sector budget.
+					tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b1; tb_retry <= 7'd0;
 					tb_state <= TBS_DATA;
 				end else tb_state <= TBS_RDY;                // status-only
 			end
 		// data: HPS returns tb_len bytes across ceil(tb_len/512) sectors, one per
 		// LBA (1..N). Each lands at buffer offset tb_fetch_sec*256; fetch the next
-		// until all N are in, then serve linearly. Same read-ack watchdog as TBS_STAT.
-		// KNOWN GAP (2026-07-31): a data block carries no signature, so a stalled
-		// HPS here cannot be detected and this serves the previous sector's
-		// bytes — a silently corrupt GET. Only SEND (which has no data phase)
-		// and the status block are protected by the TBS_LATCH retry above. Fixing
-		// it needs positive fill evidence, which is exactly what the reverted
-		// attempt got wrong; do not retry that without HW-faithful bench coverage
-		// of the watchdog-primary path first.
+		// until all N are in, then serve linearly.
+		//
+		// The watchdog here is a RETRY, not a completion (2026-08-01). It used to
+		// count a timed-out fetch as resident, which is the stale-sector race
+		// measured on HW: an HPS descheduled past one watchdog period had not
+		// even LATCHED the request, the fetch advanced to the next LBA anyway
+		// (the request line stays up, so the late HPS served the ADVANCED lba),
+		// and the skipped sector's ring slot served its previous occupant — one
+		// full ring cycle stale, silently. Now a timeout re-arms the SAME fetch
+		// (tb_lba_r/tb_fetch_sec pinned, tb_sec_done NOT advanced; the serve
+		// keeps stalling on tb_get_stall), bounded by TB_RETRY_MAX like the
+		// status-block re-looks. The ack-fall completion path is untouched — on
+		// HW it is the primary path (upload ships complete at ~4 ms cadence
+		// through the identical edge), the watchdog only covers late fills.
+		// This is NOT the reverted "positive fill evidence" scheme: nothing here
+		// gates on observing the fill; a resident-but-unacked sector is simply
+		// re-served by the HPS on the re-look and completes on that ack.
+		// Bench: scsi_bench --mode toolboxget (deferred-latch stall model) fails
+		// on the old watchdog-as-completion RTL with the exact HW signature
+		// (delta -16 sectors) and is byte-exact with the retry.
 		TBS_DATA: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
 			tb_to <= tb_to + 1'b1;
-			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
+			if (old_tb_ack & ~tb_ack) begin
+				tb_retry    <= 7'd0;                       // per-sector budget
 				tb_sec_done <= tb_sec_done + 9'd1;         // this sector is resident
 				if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) begin
 					tb_fetch_busy <= 1'b0;
@@ -1570,6 +1601,22 @@ always @(posedge clk) begin
 					tb_fetch_busy <= 1'b1;
 					tb_state      <= TBS_STREAM;
 				end
+			end else if (&tb_to) begin
+				if (tb_retry != TB_RETRY_MAX) begin
+					tb_retry <= tb_retry + 1'b1;
+					tb_to    <= 18'd0;
+					// Re-arm the request line unless a fill is in flight (ack
+					// high): re-raising then would put a one-cycle blip on the
+					// wire the HPS could take as a second request.
+					if (!tb_ack) tb_rd_r <= 1'b1;
+				end else begin
+					// ~0.8-1.6 s of re-looks and still nothing: the HPS is gone.
+					// The serve has not started (main FSM still in PHASE_TB), so
+					// fail loud as status-only CHECK, like the TBS_LATCH give-up.
+					tb_status <= 8'h02; tb_len <= 17'd0;
+					tb_rd_r <= 1'b0; tb_fetch_busy <= 1'b0;
+					tb_state <= TBS_RDY;
+				end
 			end
 		end
 		// GET streaming: same fetch loop as TBS_DATA, but the main FSM has already
@@ -1580,19 +1627,43 @@ always @(posedge clk) begin
 		// tb_fetch_busy (not tb_rd_r) is what says a read is outstanding: tb_rd_r
 		// is cleared the moment tb_ack rises, so testing it here would miss the
 		// completion entirely and the sector count would never advance.
+		// Same watchdog-is-a-retry rule as TBS_DATA (see the block comment
+		// there); this state is where the HW stale-sector serve actually fired.
 		TBS_STREAM: begin
 			if (tb_ack) tb_rd_r <= 1'b0;
 			tb_to <= tb_to + 1'b1;
 			if (tb_fetch_busy) begin
-				if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
+				if (old_tb_ack & ~tb_ack) begin
+					tb_retry      <= 7'd0;                 // per-sector budget
 					tb_fetch_busy <= 1'b0;
 					tb_sec_done   <= tb_sec_done + 9'd1;
 					if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) tb_state <= TBS_RDY;
+				end else if (&tb_to) begin
+					if (tb_retry != TB_RETRY_MAX) begin
+						tb_retry <= tb_retry + 1'b1;
+						tb_to    <= 18'd0;
+						if (!tb_ack) tb_rd_r <= 1'b1;      // re-arm (see TBS_DATA)
+					end else begin
+						// The serve is mid-phase, so a status-only bail is not
+						// enough: flag the fault, which force-completes the data
+						// phase (data_done) and turns the already-latched GOOD
+						// status into CHECK — a loud short transfer instead of a
+						// silent stale one. tb_len stays untouched: the serve
+						// wires (tb_nsec / tb_get_stall) still derive from it
+						// during the abort cycle.
+						tb_get_fault  <= 1'b1;
+						tb_rd_r       <= 1'b0;
+						tb_fetch_busy <= 1'b0;
+						tb_state      <= TBS_RDY;
+					end
 				end
 			end else if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) tb_state <= TBS_RDY;
 			// Throttle: never fetch into a ring slot whose bytes the Mac has not
 			// taken yet. TB_MAXSEC slots separate the fetch from the serve.
-			else if (({1'd0, tb_fetch_sec} + 9'd1) < (tb_srv_sec + {4'd0, TB_MAXSEC})) begin
+			// !tb_ack for the same reason as the TBS_LATCH2 arm: an issue into a
+			// live ack is killed unseen and the stale fall completes a phantom.
+			else if (!tb_ack &&
+			         (({1'd0, tb_fetch_sec} + 9'd1) < (tb_srv_sec + {4'd0, TB_MAXSEC}))) begin
 				tb_fetch_sec  <= tb_fetch_sec + 8'd1;
 				tb_lba_r      <= tb_lba_r + 32'd1;
 				tb_rd_r       <= 1'b1;
@@ -2215,6 +2286,9 @@ assign tb_out_stalled = tb_out_active && tb_out_stall_r;
 // a few cycles after each advance. Scoped to the tb serve: tb_srv_hold is 0
 // everywhere else regardless of the counter.
 wire      tb_srv_active = (phase == PHASE_DATA_OUT) && (cmd_tb_fs_in || cmd_cdc_in);
+// Mid-serve fetch abort (see tb_get_fault / TBS_STREAM). Scoped to the tb
+// serve so the flag can never touch a disk/CD data phase.
+assign tb_get_abort = tb_srv_active && tb_get_fault;
 reg [3:0] tb_srv_settle = 4'd0;
 always @(posedge clk) begin
 	if (!tb_srv_active)                tb_srv_settle <= 4'd12;  // armed for the first byte
@@ -2583,7 +2657,13 @@ always @(posedge clk) begin
 		end
 
 		else if(phase == PHASE_DATA_OUT) begin
-			if(data_done) phase <= PHASE_STATUS_OUT;
+			if(data_done) begin
+				phase <= PHASE_STATUS_OUT;
+				// GET fetch abort mid-serve: the GOOD status latched at the
+				// PHASE_TB handoff must not survive a short transfer — the
+				// initiator gets CHECK, not silence (tb_get_fault, TBS_STREAM).
+				if(tb_get_abort) status <= `STATUS_CHECK_CONDITION;
+			end
 		end
 
 		else if(phase == PHASE_DATA_IN) begin
