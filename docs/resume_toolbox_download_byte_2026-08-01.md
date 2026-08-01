@@ -42,6 +42,26 @@ Disproven (do not retry):
   received bytes at `k*65536` and nothing else; the last position of each
   window is unreachable by construction.
 
+### 2b. Second-client control: MacAtrium is byte-exact on the FAST core
+
+The decisive independent test (2026-08-01). MacAtrium's own Toolbox client,
+driven through **Toolbox Shared Files**, copied `TBT.BIN` SD → Mac
+(MacAtrium/Incoming) and back Mac → SD on the **same fast core `914e07cc`
+and same HPS `dda65f18`** that gives the SD Transfer app its 32 wrong bytes.
+Result: **`c42818…` — byte-identical to the pristine fixture.** The SD file
+was genuinely rewritten (watched growing 131072 → 2097152, mtime updated),
+so this is a real round trip, not an untouched file.
+
+Two clients, one unchanged server, opposite outcomes — the server is
+exonerated by construction, and the defect is the SD Transfer app's.
+
+MacAtrium is immune by design (`src/filebrowse.c`): `fb_copy_in` hardcodes
+`CDB[6]=1` (4 KB per GET) and `fb_send_stream` caps chunks at 4 KB, so it
+never presents a 65536-byte transfer; it reads the caps byte only for
+`TB_CAP_WORKDIR`, never for transfer sizing. **MacAtrium is therefore
+unaffected by whichever `TB_CAPS` we ship.** Measured on the fast core:
+copy-in 2 MB in under 60 s, copy-out ~39 KiB/s.
+
 ### 2a. The caps lever WORKS (2026-08-01, user-prompted A/B)
 
 The 07-31 note "the app issues CDB[6]=16 regardless of what we advertise" was
@@ -53,10 +73,14 @@ download ~121 KiB/s app-reported — the SAME download rate as 64 K mode, i.e.
 downloads are guest-disk-bound and large GETs never bought speed. The bits
 cannot be split (GETs go large under 0x02-only), so the choice is:
 
-| config | uploads | downloads | correctness |
-|---|---|---|---|
-| `TB_CAPS=0x02` | ~192 KiB/s | ~120 KiB/s | >64 K downloads lose 1 byte/64 K |
-| `TB_CAPS=0x00` | ~26 KiB/s | ~120 KiB/s | **everything byte-exact** |
+| config | SD Transfer uploads | SD Transfer downloads | SD Transfer correctness | MacAtrium |
+|---|---|---|---|---|
+| `TB_CAPS=0x02` | ~192 KiB/s | ~120 KiB/s | >64 K downloads lose 1 byte/64 K | byte-exact, ~39 KiB/s out |
+| `TB_CAPS=0x00` | ~26 KiB/s | ~120 KiB/s | **everything byte-exact** | identical (ignores caps) |
+
+Since MacAtrium is unaffected either way (§2b), the choice is purely about
+the third-party app: `0x00` = correct-but-slow for it, `0x02` = fast uploads
+for it at the cost of its own >64 K download corruption.
 
 Scope of the 0x02 defect: downloads of files **> 65535 bytes** lose the last
 byte of each full 64 KB window (final short chunk intact; files ≤ 65535 bytes
