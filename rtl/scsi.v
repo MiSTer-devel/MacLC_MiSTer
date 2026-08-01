@@ -2355,26 +2355,26 @@ assign tb_stream_stall = tb_get_stall || tb_col_stall;
 // and still truncated GET at 4096, proving source and binary had diverged.
 // Verify against the box, not the repo. If the running HPS still caps at 4096,
 // this advert costs ~94% of every upload (the 6ded62d regression).
-// 0x02 = CAP_LARGE_SEND only. Clients gate each DIRECTION on a different bit:
-// MacAtrium (ae7a051) runs 32 KB sends on 0x02 and 32 KB reads on 0x01, so this
-// value buys fast uploads (~120 KB/s vs 39) while its downloads stay on 4 KB
-// GETs (~33 KB/s).
+// Clients gate each DIRECTION on a different bit: bit 1 (CAP_LARGE_SEND)
+// sizes uploads (~120 KB/s vs 39 measured), bit 0 (CAP_LARGE_TRANSFERS)
+// sizes downloads. 0x02 was the shipped value while bit 0 hid the GET race
+// below.
 //
-// ★ DO NOT SET BIT 0 (CAP_LARGE_TRANSFERS) -- the multi-block GET serve path
-// has a STALE-SECTOR RACE, measured on hardware 2026-08-01 (build 020cd964,
-// TB_CAPS=8'h03, MacAtrium 32 KB reads). A 2 MB download corrupted exactly ONE
-// 512-byte sector (file offset 0x1AD800); the served bytes were byte-identical
-// to the sector 8192 bytes earlier -- i.e. exactly one full ring cycle back
-// (TB_ADDRW=12 => 8 KB buffer => 16 sectors). The serve consumed a ring slot
-// the HPS had not yet refilled and shipped its previous occupant. Same class as
-// the CD-read look-ahead defect fixed in 082dcc4 (rd_ahead_blk boundary served
-// a stale prev occupant), so start there when fixing it.
-//
-// Single 64 KB GETs did NOT expose this (bus-proven byte-exact 2026-08-01, and
-// the bench 65536-byte get passes) -- the race needs the sustained multi-chunk
-// read cadence a real client produces. Any fix therefore needs a BENCH case
-// that streams many back-to-back multi-block GETs, not one big one.
-localparam [7:0] TB_CAPS = 8'h02;
+// Bit 0 (CAP_LARGE_TRANSFERS) enabled 2026-08-01 after the multi-block GET
+// stale-sector race was fixed. The race (measured on HW build 020cd964: a 2 MB
+// download corrupted exactly ONE 512-byte sector at 0x1AD800, byte-identical
+// to the sector one full ring cycle (-16 sectors / 8192 B) earlier): the
+// TBS_DATA/TBS_STREAM fetch watchdog counted a timed-out fetch as RESIDENT and
+// advanced the LBA past it, so a descheduled HPS never served the stalled
+// sector and its ring slot kept the previous occupant. The watchdog is a
+// bounded RETRY now (see TBS_DATA), fetch issues are gated on !tb_ack, and the
+// serve fails loud (CHECK) if the retry budget ever exhausts. Bench:
+// scsi_bench --mode toolboxget reproduced the exact -16 signature on the old
+// RTL and is byte-exact on this one; single 64 KB GETs never exposed the race
+// (it needs the sustained multi-chunk cadence plus a stall), so that mode is
+// the required gate for any future change here.
+// MacAtrium (ae7a051) reads 32 KB chunks on bit 0: ~91 KB/s measured vs 33.
+localparam [7:0] TB_CAPS = 8'h03;
 function [7:0] tb_caps_byte;
 	input [31:0] cnt;
 	begin
