@@ -2360,21 +2360,32 @@ assign tb_stream_stall = tb_get_stall || tb_col_stall;
 // sizes downloads. 0x02 was the shipped value while bit 0 hid the GET race
 // below.
 //
-// Bit 0 (CAP_LARGE_TRANSFERS) enabled 2026-08-01 after the multi-block GET
-// stale-sector race was fixed. The race (measured on HW build 020cd964: a 2 MB
-// download corrupted exactly ONE 512-byte sector at 0x1AD800, byte-identical
-// to the sector one full ring cycle (-16 sectors / 8192 B) earlier): the
-// TBS_DATA/TBS_STREAM fetch watchdog counted a timed-out fetch as RESIDENT and
-// advanced the LBA past it, so a descheduled HPS never served the stalled
-// sector and its ring slot kept the previous occupant. The watchdog is a
-// bounded RETRY now (see TBS_DATA), fetch issues are gated on !tb_ack, and the
-// serve fails loud (CHECK) if the retry budget ever exhausts. Bench:
-// scsi_bench --mode toolboxget reproduced the exact -16 signature on the old
-// RTL and is byte-exact on this one; single 64 KB GETs never exposed the race
-// (it needs the sustained multi-chunk cadence plus a stall), so that mode is
-// the required gate for any future change here.
-// MacAtrium (ae7a051) reads 32 KB chunks on bit 0: ~91 KB/s measured vs 33.
-localparam [7:0] TB_CAPS = 8'h03;
+// ★ BIT 0 (CAP_LARGE_TRANSFERS) STAYS OFF — it CRASHES the official client.
+// The core-side stale-sector race that first blocked it IS fixed (see TBS_DATA:
+// bounded retry, !tb_ack issue gates, loud CHECK on exhaustion; bench gate
+// `scsi_bench --mode toolboxget`), and with bit 0 set MacAtrium downloads run
+// 33 -> 91 KB/s byte-exact, 4x 2 MB round trips incl. one under an SD write
+// storm. But advertising it makes the official BlueSCSI SD Transfer app
+// (1.1.0b5) bomb the guest with "bad F-Line instruction" — a 68020
+// unimplemented-instruction trap, i.e. the app jumping into garbage — at 0%,
+// before any data moves and often before its own overwrite prompt, so the
+// crash is in ITS capability-dependent setup path, not in our serve.
+//
+// HW A/B, 2026-08-01 PM, same app / file / procedure, each on a fresh boot:
+//   0x03, race fix  (5a181d40): 3 of 4 runs bombed; the one survivor ran
+//                               SLOWER (99 KB/s) and hung the machine after.
+//   0x02, no fix    (914e07cc): 2 of 2 clean, 122-123 KB/s.
+//   0x02, race fix  (3aaf1ed1): 2 of 2 clean, 121-123 KB/s.  <-- discriminator
+// The last row is what pins the blame: same RTL fix, only the caps byte
+// differs, and the app is clean. So bit 0 alone is the trigger and the fetch
+// retry is exonerated (MacAtrium also ran the fixed multi-block GET path
+// flawlessly). Do NOT re-enable bit 0 to chase MacAtrium download speed
+// without a client that survives it -- it trades a working third-party app
+// for one app's throughput.
+//
+// (The app's own pre-existing defect is unrelated and still present at 0x02:
+// downloads >64 KB lose one byte per 64 KiB chunk. See the note below.)
+localparam [7:0] TB_CAPS = 8'h02;
 function [7:0] tb_caps_byte;
 	input [31:0] cnt;
 	begin
