@@ -1201,6 +1201,16 @@ reg [7:0]  tb_ship_done;    // logical sectors handed to the HPS so far
 reg        tb_ship_req;     // a completed sector is waiting to be shipped
 reg [4:0]  tb_ship_slot;
 reg [7:0]  tb_ship_lba;
+// SEND write position, in 512-byte blocks, accumulated across the session.
+// HW 2026-08-01: with block-encoded chunks the official client advances
+// CDB[3..5] by ONE PER CHUNK -- a chunk index, not the 512-block offset the
+// HPS seeks with. Every 65024-byte chunk therefore landed 512 bytes past the
+// previous one and a 2 MB upload collapsed to 80,896 bytes (= 31*512 + 65024,
+// measured exactly; confirmed by content -- the slot at k*512 held chunk k's
+// first 512 bytes, for all 32 chunks). We substitute our own running position
+// when writing the CDB, so the HPS contract stays 'offset in 512-blocks' and
+// needs no change. v0 512-byte sends reproduce the client's own numbering.
+reg [23:0] tb_send_pos = 24'd0;
 reg  [6:0] tb_retry;        // status-block re-looks (re-issued reads) this round trip
 // A slow HPS answer must not read as "no handler". The SD is mounted
 // sync,dirsync, so one SEND chunk is a synchronous card write; when the card
@@ -1270,8 +1280,13 @@ wire [12:0] tb_hps_addr13 = {tb_fetch_sec[4:0], sd_buff_addr[7:0]};
 wire [TB_ADDRW-1:0] tb_hps_addr = tb_hps_addr13[TB_ADDRW-1:0];
 wire       tb_b_wr0   = (tb_state == TBS_LOAD) || tb_col_wr0;
 wire       tb_b_wr1   = (tb_state == TBS_LOAD) || tb_col_wr1;
-wire [7:0] tb_load_b0 = cmd[{tb_load_w[2:0], 1'b0}];   // even CDB byte
-wire [7:0] tb_load_b1 = cmd[{tb_load_w[2:0], 1'b1}];   // odd  CDB byte
+// Block-encoded 0xD4 only: byte3 = word1 lane1, byte4/5 = word2 lane0/1.
+wire       tb_send_fixoff = cmd_tb_send_data && (cmd[6] > 8'd1);
+wire [7:0] tb_load_b0 = (tb_send_fixoff && (tb_load_w == 4'd2)) ? tb_send_pos[15:8]
+                      : cmd[{tb_load_w[2:0], 1'b0}];   // even CDB byte
+wire [7:0] tb_load_b1 = (tb_send_fixoff && (tb_load_w == 4'd1)) ? tb_send_pos[23:16]
+                      : (tb_send_fixoff && (tb_load_w == 4'd2)) ? tb_send_pos[7:0]
+                      : cmd[{tb_load_w[2:0], 1'b1}];   // odd  CDB byte
 wire [7:0] tb_b_d0    = (tb_state == TBS_LOAD) ? tb_load_b0 : din;   // CDB even byte, else payload byte
 wire [7:0] tb_b_d1    = (tb_state == TBS_LOAD) ? tb_load_b1 : din;   // CDB odd  byte, else payload byte
 
@@ -1413,6 +1428,9 @@ always @(posedge clk) begin
 		TBS_LOAD:
 			if (tb_load_w == 4'd4) begin
 				tb_fetch_sec <= 8'd0;   // the CDB block is ring slot 0
+				// 0xD3 starts a new file; each 0xD4 advances by the chunk it carried.
+				if (cmd_tb_send_prep)      tb_send_pos <= 24'd0;
+				else if (cmd_tb_send_data) tb_send_pos <= tb_send_pos + tb_send_len[24:9];
 				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
 			end else tb_load_w <= tb_load_w + 1'b1;
 		// tail block written; fall through to the CDB request block. Same ~8 ms
@@ -2250,7 +2268,20 @@ assign tb_stream_stall = tb_get_stall || tb_col_stall;
 // returns 4096 -- so exactly 1 block in 16 arrives (proven: a 2 MB download
 // round-trips as 32 correct 4 KB blocks spaced 16 apart, 480 zero blocks, 0
 // wrong). Fixing reads needs a streaming serve, not a capability flag.
-localparam [7:0] TB_CAPS = 8'h00;
+// 2026-07-31 STAGE 2: flipped to 0x02 now that the core streams a full 64 KB
+// chunk (TBS_COLL ships each payload sector as the Mac fills it, so the chunk
+// size no longer has to fit the buffer). The client answers this advert by
+// switching from 512-byte v0 sends to CDB[6]=127 (65024 B), which is ~8x fewer
+// command round trips: 28 KiB/s measured -> ~220 KiB/s projected, against a
+// 230 KiB/s data-phase ceiling.
+//
+// DEPLOY GATE: this is only safe once the RUNNING HPS accepts a 64 KB 0xD4
+// chunk (TB_CHUNK_MAX 65536). Do not infer that from the Main source tree --
+// on 2026-07-31 the deployed binary was a build that PREDATED its own commit
+// and still truncated GET at 4096, proving source and binary had diverged.
+// Verify against the box, not the repo. If the running HPS still caps at 4096,
+// this advert costs ~94% of every upload (the 6ded62d regression).
+localparam [7:0] TB_CAPS = 8'h02;
 function [7:0] tb_caps_byte;
 	input [31:0] cnt;
 	begin
