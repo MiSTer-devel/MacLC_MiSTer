@@ -2281,10 +2281,26 @@ assign tb_stream_stall = tb_get_stall || tb_col_stall;
 // and still truncated GET at 4096, proving source and binary had diverged.
 // Verify against the box, not the repo. If the running HPS still caps at 4096,
 // this advert costs ~94% of every upload (the 6ded62d regression).
-// A/B 2026-08-01: 0x00 to measure whether the client's 64 KB GETs are keyed
-// off the caps advert (the 07-31 "regardless" note only ever observed GETs
-// under 0x02). Ship value is 8'h02.
-localparam [7:0] TB_CAPS = 8'h00;
+// 0x02 = CAP_LARGE_SEND only. Clients gate each DIRECTION on a different bit:
+// MacAtrium (ae7a051) runs 32 KB sends on 0x02 and 32 KB reads on 0x01, so this
+// value buys fast uploads (~120 KB/s vs 39) while its downloads stay on 4 KB
+// GETs (~33 KB/s).
+//
+// ★ DO NOT SET BIT 0 (CAP_LARGE_TRANSFERS) -- the multi-block GET serve path
+// has a STALE-SECTOR RACE, measured on hardware 2026-08-01 (build 020cd964,
+// TB_CAPS=8'h03, MacAtrium 32 KB reads). A 2 MB download corrupted exactly ONE
+// 512-byte sector (file offset 0x1AD800); the served bytes were byte-identical
+// to the sector 8192 bytes earlier -- i.e. exactly one full ring cycle back
+// (TB_ADDRW=12 => 8 KB buffer => 16 sectors). The serve consumed a ring slot
+// the HPS had not yet refilled and shipped its previous occupant. Same class as
+// the CD-read look-ahead defect fixed in 082dcc4 (rd_ahead_blk boundary served
+// a stale prev occupant), so start there when fixing it.
+//
+// Single 64 KB GETs did NOT expose this (bus-proven byte-exact 2026-08-01, and
+// the bench 65536-byte get passes) -- the race needs the sustained multi-chunk
+// read cadence a real client produces. Any fix therefore needs a BENCH case
+// that streams many back-to-back multi-block GETs, not one big one.
+localparam [7:0] TB_CAPS = 8'h02;
 function [7:0] tb_caps_byte;
 	input [31:0] cnt;
 	begin

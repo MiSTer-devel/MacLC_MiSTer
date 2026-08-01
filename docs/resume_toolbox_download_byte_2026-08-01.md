@@ -62,6 +62,32 @@ never presents a 65536-byte transfer; it reads the caps byte only for
 unaffected by whichever `TB_CAPS` we ship.** Measured on the fast core:
 copy-in 2 MB in under 60 s, copy-out ~39 KiB/s.
 
+### 2c. ★ OPEN CORE BUG: multi-block GET serves a stale sector
+
+Found 2026-08-01 while chasing download speed for MacAtrium `ae7a051`, which
+gates each direction on a different capability bit (sends on `CAP_LARGE_SEND`
+0x02, reads on `CAP_LARGE_TRANSFERS` 0x01). Advertising `TB_CAPS=8'h03`
+(build `020cd964`, STA met, boot gate `94fedd19`) did unlock the read speed —
+**33 KB/s → 91 KB/s** — but corrupted the transfer:
+
+| | |
+|---|---|
+| wrong bytes | 510, all inside ONE 512-byte sector at file offset `0x1AD800` |
+| what was served | byte-identical to the sector **8192 bytes earlier** (−16 sectors) |
+| ring geometry | `TB_ADDRW(12)` on the Toolbox target = 8 KB buffer = **16 sectors** |
+| verdict | the serve consumed a ring slot the HPS had not yet refilled and shipped its previous occupant — exactly one full ring cycle stale |
+
+This is OUR defect, not a client bug (contrast §1/§2b). Same class as the
+CD-read look-ahead defect fixed in `082dcc4` (`rd_ahead_blk` crossed a ring
+boundary unvalidated and served the stale prev occupant) — start there.
+
+Why it was not caught earlier: a SINGLE 64 KB GET is byte-exact (bus-proven,
+and the bench's 65536-byte get passes). The race needs the sustained
+back-to-back multi-block read cadence a real client produces, so **any fix
+needs a new bench case that streams many consecutive multi-block GETs**, not
+one large one. Until then `TB_CAPS` bit 0 stays clear (see the comment block
+at `rtl/scsi.v` `TB_CAPS`).
+
 ### 2a. The caps lever WORKS (2026-08-01, user-prompted A/B)
 
 The 07-31 note "the app issues CDB[6]=16 regardless of what we advertise" was
@@ -73,14 +99,17 @@ download ~121 KiB/s app-reported — the SAME download rate as 64 K mode, i.e.
 downloads are guest-disk-bound and large GETs never bought speed. The bits
 cannot be split (GETs go large under 0x02-only), so the choice is:
 
-| config | SD Transfer uploads | SD Transfer downloads | SD Transfer correctness | MacAtrium |
+| config | SD Transfer up | SD Transfer down | MacAtrium up | MacAtrium down |
 |---|---|---|---|---|
-| `TB_CAPS=0x02` | ~192 KiB/s | ~120 KiB/s | >64 K downloads lose 1 byte/64 K | byte-exact, ~39 KiB/s out |
-| `TB_CAPS=0x00` | ~26 KiB/s | ~120 KiB/s | **everything byte-exact** | identical (ignores caps) |
+| `0x00` | ~26 KiB/s ✔ | ~120 KiB/s ✔ | 39 KB/s ✔ | 33 KB/s ✔ |
+| `0x02` **(shipped)** | ~192 KiB/s | ✘ loses 1 B/64 K | ~120 KB/s ✔ | 33 KB/s ✔ |
+| `0x03` | — | ✘ | ~120 KB/s | 91 KB/s **✘ stale sector (§2c)** |
 
-Since MacAtrium is unaffected either way (§2b), the choice is purely about
-the third-party app: `0x00` = correct-but-slow for it, `0x02` = fast uploads
-for it at the cost of its own >64 K download corruption.
+**NOTE (supersedes an earlier claim):** MacAtrium was caps-INDEPENDENT only
+until `ae7a051`; from that commit it sizes transfers from the caps byte, so
+the shipped value now matters to it directly. `0x02` is the best available
+point — MacAtrium byte-exact with fast uploads — and the only cost is the SD
+Transfer app's own >64 K download defect, which is its bug, not ours.
 
 Scope of the 0x02 defect: downloads of files **> 65535 bytes** lose the last
 byte of each full 64 KB window (final short chunk intact; files ≤ 65535 bytes
