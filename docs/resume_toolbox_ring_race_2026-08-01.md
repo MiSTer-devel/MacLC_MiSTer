@@ -1,16 +1,20 @@
 # Resume — Toolbox GET ring race: the stale-sector serve (2026-08-01)
 
 **✅ MISSION COMPLETE (2026-08-01 PM session). Do not re-run this prompt.**
-Fix `7a6935a` (watchdog → bounded retry + `!tb_ack` issue gates), caps 0x03
-`7e6d321`, build `5a181d40` = `releases/MacLC_20260801.rbf`, deployed + boot-
-gated twice (`94fedd19`). 3× 2 MB MacAtrium round trips byte-exact
-(`c42818…`), incl. one under a deliberate SD write storm (downloads dipped
-56 KB/s = retries exercised live). Downloads 33 → ~91 KB/s. §3's suspicion
-was verified on the bench first (`scsi_bench --mode toolboxget`, deferred-
-latch HPS model, exact −16 signature) plus a second same-family defect
-(status-ack-live fetch arm killing sector 0) found by the now-gating
-`toolboxslow` probe. SEND-side ship watchdog hardening filed as a follow-up
-chip. Historical content below.
+The race is FIXED (`7a6935a`: watchdog → bounded retry + `!tb_ack` issue
+gates). §3's suspicion was verified on the bench first (`scsi_bench --mode
+toolboxget`, deferred-latch HPS model, exact −16 signature), plus a second
+same-family defect (status-ack-live fetch arm killing sector 0) found by
+the now-gating `toolboxslow` probe. With caps 0x03 it gave 4× 2 MB
+MacAtrium round trips byte-exact (`c42818…`) at 91 KB/s, one under a
+deliberate SD write storm.
+
+**⚠️ BUT caps bit 0 was REVERTED — it crashes the official BlueSCSI SD
+Transfer app. Shipped build is `3aaf1ed1` = the fix + `TB_CAPS = 0x02`
+(`releases/MacLC_20260801.rbf`, commit `564a9f7`). See the ADDENDUM at the
+bottom for the three-build A/B that proves it. MacAtrium downloads
+therefore stay at 33 KB/s, not 91.** SEND-side ship watchdog hardening
+filed as a follow-up chip. Historical content below.
 
 ---
 
