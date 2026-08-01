@@ -1259,6 +1259,10 @@ wire [12:0] tb_b_addr13 = (tb_state == TBS_LOAD)   ? {9'd0, tb_load_w}
 // TB_ADDRW, which is already (byte/2) mod 4096 -- a 16-sector ring by
 // construction, which is why the GET side needs no new addressing at all.
 wire tb_col_sec_full = tb_collect && stb_ack && (tb_col_lin[8:0] == 9'h1ff);
+// SEND back-pressure: the collect is about to reuse a ring slot whose previous
+// occupant has not shipped yet. Defined HERE rather than with the other stalls
+// because the 0xD4 inter-byte watchdog below must be able to see it.
+wire tb_col_stall = tb_collect && ((tb_col_lba - tb_ship_done) >= (TB_MAXSEC - 5'd1));
 wire [TB_ADDRW-1:0] tb_b_addr = tb_b_addr13[TB_ADDRW-1:0];
 // HPS fill address: sector tb_fetch_sec at word offset tb_fetch_sec*256, so a
 // multi-sector LIST lands contiguously (LBA 1+k -> words k*256..k*256+255).
@@ -2170,7 +2174,12 @@ reg [15:0] tb_out_to    = 16'd0;
 reg        tb_out_stall_r = 1'b0;
 always @(posedge clk) begin
 	if (!tb_out_active)     begin tb_out_to <= 16'd0; tb_out_stall_r <= 1'b0; end
-	else if (stb_adv)             tb_out_to <= 16'd0;
+	// tb_col_stall: WE are holding REQ down to drain the streaming ring, so the
+	// absence of ACKs is our own flow control, not a stalled client. Inert while
+	// TB_CAPS=0x00 (a 512-byte chunk never fills the ring); it matters once large
+	// sends are advertised, where a slow HPS block write could otherwise let a
+	// full ring exceed the 2.02 ms timeout and truncate the phase.
+	else if (stb_adv || tb_col_stall) tb_out_to <= 16'd0;
 	else if (!(&tb_out_to))       tb_out_to <= tb_out_to + 1'b1;
 	else                          tb_out_stall_r <= 1'b1;
 end
@@ -2212,7 +2221,7 @@ wire tb_get_stall = tb_srv_active &&
 // this never fires -- the Mac needs ~2.2 ms to fill a sector and the HPS takes
 // ~0.5 ms to take one -- but it is what makes the design correct rather than
 // merely fast enough.
-wire tb_col_stall = tb_collect && ((tb_col_lba - tb_ship_done) >= (TB_MAXSEC - 5'd1));
+// (tb_col_stall is defined with the collect logic -- the 0xD4 watchdog needs it)
 assign tb_stream_stall = tb_get_stall || tb_col_stall;
 
 // DEVICE INFO data (docs/BLUESCSI_HANDOFF.md §4.8): subcmd 0x00 LIST DEVICES ->

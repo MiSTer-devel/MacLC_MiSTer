@@ -164,3 +164,46 @@ order already forbids. Note the *current* box is safe: the HPS clamps the
 reported length to 0xFFFF (`mac_toolbox.cpp:70`), so today's new-HPS/
 old-core combo degrades to a short serve, not a wedge. Whoever changes
 that clamp to the byte-4 encoding must land the new core in the same pass.
+
+### 7a. The exact remaining HPS change (ready to apply)
+
+The HPS session left the reporting side pending until the core picked an
+encoding. It has: **byte 4 bit 0 = length[16]**. This is the whole change,
+in `tbx_fill()` / the status-block writer (`mac_toolbox.cpp` ~line 70):
+
+```c
+-  uint16_t len = (ch.resp.size() > 0xFFFF) ? 0xFFFF : (uint16_t)ch.resp.size();
+-  buf[0] = status; buf[1] = TB_SIG; buf[2] = len >> 8; buf[3] = len & 0xFF;
++  size_t   full = (ch.resp.size() > 0x1FFFF) ? 0x1FFFF : ch.resp.size();
++  uint16_t len  = (uint16_t)(full & 0xFFFF);
++  buf[0] = status; buf[1] = TB_SIG; buf[2] = len >> 8; buf[3] = len & 0xFF;
++  buf[4] = (uint8_t)((full >> 16) & 1);
+```
+
+That exact code is already running as the bench's HPS model
+(`verilator/scsi_bench/scsi_bench.cpp`, `TbHps::fill`) and the core passes
+a 65536-byte GET against it byte-for-byte, so it is a validated reference,
+not a suggestion.
+
+**A trap worth knowing about**, because it cost the core session a debug
+cycle: reading byte 4 on the core is not free. The obvious read (the
+dpram's +2 look-ahead port) returns 0 — those are the prefetch
+controller's holding registers and they are not valid on the status-latch
+path. The core now reads byte 4 through the primary port in a dedicated
+settle state (`TBS_LATCH2`). Nothing for the HPS to do, but if a future
+core reports "length bit 16 never arrives", this is why.
+
+### 7b. Merge / deploy ordering with the open PR
+
+Core commit `8a786ce` (streaming + `TB_CAPS = 0x00`) is the matching core
+side. Ordering constraints, in force until BOTH are in:
+
+1. The HPS PR is safe to merge on its own **only while the status writer
+   still clamps to 0xFFFF**. In that state a 64 KB response reports 65535,
+   an old core serves a short 8 KB, and nothing wedges.
+2. The moment §7a lands, an old core reads length 0 for exactly 65536 and
+   takes the status-only path — the client gets nothing. So §7a and a core
+   built from `8a786ce`+ must reach the box together.
+3. `TB_CAPS` flips to `0x02` only after §2 + §7a are live. Until then
+   uploads are correct-but-slow (512-byte v0 chunks, ~28 KiB/s measured)
+   and downloads stay at the HPS's 4 KB ceiling.
