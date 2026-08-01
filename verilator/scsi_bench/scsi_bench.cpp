@@ -84,8 +84,10 @@ struct TbHps {
 	// Tail request blocks LBA 1..TB_TAIL_BLKS, flattened: payload byte P >= 496
 	// sits at tail[P - 496]. 512-byte chunks use one block; a 4 KB large-send
 	// chunk spans eight (mirrors Main_MiSTer 952994d).
-	static const uint32_t CHUNK_MAX = 4096;
-	static const uint32_t TAIL_BLKS = (CHUNK_MAX + 16 - 1) / 512;   // 8
+	// 64 KB since the streaming rework (2026-07-31), matching the new HPS: the
+	// official client sends 127x512 chunks and asks for 16x4096 reads.
+	static const uint32_t CHUNK_MAX = 65536;
+	static const uint32_t TAIL_BLKS = (CHUNK_MAX + 16 - 1) / 512;   // 128
 	uint8_t              tail[TAIL_BLKS * 512];
 	uint64_t             reqs = 0, fills = 0;
 
@@ -116,7 +118,7 @@ struct TbHps {
 		uint32_t offset = ((uint32_t)cdb[2]<<24)|((uint32_t)cdb[3]<<16)|((uint32_t)cdb[4]<<8)|cdb[5];
 		uint32_t blocks = cdb[6] ? cdb[6] : 1;
 		uint32_t want   = blocks * BLOCK;
-		if (want > 4096) want = 4096;                          // core tb buffer bound
+		if (want > CHUNK_MAX) want = CHUNK_MAX;                // cap only, not a clamp to 4 KB
 		if (offset == 0) get_idx = (cdb[1] < files.size()) ? cdb[1] : -1;
 		if (get_idx < 0) { status = 0x02; return; }
 		const std::vector<uint8_t>& d = files[get_idx].data;
@@ -139,7 +141,7 @@ struct TbHps {
 		uint32_t off   = ((uint32_t)buf[3]<<16)|((uint32_t)buf[4]<<8)|buf[5];        // 512-blocks
 		uint32_t bytes = buf[6] ? (uint32_t)buf[6]*512 : (((uint32_t)buf[1]<<8)|buf[2]);
 		if (bytes > CHUNK_MAX) bytes = CHUNK_MAX;
-		uint8_t chunk[CHUNK_MAX];
+		static uint8_t chunk[CHUNK_MAX];   // 64 KB: must NOT be a stack array
 		uint32_t head = bytes < 496 ? bytes : 496;
 		memcpy(chunk, buf + 16, head);
 		if (bytes > 496) memcpy(chunk + 496, tail, bytes - 496);   // tail block
@@ -172,8 +174,15 @@ struct TbHps {
 		fills++;
 		memset(buf, 0, 512);
 		if (lba == 0) {
-			uint16_t len = (resp.size() > 0xFFFF) ? 0xFFFF : (uint16_t)resp.size();
+			// 17-bit length (2026-07-31): bytes 2..3 carry length[15:0] and byte 4
+			// bit 0 carries length[16]. A CDB[6]=16 GET asks for exactly 65536,
+			// which a BE16 field cannot express -- the old 0xFFFF clamp cost one
+			// byte per 64 KB chunk, and this client zero-fills what it does not
+			// receive. Byte 4 was reserved-zero, so old cores are unaffected.
+			size_t   full = (resp.size() > 0x1FFFF) ? 0x1FFFF : resp.size();
+			uint16_t len  = (uint16_t)(full & 0xFFFF);
 			buf[0] = status; buf[1] = TB_SIG; buf[2] = len >> 8; buf[3] = len & 0xFF;
+			buf[4] = (uint8_t)((full >> 16) & 1);
 		} else {
 			size_t off = (size_t)(lba - 1) * 512;
 			if (off < resp.size()) memcpy(buf, resp.data() + off, std::min<size_t>(512, resp.size() - off));
@@ -1272,6 +1281,93 @@ static int run_toolbox() {
 				       bad, SRC, first, tbx.upload[first], src[first]);
 				fails++;
 			} else printf("toolbox: large-send %d bytes OK (4 KB chunks, 8 tail blocks)\n", SRC);
+		}
+	}
+
+	// ---- SEND at the OFFICIAL CLIENT's chunk size: CDB[6]=127 = 65024 bytes in
+	// ONE DataOut phase. This is the case the whole streaming rework exists for:
+	// 65024 bytes cannot be resident in an 8 KB buffer, so the core must ship
+	// each 512-byte sector to the HPS while the Mac is still filling the next.
+	// It wraps the 15-slot payload ring ~8 times per chunk, so a ring-wrap or
+	// back-pressure defect corrupts a whole sector rather than a byte or two.
+	// (HW 2026-07-31: the app really does send CDB[6]=127, JTAG CDB capture.)
+	{
+		const int CH  = 127 * 512;                 // 65024, the client's chunk
+		const int SRC = CH * 2 + 4096 + 300;       // 2 full chunks + a short tail
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0x2A000 + i * 7);
+
+		uint8_t name[33] = {};
+		memcpy(name, "huge.bin", 8);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "HUGE PREP");
+		if (st != 0x00) { printf("toolbox: HUGE PREP status %02x\n", st); return 1; }
+
+		int blk = 0;
+		while (blk * 512 < SRC) {
+			int left   = SRC - blk * 512;
+			int blocks = (left + 511) / 512; if (blocks > 127) blocks = 127;
+			int bytes  = blocks * 512;
+			std::vector<uint8_t> chunk(bytes, 0xFF);
+			int valid = (left < bytes) ? left : bytes;
+			memcpy(chunk.data(), &src[blk * 512], valid);
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			cdb[6] = (uint8_t)blocks;
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			char what[48]; snprintf(what, sizeof(what), "HUGE DATA blk%d x%d", blk, blocks);
+			st = tb_cmd(cdb, chunk.data(), bytes, nullptr, 0, what);
+			if (st != 0x00) { printf("toolbox: %s status %02x\n", what, st); return 1; }
+			blk += blocks;
+		}
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "HUGE END");
+		if (st != 0x00) { printf("toolbox: HUGE END status %02x\n", st); return 1; }
+
+		if (tbx.upload.size() < (size_t)SRC) {
+			printf("toolbox: HUGE upload %zu bytes, want >= %d\n", tbx.upload.size(), SRC);
+			fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < SRC; i++)
+				if (tbx.upload[i] != src[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: HUGE upload %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, SRC, first, tbx.upload[first], src[first]);
+				fails++;
+			} else printf("toolbox: streamed-send %d bytes OK (65024-B chunks, ring wraps)\n", SRC);
+		}
+	}
+
+	// ---- GET at the official client's request size: CDB[6]=16 = 65536 bytes.
+	// Two things under test. (1) The serve streams: the core must hand over
+	// bytes while later sectors are still being fetched, since 65536 does not
+	// fit the buffer. (2) The 17-bit length: 65536 has bytes 2..3 == 0 in the
+	// status block, so a core that reads only the BE16 field sees "no data" and
+	// skips the data phase entirely -- exactly the trap the HPS session found.
+	{
+		const int WANT = 65536;
+		tbx.files.push_back({ "big.get", {} });
+		auto &fdat = tbx.files.back().data;
+		fdat.resize(WANT);
+		for (int i = 0; i < WANT; i++) fdat[i] = ramp(0x71000 + i * 3);
+		int idx = (int)tbx.files.size() - 1;
+
+		std::vector<uint8_t> buf(WANT, 0);
+		uint8_t cdb[10] = { 0xD1, (uint8_t)idx, 0, 0, 0, 0, 16, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf.data(), WANT, "BIG GET");
+		if (st != 0x00) { printf("toolbox: BIG GET status %02x\n", st); return 1; }
+		if (tbx.resp.size() != (size_t)WANT) {
+			printf("toolbox: BIG GET staged %zu bytes, want %d\n", tbx.resp.size(), WANT);
+			fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < WANT; i++)
+				if (buf[i] != fdat[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: BIG GET %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, WANT, first, buf[first], fdat[first]);
+				fails++;
+			} else printf("toolbox: streamed-get %d bytes OK (17-bit len, ring refills)\n", WANT);
 		}
 	}
 

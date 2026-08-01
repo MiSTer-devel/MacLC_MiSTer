@@ -474,6 +474,12 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	// Toolbox DataIn serve-settle (driven near the tb FSM, declared here because
 	// REQ consumes it). Zero outside a Toolbox/CD-changer DataIn serve.
 	wire tb_srv_hold;
+	// Toolbox STREAMING back-pressure (2026-07-31), also driven near the tb FSM.
+	// GET: the serve has caught up with the HPS fetch. SEND: the collect has
+	// lapped the ring and would overwrite a sector still waiting to be shipped.
+	// Both are ordinary flow control -- REQ simply waits, exactly like io_busy on
+	// the disk path -- and both are 0 whenever a transfer fits without streaming.
+	wire tb_stream_stall;
 	// 0xD4 SEND DATA inter-byte watchdog; zero outside that DataOut phase.
 	wire tb_out_stalled;
 	// REQ assertion. Previously this was gated on !sel ("wait for the initiator
@@ -488,7 +494,7 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	// `phase != PHASE_IDLE` already prevents REQ during the IDLE->selection
 	// sampling window, so REQ now comes up on selection like the references.
 	assign req = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !io_busy && !data_phase_complete &&
-	             !tb_srv_hold;
+	             !tb_srv_hold && !tb_stream_stall;
 
 	// Bus-VISIBLE REQ (CSR bit 5 / BSR DRQ): stays asserted across the HPS
 	// 512-byte block-boundary fetches in the data phases. Real drives never
@@ -505,7 +511,12 @@ wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
 	// (LBMacTwo 5adc2e1, HW-validated with 2d025c5 in round 6.)
 	assign req_bus = (phase != PHASE_IDLE) && (phase != PHASE_TB) && !ack && !data_phase_complete &&
 	                 ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN) || !io_busy) &&
-	                 !tb_srv_hold;   // ~250 ns per byte, not the ~ms fetch stall above
+	                 !tb_srv_hold &&   // ~250 ns per byte, not the ~ms fetch stall above
+	                 // The streaming stall DOES gate the bus-visible REQ/DRQ: unlike
+	                 // a block-boundary disk fetch, there is genuinely no byte to
+	                 // hand over, and the host must wait rather than latch a stale
+	                 // one. It clears within one HPS sector time (~0.5 ms).
+	                 !tb_stream_stall;
 
 assign bsy = (phase != PHASE_IDLE);
 
@@ -1146,20 +1157,50 @@ reg [7:0]  cmd [9:0];
 // `verilator/scsi_bench --mode toolbox` (COUNT/LIST/SEND/GET round trips
 // against a mirror of Main's handler).
 // ========================================================================
-localparam TBS_IDLE=3'd0, TBS_LOAD=3'd1, TBS_REQ=3'd2, TBS_STAT=3'd3,
-           TBS_LATCH=3'd4, TBS_DATA=3'd5, TBS_RDY=3'd6, TBS_REQ2=3'd7;
-reg [2:0]  tb_state = TBS_IDLE;
+// 4 bits since the streaming work (2026-07-31): the original 8 codes were all
+// taken, and TBS_STREAM / TBS_COLL / TBS_COLLW are what let a transfer be
+// larger than the buffer that carries it.
+localparam TBS_IDLE=4'd0, TBS_LOAD=4'd1, TBS_REQ=4'd2, TBS_STAT=4'd3,
+           TBS_LATCH=4'd4, TBS_DATA=4'd5, TBS_RDY=4'd6, TBS_REQ2=4'd7,
+           TBS_STREAM=4'd8,   // GET: keep fetching while the Mac is served
+           TBS_COLL=4'd9,     // SEND: watch the DataOut phase fill sectors
+           TBS_COLLW=4'd10,   // SEND: a streamed sector write is in flight
+           TBS_LATCH2=4'd11;  // status block: settle + read the length's bit 16
+reg [3:0]  tb_state = TBS_IDLE;
 reg        tb_rd_r, tb_wr_r;
 reg [31:0] tb_lba_r;
 reg [7:0]  tb_status;
-reg [15:0] tb_len;
+// 17 bits (2026-07-31). The status block's BE16 length field cannot express
+// 65536, and that is exactly what a CDB[6]=16 GET asks for -- the official
+// client zero-fills whatever it does not receive and advances by the full
+// request, so a 16-bit length costs one corrupted byte per 64 KB chunk and
+// fails an md5 round trip. Status-block byte 4 (reserved-zero until now)
+// carries bit 16. Found by the HPS session, 2026-07-31.
+reg [16:0] tb_len;
 reg [3:0]  tb_load_w;
 reg [3:0]  tb_settle;   // status-latch settle for the registered port-B (q_b) reads
                         // of the status block (word 0 = status/sig, word 1 = length).
 reg [17:0] tb_to;       // tb read-completion watchdog (~8-17 ms); see TBS_STAT.
 reg        old_tb_ack;
-reg [4:0]  tb_fetch_sec;    // which 512B sector the HPS fill is landing (multi-block LIST; TB_ADDRW>8)
-                            // 5 bits: TB_ADDRW=12 gives TB_MAXSEC=16, which does not fit in 4.
+reg [7:0]  tb_fetch_sec;    // which 512B sector the HPS transfer is landing on / reading from.
+                            // 8 bits since streaming: this is now the RING SLOT for a
+                            // response/chunk of up to 128 sectors, not a buffer index --
+                            // tb_hps_addr13 slices it back down to the buffer's 16 slots.
+// ---- streaming state (2026-07-31) ---------------------------------------
+// GET: sectors of the current response that are fully in the buffer. The serve
+// stalls when it reaches this; the fetch stalls when it is TB_MAXSEC ahead of
+// the serve (it would otherwise overwrite bytes the Mac has not taken yet).
+reg [8:0]  tb_sec_done;
+reg        tb_fetch_busy;   // a streamed sector read is outstanding
+// SEND: the ring slot being filled and the LOGICAL sector it maps to. Slot 0 is
+// reserved for the CDB block (it must ship LAST, because LBA 0 is what runs the
+// HPS handler), so the payload ring is slots 1..TB_MAXSEC-1.
+reg [4:0]  tb_col_slot;
+reg [7:0]  tb_col_lba;
+reg [7:0]  tb_ship_done;    // logical sectors handed to the HPS so far
+reg        tb_ship_req;     // a completed sector is waiting to be shipped
+reg [4:0]  tb_ship_slot;
+reg [7:0]  tb_ship_lba;
 reg  [6:0] tb_retry;        // status-block re-looks (re-issued reads) this round trip
 // A slow HPS answer must not read as "no handler". The SD is mounted
 // sync,dirsync, so one SEND chunk is a synchronous card write; when the card
@@ -1200,9 +1241,24 @@ wire       tb_col_wr1 = tb_collect && stb_ack &&  data_cnt[0];
 // 13 bits so a multi-block SEND fits: a 4 KB chunk sits at bytes 16..4111, i.e.
 // words 8..2055, which overflows the old 11-bit form (and the old collect slice
 // data_cnt[8:1] wrapped the payload back onto itself at 512 bytes).
+// Collect addressing (streaming, 2026-07-31). The payload still starts at block
+// byte 16 -- the HPS contract is unchanged -- so payload byte P sits at LINEAR
+// block byte 16+P. What changed is that the linear byte no longer indexes the
+// buffer directly: it is split into (logical sector, word-in-sector), and the
+// sector is replaced by the ring slot tb_col_slot. That is what decouples the
+// chunk size from the buffer size. Slot 0 holds the CDB + payload bytes 0..495
+// and is never recycled; slots 1..TB_MAXSEC-1 rotate.
+wire [16:0] tb_col_lin  = {1'b0, data_cnt[15:0]} + 17'd16;   // linear block byte
+wire [7:0]  tb_col_word = tb_col_lin[8:1];                   // word within the sector
 wire [12:0] tb_b_addr13 = (tb_state == TBS_LOAD)   ? {9'd0, tb_load_w}
-                        : tb_collect               ? (13'd8 + {1'b0, data_cnt[12:1]})
+                        : (tb_state == TBS_LATCH2) ? 13'd2   // status bytes 4,5
+                        : tb_collect               ? {tb_col_slot, tb_col_word}
                         :                             data_cnt[13:1];
+// A sector is complete when the Mac acks the byte at offset 511 of it. The
+// serve side needs no equivalent: its address is data_cnt[13:1] sliced to
+// TB_ADDRW, which is already (byte/2) mod 4096 -- a 16-sector ring by
+// construction, which is why the GET side needs no new addressing at all.
+wire tb_col_sec_full = tb_collect && stb_ack && (tb_col_lin[8:0] == 9'h1ff);
 wire [TB_ADDRW-1:0] tb_b_addr = tb_b_addr13[TB_ADDRW-1:0];
 // HPS fill address: sector tb_fetch_sec at word offset tb_fetch_sec*256, so a
 // multi-sector LIST lands contiguously (LBA 1+k -> words k*256..k*256+255).
@@ -1240,17 +1296,29 @@ wire [15:0] tb_serve_pair_next = data_cnt[0] ? {tb1_dout_next, tb0_dout_next2} :
 // Multi-sector LIST fetch (TB_ADDRW>8): the HPS returns tb_len bytes across
 // ceil(tb_len/512) sectors (LBA 1..N). TB_MAXSEC bounds it to the buffer; with
 // TB_ADDRW=8 => TB_MAXSEC=1 => single-block (file Toolbox behaviour preserved).
-localparam [4:0] TB_MAXSEC = 1 << (TB_ADDRW - 8);   // 5 bits: TB_ADDRW=12 => 16
-wire [6:0] tb_nsec_raw = tb_len[15:9] + {6'd0, |tb_len[8:0]};  // ceil(tb_len/512)
-wire [4:0] tb_nsec = (tb_nsec_raw == 7'd0)         ? 5'd1
-                   : (tb_nsec_raw > {2'd0,TB_MAXSEC}) ? TB_MAXSEC
-                   :                                  tb_nsec_raw[4:0];
-// Never SERVE more than the buffer actually holds. tb_nsec clamps the FETCH at
-// TB_MAXSEC sectors; without the matching clamp on the served length an HPS
-// response longer than the buffer is served from wrapped/stale words (the
-// alloc-overserve wedge class), silently corrupting the tail of a GET.
-localparam [15:0] TB_SRV_MAX = {2'd0, TB_MAXSEC, 9'd0};        // TB_MAXSEC * 512
-wire [15:0] tb_srv_len = (tb_len > TB_SRV_MAX) ? TB_SRV_MAX : tb_len;
+localparam [4:0] TB_MAXSEC = 1 << (TB_ADDRW - 8);   // buffer RING slots: TB_ADDRW=12 => 16
+// Sectors a single response/chunk may span. No longer bounded by the buffer:
+// the serve streams through the ring (TBS_STREAM), so this is bounded by the
+// wire protocol instead -- 128 sectors = 64 KB, which covers the official
+// client's 16-block (65536 B) GET and 127-block (65024 B) SEND.
+localparam [8:0] TB_SEC_MAX = 9'd128;
+wire [8:0] tb_nsec_raw = {1'd0, tb_len[16:9]} + {8'd0, |tb_len[8:0]};  // ceil(tb_len/512)
+wire [8:0] tb_nsec = (tb_nsec_raw == 9'd0)          ? 9'd1
+                   : (tb_nsec_raw > TB_SEC_MAX)     ? TB_SEC_MAX
+                   :                                  tb_nsec_raw;
+// The served length is now bounded by TB_SEC_MAX, not by the buffer: the ring
+// refills behind the serve. The clamp still matters -- an HPS response longer
+// than we will ever fetch must not be served from stale words (the
+// alloc-overserve wedge class) -- it just sits 8x higher than before.
+localparam [16:0] TB_SRV_MAX = {TB_SEC_MAX, 8'd0} << 1;        // TB_SEC_MAX * 512 = 64 KB
+wire [16:0] tb_srv_len = (tb_len > TB_SRV_MAX) ? TB_SRV_MAX : tb_len;
+// Where the serve has got to, in sectors, and where a longword pseudo-DMA read
+// can reach (it captures data_cnt..+3 in one bus cycle, so the sector holding
+// +3 must be resident too -- the same look-ahead the disk read path needs, and
+// the same class of bug as the 2026-07-29 rd_ahead_blk defect).
+wire [8:0]  tb_srv_sec       = {1'b0, data_cnt[16:9]};
+wire [16:0] tb_srv_byte_ah   = data_cnt[16:0] + 17'd3;
+wire [8:0]  tb_srv_sec_ahead = {1'b0, tb_srv_byte_ah[16:9]};
 
 // Round-trip FSM. Drives tb_state / tb_rd / tb_wr / tb_lba; the MAIN phase FSM
 // moves `phase` (CMD_IN -> PHASE_TB -> DATA_OUT/STATUS_OUT) by watching tb_state.
@@ -1258,29 +1326,90 @@ always @(posedge clk) begin
 	old_tb_ack <= tb_ack;
 	if (rst) begin
 		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
-		tb_status <= 8'h02; tb_len <= 16'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
-		tb_fetch_sec <= 5'd0; tb_retry <= 7'd0;
+		tb_status <= 8'h02; tb_len <= 17'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
+		tb_fetch_sec <= 8'd0; tb_retry <= 7'd0;
+		tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b0; tb_col_slot <= 5'd0; tb_col_lba <= 8'd0;
+		tb_ship_done <= 8'd0; tb_ship_req <= 1'b0; tb_ship_slot <= 5'd0; tb_ship_lba <= 8'd0;
 	end else if (TOOLBOX_ENABLE || CDCHANGER_ENABLE) begin
+		// A completed payload sector is latched here regardless of which state we
+		// are in, so the collect never has to wait for the FSM to look.
+		if (tb_col_sec_full && (tb_col_lba != 8'd0)) begin
+			tb_ship_req  <= 1'b1;
+			tb_ship_slot <= tb_col_slot;
+			tb_ship_lba  <= tb_col_lba;
+		end
+		if (tb_col_sec_full) begin
+			// slot 0 is the CDB block and is never recycled; the payload ring is
+			// slots 1..TB_MAXSEC-1.
+			tb_col_slot <= (tb_col_slot >= (TB_MAXSEC - 5'd1)) ? 5'd1 : (tb_col_slot + 5'd1);
+			tb_col_lba  <= tb_col_lba + 8'd1;
+		end
 		case (tb_state)
 		TBS_IDLE: begin
 			tb_load_w <= 4'd0;
-			tb_fetch_sec <= 5'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
+			tb_fetch_sec <= 8'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
 			tb_retry <= 7'd0;                    // per-round-trip
+			// NOTE: tb_sec_done is deliberately NOT cleared here. TBS_RDY drops
+			// through to IDLE the moment the main FSM leaves PHASE_TB -- i.e.
+			// while the Mac is still being served -- so clearing it here stalls
+			// the serve forever (caught by scsi_bench: "COUNT DataIn stalled at
+			// 0 of 1"). It is armed in TBS_LATCH, where a fetch actually starts.
 			if (phase == PHASE_TB) tb_state <= TBS_LOAD;
+			else if ((phase == PHASE_DATA_IN) && cmd_tb_send_pay) begin
+				// SEND payload starting: arm the collect ring. Slot 0 takes the CDB
+				// block (payload bytes 0..495 land in it too); it ships LAST.
+				tb_col_slot <= 5'd0; tb_col_lba <= 8'd0;
+				tb_ship_done <= 8'd0; tb_ship_req <= 1'b0;
+				tb_state <= TBS_COLL;
+			end
+		end
+		// SEND streaming: hand each completed payload sector to the HPS while the
+		// Mac is still filling the next one. This is what decouples the chunk size
+		// from the buffer: without it a 64 KB chunk would have to be resident, and
+		// the buffer is 8 KB. Ordering is unchanged from the old collect-then-ship
+		// path -- payload sectors go out as LBA 1..N and the CDB block (LBA 0,
+		// which is what runs the handler) still goes last, from TBS_REQ.
+		TBS_COLL: begin
+			if (tb_ship_req) begin
+				tb_ship_req  <= 1'b0;
+				tb_fetch_sec <= {3'd0, tb_ship_slot};
+				tb_lba_r     <= {24'd0, tb_ship_lba};
+				tb_wr_r      <= 1'b1;
+				tb_to        <= 18'd0;
+				tb_state     <= TBS_COLLW;
+			end else if (phase == PHASE_TB) begin
+				// Phase over. Anything still in the current slot is a short final
+				// sector; ship it, then the CDB block closes the round trip.
+				if ((tb_col_lba != 8'd0) && (tb_col_lin[8:0] != 9'd0)) begin
+					tb_fetch_sec <= {3'd0, tb_col_slot};
+					tb_lba_r     <= {24'd0, tb_col_lba};
+					tb_wr_r      <= 1'b1;
+					tb_to        <= 18'd0;
+					tb_col_lba   <= 8'd0;   // one-shot: do not ship it twice
+					tb_state     <= TBS_COLLW;
+				end else begin
+					tb_fetch_sec <= 8'd0;
+					tb_state     <= TBS_LOAD;
+				end
+			end else if (phase != PHASE_DATA_IN) tb_state <= TBS_IDLE;  // aborted
+		end
+		TBS_COLLW: begin
+			if (tb_ack) tb_wr_r <= 1'b0;
+			tb_to <= tb_to + 1'b1;
+			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
+				tb_ship_done <= tb_ship_done + 8'd1;
+				tb_state     <= TBS_COLL;
+			end
 		end
 		// write the 10-byte CDB as 5 words (0..4) into the tb buffer
+		// Every payload sector has already been shipped by TBS_COLL/TBS_COLLW by
+		// the time we get here, so the CDB block always goes straight out. (This
+		// used to detour through TBS_REQ2 to push the tail sectors first; that is
+		// now done during the data phase, which is the whole point of streaming.)
 		TBS_LOAD:
 			if (tb_load_w == 4'd4) begin
-				if (tb_send_tail) begin
-					// SEND DATA: the 512-byte payload sits at buffer bytes
-					// 16..527, so its last 16 bytes are in buffer sector 1.
-					// Ship that tail FIRST (LBA 1) — the handler then has the
-					// whole payload when the CDB block (LBA 0) runs it.
-					tb_fetch_sec <= 5'd1;
-					tb_wr_r <= 1'b1; tb_lba_r <= 32'd1; tb_to <= 18'd0; tb_state <= TBS_REQ2;
-				end else begin
-					tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
-				end
+				tb_fetch_sec <= 8'd0;   // the CDB block is ring slot 0
+				tb_wr_r <= 1'b1; tb_lba_r <= 32'd0; tb_state <= TBS_REQ;
 			end else tb_load_w <= tb_load_w + 1'b1;
 		// tail block written; fall through to the CDB request block. Same ~8 ms
 		// watchdog as TBS_STAT/TBS_DATA: this is the one NEW transfer in the
@@ -1343,11 +1472,19 @@ always @(posedge clk) begin
 			if (tb_settle != 4'd0) tb_settle <= tb_settle - 1'b1;
 			else if (tb1_dout == 8'hb5) begin            // signature ok (byte 1)
 				tb_status <= tb0_dout;                       // byte 0 = SCSI status
-				tb_len    <= {tb0_dout_next, tb1_dout_next}; // bytes 2,3 = length
-				if ({tb0_dout_next, tb1_dout_next} != 16'd0) begin
-					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 5'd0; tb_to <= 18'd0;
-					tb_state <= TBS_DATA;
-				end else tb_state <= TBS_RDY;                // status-only
+				// bytes 2,3 = length[15:0]; byte 4 bit 0 = length[16]. Byte 4 was
+				// reserved-zero, so an HPS that does not set it reads back exactly
+				// as before. The status-only test below MUST look at all 17 bits:
+				// a 65536-byte response has bytes 2,3 == 0 and would otherwise be
+				// mistaken for "no data".
+				tb_len[15:0] <= {tb0_dout_next, tb1_dout_next};
+				// Bit 16 lives in byte 4, which is NOT reachable from this address:
+				// q_c/q_d are the prefetch controller's holding registers, valid on
+				// the pseudo-DMA path's schedule, not this one (bench: byte 4 read
+				// back 0, so a 65536 response looked like "no data"). Re-point the
+				// PRIMARY port at word 2 and give it the same settle.
+				tb_settle <= 4'd8;
+				tb_state  <= TBS_LATCH2;
 			end else if (tb_retry != TB_RETRY_MAX) begin
 				// No signature: the buffer still holds the CDB we wrote, so the HPS
 				// has not answered YET — a SEND chunk is a synchronous write to a
@@ -1365,7 +1502,21 @@ always @(posedge clk) begin
 				tb_to    <= 18'd0;
 				tb_state <= TBS_STAT;
 			end else begin                               // no real handler -> CHECK
-				tb_status <= 8'h02; tb_len <= 16'd0; tb_state <= TBS_RDY;
+				tb_status <= 8'h02; tb_len <= 17'd0; tb_state <= TBS_RDY;
+			end
+		// Length bit 16 (see TBS_LATCH). tb_len[15:0] is already latched, so the
+		// full 17-bit value is known once byte 4 has settled on the primary port.
+		TBS_LATCH2:
+			if (tb_settle != 4'd0) tb_settle <= tb_settle - 1'b1;
+			else begin
+				tb_len[16] <= tb0_dout[0];
+				if ({tb0_dout[0], tb_len[15:0]} != 17'd0) begin
+					tb_rd_r <= 1'b1; tb_lba_r <= 32'd1; tb_fetch_sec <= 8'd0; tb_to <= 18'd0;
+					// Arm the streaming accounting HERE -- a fetch is starting, and this
+					// is the only point where "no sector is resident yet" is true.
+					tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b1;
+					tb_state <= TBS_DATA;
+				end else tb_state <= TBS_RDY;                // status-only
 			end
 		// data: HPS returns tb_len bytes across ceil(tb_len/512) sectors, one per
 		// LBA (1..N). Each lands at buffer offset tb_fetch_sec*256; fetch the next
@@ -1381,13 +1532,50 @@ always @(posedge clk) begin
 			if (tb_ack) tb_rd_r <= 1'b0;
 			tb_to <= tb_to + 1'b1;
 			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
-				if ((tb_fetch_sec + 4'd1) >= tb_nsec) tb_state <= TBS_RDY;
-				else begin
-					tb_fetch_sec <= tb_fetch_sec + 5'd1;
-					tb_lba_r     <= tb_lba_r + 32'd1;
-					tb_rd_r      <= 1'b1;
-					tb_to        <= 18'd0;
+				tb_sec_done <= tb_sec_done + 9'd1;         // this sector is resident
+				if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) begin
+					tb_fetch_busy <= 1'b0;
+					tb_state <= TBS_RDY;
+				end else begin
+					// Hand over to TBS_STREAM as soon as the FIRST sector is in: the
+					// Mac can start taking bytes now, and the rest of the response
+					// arrives behind it. Waiting for all N (the old behaviour) is
+					// what capped a response at the buffer size.
+					tb_fetch_sec  <= tb_fetch_sec + 8'd1;
+					tb_lba_r      <= tb_lba_r + 32'd1;
+					tb_rd_r       <= 1'b1;
+					tb_to         <= 18'd0;
+					tb_fetch_busy <= 1'b1;
+					tb_state      <= TBS_STREAM;
 				end
+			end
+		end
+		// GET streaming: same fetch loop as TBS_DATA, but the main FSM has already
+		// left PHASE_TB and the serve is running. Two rules keep the ring honest:
+		// the serve stalls on tb_sec_done (REQ gating, see tb_srv_stall) and the
+		// fetch stalls here when it is TB_MAXSEC ahead of the byte being served,
+		// which is the slot it would otherwise overwrite.
+		// tb_fetch_busy (not tb_rd_r) is what says a read is outstanding: tb_rd_r
+		// is cleared the moment tb_ack rises, so testing it here would miss the
+		// completion entirely and the sector count would never advance.
+		TBS_STREAM: begin
+			if (tb_ack) tb_rd_r <= 1'b0;
+			tb_to <= tb_to + 1'b1;
+			if (tb_fetch_busy) begin
+				if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
+					tb_fetch_busy <= 1'b0;
+					tb_sec_done   <= tb_sec_done + 9'd1;
+					if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) tb_state <= TBS_RDY;
+				end
+			end else if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) tb_state <= TBS_RDY;
+			// Throttle: never fetch into a ring slot whose bytes the Mac has not
+			// taken yet. TB_MAXSEC slots separate the fetch from the serve.
+			else if (({1'd0, tb_fetch_sec} + 9'd1) < (tb_srv_sec + {4'd0, TB_MAXSEC})) begin
+				tb_fetch_sec  <= tb_fetch_sec + 8'd1;
+				tb_lba_r      <= tb_lba_r + 32'd1;
+				tb_rd_r       <= 1'b1;
+				tb_to         <= 18'd0;
+				tb_fetch_busy <= 1'b1;
 			end
 		end
 		// round-trip done; the main FSM consumes tb_status/tb_len and leaves
@@ -1399,7 +1587,7 @@ end
 
 `ifdef SIMULATION
 // Toolbox round-trip trace: run the bench with +tb_debug.
-reg [2:0] tb_state_dbg;
+reg [3:0] tb_state_dbg;
 always @(posedge clk) begin
 	tb_state_dbg <= tb_state;
 	if ((tb_state != tb_state_dbg) && $test$plusargs("tb_debug"))
@@ -1687,7 +1875,7 @@ wire [31:0] data_len =
 		 cmd_request_sense?((sense_len < 32'd18) ? sense_len : 32'd18):
 		 cmd_tb_devinfo?tb_devinfo_len:                       // 0xD9 DEVICE INFO
 		 cmd_tb_debug_get?32'd1:                              // 0xD6 get = one flag byte
-		 (cmd_tb_fs_in || cmd_cdc_in)?{16'd0, tb_srv_len}:    // 0xD0/D1/D2 fs + 0xD7/DA CD-changer DataIn (HPS length)
+		 (cmd_tb_fs_in || cmd_cdc_in)?{15'd0, tb_srv_len}:    // 0xD0/D1/D2 fs + 0xD7/DA CD-changer DataIn (HPS length)
 		 cmd_tb_send_prep?32'd33:                             // 0xD3 SEND PREP: 33-byte filename
 		 // 0xD4 SEND DATA: the DataOut phase is ALWAYS one full 512-byte block.
 		 // CDB[6] (512-blocks) / CDB[1..2] (legacy byte count) say how many of
@@ -1954,12 +2142,16 @@ wire       tb_send_tail     = cmd_tb_send_data && (TB_ADDRW > 8);     // ship bu
 // Clamped to TB_SEND_CAP so a client that ignores our advertised capability
 // cannot overrun the buffer: the payload sits at byte 16, so 16 + N must fit in
 // 2 * 2^TB_ADDRW bytes. TB_ADDRW=12 (8 KB) holds 4 KB comfortably.
-localparam [31:0] TB_SEND_CAP = (TB_ADDRW >= 12) ? 32'd4096 : 32'd512;
+// Streaming (2026-07-31) decouples this from the buffer: a chunk is collected
+// through the ring, so the cap is the protocol's, not the RAM's. 64 KB covers
+// the official client's 127-block (65024 B) chunk. It stays a CLAMP -- a client
+// that asks for more than we will collect must not overrun the ring.
+localparam [31:0] TB_SEND_CAP = (TB_ADDRW >= 12) ? 32'd65536 : 32'd512;
 wire [31:0] tb_send_raw = (cmd[6] != 8'd0) ? {15'd0, cmd[6], 9'd0} : 32'd512;
 wire [31:0] tb_send_len = (tb_send_raw > TB_SEND_CAP) ? TB_SEND_CAP : tb_send_raw;
 // Last buffer sector the payload touches = (16 + N - 1) >> 9. Sector 0 is the
 // CDB block, so sectors 1..tb_tail_last are the tail blocks to ship first.
-wire [4:0]  tb_tail_last = (tb_send_len[15:0] + 16'd15) >> 9;
+wire [8:0]  tb_tail_last = ({1'b0,tb_send_len[15:0]} + 17'd15) >> 9;
 wire       cmd_tb_debug     = TOOLBOX_ENABLE && tb_ready && (op_code == 8'hd6);      // TOGGLE DEBUG
 wire       cmd_tb_debug_get = cmd_tb_debug && (cmd[1] != 8'd0);    // CDB[1]!=0 -> read flag
 wire       tb_devinfo_caps  = cmd_tb_devinfo && (cmd[1] == 8'h01); // subcmd 1 = capabilities
@@ -2004,6 +2196,25 @@ always @(posedge clk) begin
 end
 assign tb_srv_hold = tb_srv_active && (tb_srv_settle != 4'd0);
 
+// ---- streaming back-pressure (see the tb_stream_stall declaration) --------
+// GET: stall while the byte being served -- or the +3 a longword read grabs
+// with it -- lives in a sector the HPS has not delivered yet. tb_sec_done only
+// advances on a completed fetch, so this can never hand out a stale word.
+// The ahead term is clamped at the response tail (the same clamp rd_ahead_needed
+// applies on the disk path): past the last sector no fetch will ever arrive and
+// the host never consumes those bytes, so waiting for them would deadlock.
+wire tb_get_stall = tb_srv_active &&
+                    ((tb_srv_sec >= tb_sec_done) ||
+                     ((tb_srv_sec_ahead < tb_nsec) && (tb_srv_sec_ahead >= tb_sec_done)));
+// SEND: stall when the collect is about to reuse a ring slot whose previous
+// occupant has not been shipped. The ring is TB_MAXSEC-1 payload slots, so the
+// collect may run that far ahead of tb_ship_done and no further. In practice
+// this never fires -- the Mac needs ~2.2 ms to fill a sector and the HPS takes
+// ~0.5 ms to take one -- but it is what makes the design correct rather than
+// merely fast enough.
+wire tb_col_stall = tb_collect && ((tb_col_lba - tb_ship_done) >= (TB_MAXSEC - 5'd1));
+assign tb_stream_stall = tb_get_stall || tb_col_stall;
+
 // DEVICE INFO data (docs/BLUESCSI_HANDOFF.md §4.8): subcmd 0x00 LIST DEVICES ->
 // 8 bytes; this target's own ID = 0x00 (fixed disk present), every other ID =
 // 0xFF (absent). subcmd 0x01 GET CAPABILITIES -> API version 0 + cap flags; M0
@@ -2014,7 +2225,23 @@ assign tb_srv_hold = tb_srv_active && (tb_srv_settle != 4'd0);
 // stage a 4 KB chunk — a client that sees the flag WILL send block-encoded
 // chunks, so never advertise ahead of TB_ADDRW. 0x01 CAP_LARGE_TRANSFERS
 // (multi-block 0xD1 GET) stays off until its read path has bench coverage.
-localparam [7:0] TB_CAPS = (TB_ADDRW >= 12) ? 8'h02 : 8'h00;
+//
+// FORCED TO 0x00 (2026-07-31, HW-measured). CAP_LARGE_SEND means 32 KB sends
+// in the BlueSCSI spec, but this core caps a 0xD4 chunk at TB_SEND_CAP (4 KB)
+// and Main caps the write at TB_CHUNK_MAX (4 KB). JTAG CDB capture on the
+// official BlueSCSI SD Transfer app: with 0x02 advertised it sends CDB[6]=127
+// (65024-byte chunks) and advances its offset by the whole chunk, so ~94% of
+// every upload was silently dropped -- a 2 MB file landed as 20480 bytes with
+// 512 valid. With 0x00 the same app falls back to CDB[6]=1 (512-byte v0
+// chunks) and a 2 MB upload round-trips BYTE-EXACT. Slower, but correct.
+// Do not re-enable without honouring the full chunk end to end (core + HPS).
+//
+// NOTE: this does NOT fix downloads. The same capture shows the app issues
+// 0xD1 with CDB[6]=16 (65536 B) regardless of what we advertise, while Main
+// returns 4096 -- so exactly 1 block in 16 arrives (proven: a 2 MB download
+// round-trips as 32 correct 4 KB blocks spaced 16 apart, 480 zero blocks, 0
+// wrong). Fixing reads needs a streaming serve, not a capability flag.
+localparam [7:0] TB_CAPS = 8'h00;
 function [7:0] tb_caps_byte;
 	input [31:0] cnt;
 	begin
@@ -2288,9 +2515,11 @@ always @(posedge clk) begin
 
 		else if(phase == PHASE_TB) begin
 			// round-trip done: adopt the HPS status, then serve DataIn or finish.
-			if(tb_state == TBS_RDY) begin
+			// TBS_STREAM counts as ready: the status block and the first data
+			// sector are in, and the remaining sectors arrive behind the serve.
+			if((tb_state == TBS_RDY) || (tb_state == TBS_STREAM)) begin
 				status <= tb_status;
-				phase  <= (tb_len != 16'd0) ? PHASE_DATA_OUT : PHASE_STATUS_OUT;
+				phase  <= (tb_len != 17'd0) ? PHASE_DATA_OUT : PHASE_STATUS_OUT;
 			end
 		end
 
