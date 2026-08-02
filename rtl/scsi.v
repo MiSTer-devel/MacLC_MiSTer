@@ -1202,9 +1202,13 @@ reg        tb_fetch_busy;   // a streamed sector read is outstanding
 reg [4:0]  tb_col_slot;
 reg [7:0]  tb_col_lba;
 reg [7:0]  tb_ship_done;    // logical sectors handed to the HPS so far
-reg        tb_ship_req;     // a completed sector is waiting to be shipped
-reg [4:0]  tb_ship_slot;
-reg [7:0]  tb_ship_lba;
+// A payload sector that exhausted its ship retries. Main cannot detect a
+// missing tail block (its tb_tail[] is static and never cleared, so the
+// previous chunk's bytes stand in for it), so the CORE has to be the one that
+// refuses to call the chunk good -- see TBS_COLLW and the override in
+// TBS_LATCH. (2026-08-01, after HW-confirmed silent upload corruption.)
+reg        tb_send_fault;
+reg [4:0]  tb_ship_slot;    // rotating ring slot of the NEXT sector to ship (1..TB_MAXSEC-1)
 // SEND write position, in 512-byte blocks, accumulated across the session.
 // HW 2026-08-01: with block-encoded chunks the official client advances
 // CDB[3..5] by ONE PER CHUNK -- a chunk index, not the 512-block offset the
@@ -1281,6 +1285,10 @@ wire tb_col_sec_full = tb_collect && stb_ack && (tb_col_lin[8:0] == 9'h1ff);
 // occupant has not shipped yet. Defined HERE rather than with the other stalls
 // because the 0xD4 inter-byte watchdog below must be able to see it.
 wire tb_col_stall = tb_collect && ((tb_col_lba - tb_ship_done) >= (TB_MAXSEC - 5'd1));
+// Sectors 1..tb_col_lba-1 are complete; anything past tb_ship_done is waiting to
+// go. tb_col_lba == 0 means the collect has not produced a full sector yet (or
+// the final short one was already handed over), so nothing is pending.
+wire tb_ship_pending = (tb_col_lba != 8'd0) && (tb_ship_done < (tb_col_lba - 8'd1));
 wire [TB_ADDRW-1:0] tb_b_addr = tb_b_addr13[TB_ADDRW-1:0];
 // HPS fill address: sector tb_fetch_sec at word offset tb_fetch_sec*256, so a
 // multi-sector LIST lands contiguously (LBA 1+k -> words k*256..k*256+255).
@@ -1356,15 +1364,19 @@ always @(posedge clk) begin
 		tb_status <= 8'h02; tb_len <= 17'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
 		tb_fetch_sec <= 8'd0; tb_retry <= 7'd0; tb_get_fault <= 1'b0;
 		tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b0; tb_col_slot <= 5'd0; tb_col_lba <= 8'd0;
-		tb_ship_done <= 8'd0; tb_ship_req <= 1'b0; tb_ship_slot <= 5'd0; tb_ship_lba <= 8'd0;
+		tb_ship_done <= 8'd0; tb_ship_slot <= 5'd1;
+		tb_send_fault <= 1'b0;
 	end else if (TOOLBOX_ENABLE || CDCHANGER_ENABLE) begin
-		// A completed payload sector is latched here regardless of which state we
-		// are in, so the collect never has to wait for the FSM to look.
-		if (tb_col_sec_full && (tb_col_lba != 8'd0)) begin
-			tb_ship_req  <= 1'b1;
-			tb_ship_slot <= tb_col_slot;
-			tb_ship_lba  <= tb_col_lba;
-		end
+		// NOTE (2026-08-01): there used to be a one-deep ship mailbox here
+		// (tb_ship_req/slot/lba latched on every completed sector). It silently
+		// DROPPED sectors: while one ship is outstanding the collect keeps
+		// running -- tb_col_stall only bites 15 sectors ahead -- so a second
+		// sector completing before the FSM consumed the first simply overwrote
+		// it, and that sector was never sent. Invisible while ships took ~600
+		// cycles; a stalled HPS (or the retry below, which legitimately holds a
+		// ship for up to a watchdog period) makes it fire. The queue is now
+		// implicit and cannot overflow: sectors ship strictly in order, the next
+		// one is always tb_ship_done+1, and tb_ship_slot rotates with it.
 		if (tb_col_sec_full) begin
 			// slot 0 is the CDB block and is never recycled; the payload ring is
 			// slots 1..TB_MAXSEC-1.
@@ -1387,7 +1399,8 @@ always @(posedge clk) begin
 				// SEND payload starting: arm the collect ring. Slot 0 takes the CDB
 				// block (payload bytes 0..495 land in it too); it ships LAST.
 				tb_col_slot <= 5'd0; tb_col_lba <= 8'd0;
-				tb_ship_done <= 8'd0; tb_ship_req <= 1'b0;
+				tb_ship_done <= 8'd0; tb_ship_slot <= 5'd1;
+				tb_send_fault <= 1'b0;   // per-chunk
 				tb_state <= TBS_COLL;
 			end
 		end
@@ -1398,12 +1411,12 @@ always @(posedge clk) begin
 		// path -- payload sectors go out as LBA 1..N and the CDB block (LBA 0,
 		// which is what runs the handler) still goes last, from TBS_REQ.
 		TBS_COLL: begin
-			if (tb_ship_req) begin
-				tb_ship_req  <= 1'b0;
+			if (tb_ship_pending) begin
 				tb_fetch_sec <= {3'd0, tb_ship_slot};
-				tb_lba_r     <= {24'd0, tb_ship_lba};
+				tb_lba_r     <= {24'd0, tb_ship_done + 8'd1};   // strictly in order
 				tb_wr_r      <= 1'b1;
 				tb_to        <= 18'd0;
+				tb_retry     <= 7'd0;   // per-sector ship budget
 				tb_state     <= TBS_COLLW;
 			end else if (phase == PHASE_TB) begin
 				// Phase over. Anything still in the current slot is a short final
@@ -1413,6 +1426,7 @@ always @(posedge clk) begin
 					tb_lba_r     <= {24'd0, tb_col_lba};
 					tb_wr_r      <= 1'b1;
 					tb_to        <= 18'd0;
+					tb_retry     <= 7'd0;
 					tb_col_lba   <= 8'd0;   // one-shot: do not ship it twice
 					tb_state     <= TBS_COLLW;
 				end else begin
@@ -1421,12 +1435,52 @@ always @(posedge clk) begin
 				end
 			end else if (phase != PHASE_DATA_IN) tb_state <= TBS_IDLE;  // aborted
 		end
+		// The ship watchdog is a RETRY, not a completion (2026-08-01) — the SEND
+		// twin of the TBS_DATA fix, and the cause of a CONFIRMED HW corruption:
+		// the official client's 65024-byte chunks lost 4594 bytes per 2 MB, every
+		// corrupt region carrying data from exactly one CHUNK (-127 sectors) back,
+		// first bad byte at payload offset 496. Main's tb_tail[] is static and
+		// never cleared between chunks (mac_toolbox.cpp copies from it
+		// unconditionally), so a tail block that never lands leaves the PREVIOUS
+		// chunk's bytes at that offset. It never landed because this state used to
+		// count a timed-out ship as delivered: tb_ship_done advanced, TBS_COLL
+		// retargeted tb_fetch_sec/tb_lba_r, and an HPS descheduled past one
+		// watchdog period woke to the ADVANCED request (the write line stays up),
+		// so the stalled sector was never re-sent. Now a timeout re-arms the SAME
+		// ship with slot and LBA pinned, bounded by TB_RETRY_MAX; the collect
+		// keeps back-pressuring via tb_col_stall meanwhile. Ack-fall completion is
+		// untouched — on HW it is the primary path for uploads.
+		// Bench: scsi_bench --mode toolboxsend part B (deferred-latch WRITE model)
+		// fails on the old RTL with the exact HW signature (offset%512 == 496).
 		TBS_COLLW: begin
 			if (tb_ack) tb_wr_r <= 1'b0;
 			tb_to <= tb_to + 1'b1;
-			if ((old_tb_ack & ~tb_ack) || (&tb_to)) begin
+			if (old_tb_ack & ~tb_ack) begin
 				tb_ship_done <= tb_ship_done + 8'd1;
+				tb_ship_slot <= (tb_ship_slot >= (TB_MAXSEC - 5'd1)) ? 5'd1 : (tb_ship_slot + 5'd1);
+				tb_retry     <= 7'd0;
 				tb_state     <= TBS_COLL;
+			end else if (&tb_to) begin
+				if (tb_retry != TB_RETRY_MAX) begin
+					tb_retry <= tb_retry + 1'b1;
+					tb_to    <= 18'd0;
+					// Re-arm unless a transfer is in flight (ack high): re-raising
+					// then would blip the wire as a second request.
+					if (!tb_ack) tb_wr_r <= 1'b1;
+				end else begin
+					// ~0.8-1.6 s of re-ships and still nothing. Let the phase
+					// finish rather than wedge the bus, but latch a fault so the
+					// chunk reports CHECK: a lost tail block would otherwise be
+					// invisible (Main writes whatever tb_tail still holds), which
+					// is exactly the silent corruption this fix exists to end.
+					// tb_ship_done still advances here -- the ring must keep
+					// draining or tb_col_stall deadlocks the DataOut phase.
+					tb_send_fault <= 1'b1;
+					tb_ship_done  <= tb_ship_done + 8'd1;
+					tb_ship_slot  <= (tb_ship_slot >= (TB_MAXSEC - 5'd1)) ? 5'd1 : (tb_ship_slot + 5'd1);
+					tb_wr_r       <= 1'b0;
+					tb_state      <= TBS_COLL;
+				end
 			end
 		end
 		// write the 10-byte CDB as 5 words (0..4) into the tb buffer
@@ -1502,7 +1556,10 @@ always @(posedge clk) begin
 		TBS_LATCH:
 			if (tb_settle != 4'd0) tb_settle <= tb_settle - 1'b1;
 			else if (tb1_dout == 8'hb5) begin            // signature ok (byte 1)
-				tb_status <= tb0_dout;                       // byte 0 = SCSI status
+				// A ship that exhausted its retries makes this chunk bad no matter
+				// what the HPS says: it wrote the file from a tail buffer holding
+				// the previous chunk's bytes and reported GOOD in good faith.
+				tb_status <= tb_send_fault ? 8'h02 : tb0_dout;   // byte 0 = SCSI status
 				// bytes 2,3 = length[15:0]; byte 4 bit 0 = length[16]. Byte 4 was
 				// reserved-zero, so an HPS that does not set it reads back exactly
 				// as before. The status-only test below MUST look at all 17 bits:
