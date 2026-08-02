@@ -1225,7 +1225,8 @@ reg  [9:0] tb_retry;        // status-block re-looks / data-fetch re-arms / ship
 // hits an erase cycle it stalls far past one watchdog period. Re-look up to
 // TB_RETRY_MAX times (~0.8 s total) before giving up. (2026-07-31)
 localparam [9:0] TB_RETRY_MAX = 10'd96;
-// SEND ship re-arms get a much larger budget than the ~0.8 s used above, and
+// DATA-TRANSFER re-arms (SEND ships AND GET fetches) get a much larger budget
+// than the ~0.8 s used above, and
 // the reason is measured, not guessed: the HPS blocks its own poll loop on
 // unrelated work (a screenshot encode, an md5 of a file on the same card, any
 // OSD/file I/O), and 0.8 s is well inside that. HW 2026-08-02: with the ship
@@ -1235,7 +1236,15 @@ localparam [9:0] TB_RETRY_MAX = 10'd96;
 // PIO; only a genuinely dead HPS reaches the cap, and then CHECK is right).
 // Pre-fix builds did not "survive" these stalls -- they silently corrupted the
 // file, which is the whole defect this path exists to end.
-localparam [9:0] TB_SHIP_RETRY_MAX = 10'd512;
+//
+// Applied to the GET fetch retries too (2026-08-02): TBS_DATA/TBS_STREAM had
+// the same 0.8 s cap, so the identical stall would have aborted a DOWNLOAD via
+// tb_get_fault. Never observed in the field -- downloads survived every stall
+// this session -- but it is the same latent failure as the one measured on the
+// SEND side, and there is no reason for the two directions to differ.
+// The status-block re-looks above keep TB_RETRY_MAX: that path is HW-proven at
+// 96 and its stall (a synchronous card write) is bounded differently.
+localparam [9:0] TB_STALL_RETRY_MAX = 10'd512;
 // GET data-fetch retry budget exhausted while the serve was mid-phase: force
 // the data phase closed (data_done) and turn the status byte into CHECK — see
 // TBS_STREAM. One-shot per round trip, cleared in TBS_IDLE.
@@ -1472,7 +1481,7 @@ always @(posedge clk) begin
 				tb_retry     <= 10'd0;
 				tb_state     <= TBS_COLL;
 			end else if (&tb_to) begin
-				if (tb_retry != TB_SHIP_RETRY_MAX) begin
+				if (tb_retry != TB_STALL_RETRY_MAX) begin
 					tb_retry <= tb_retry + 1'b1;
 					tb_to    <= 18'd0;
 					// Re-arm unless a transfer is in flight (ack high): re-raising
@@ -1670,7 +1679,7 @@ always @(posedge clk) begin
 					tb_state      <= TBS_STREAM;
 				end
 			end else if (&tb_to) begin
-				if (tb_retry != TB_RETRY_MAX) begin
+				if (tb_retry != TB_STALL_RETRY_MAX) begin
 					tb_retry <= tb_retry + 1'b1;
 					tb_to    <= 18'd0;
 					// Re-arm the request line unless a fill is in flight (ack
@@ -1678,7 +1687,7 @@ always @(posedge clk) begin
 					// wire the HPS could take as a second request.
 					if (!tb_ack) tb_rd_r <= 1'b1;
 				end else begin
-					// ~0.8-1.6 s of re-looks and still nothing: the HPS is gone.
+					// ~4.2 s of re-looks and still nothing: the HPS is gone.
 					// The serve has not started (main FSM still in PHASE_TB), so
 					// fail loud as status-only CHECK, like the TBS_LATCH give-up.
 					tb_status <= 8'h02; tb_len <= 17'd0;
@@ -1707,7 +1716,7 @@ always @(posedge clk) begin
 					tb_sec_done   <= tb_sec_done + 9'd1;
 					if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) tb_state <= TBS_RDY;
 				end else if (&tb_to) begin
-					if (tb_retry != TB_RETRY_MAX) begin
+					if (tb_retry != TB_STALL_RETRY_MAX) begin
 						tb_retry <= tb_retry + 1'b1;
 						tb_to    <= 18'd0;
 						if (!tb_ack) tb_rd_r <= 1'b1;      // re-arm (see TBS_DATA)
