@@ -15,7 +15,8 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 
 - Boots **Mac OS 6.0.8, 7.1, and 7.5.5** from SCSI to the Finder desktop
 - **68020 CPU** via TG68K (with core-specific tweaks), running at the LC's native ~15.67 MHz
-- **SCSI hard disk** on ID 0 (read/write, boot). Multiple drives untested.
+- **SCSI hard disks** on IDs 0 and 1 (read/write, boot) — two drives plus the CD-ROM
+  run together
 - **File transfer** to/from the SD card via the BlueSCSI Toolbox — see
   [File transfer](#file-transfer-bluescsi-toolbox)
 - **CD-ROM drive** on SCSI ID 3 — data, mixed-mode and audio discs, including the
@@ -64,9 +65,9 @@ Main (file transfer, PRAM, CD swapping), and the guest never sees them:
 | *(no OSD entry)* | — | BlueSCSI Toolbox shared folder (host channel) |
 | *(no OSD entry)* | — | BlueSCSI Toolbox CD changer control (host channel) |
 
-The two host channels without an OSD entry are mounted automatically by the
-forked Main_MiSTer; on stock Main they stay unmounted and the features that use
-them degrade gracefully.
+The two host channels without an OSD entry are mounted automatically by an updated
+Main_MiSTer (see [Updating Main_MiSTer](#updating-main_mister)); on an older Main they
+stay unmounted and the features that use them degrade gracefully.
 
 The Toolbox file-transfer commands are answered by the **SCSI ID 0** target and the
 CD changer commands by the **ID 3** target — clients find them by INQUIRY, not by ID.
@@ -97,7 +98,8 @@ also available from the
 A tool to create hard-disk images (with driver and partition table) is available
 [here](https://diskjockey.onegeekarmy.eu/).
 
-> Multiple simultaneous SCSI drives have not been tested.
+Both drives can be mounted at once, with the CD-ROM alongside them — all three targets
+active on the bus is the normal, tested configuration.
 
 ## CD-ROM support (SCSI)
 
@@ -120,7 +122,7 @@ Image format support:
 | Format | Status |
 |---|---|
 | `.iso` / `.toast` / `.bin` (2048-byte sectors) | **Working** — verified on hardware, stock MiSTer Main |
-| `.cue`+`.bin` (2352-byte raw), `.chd` | **Working** — verified on hardware (July 2026); requires a [forked Main_MiSTer](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC) build |
+| `.cue`+`.bin` (2352-byte raw), `.chd` | **Working** — verified on hardware (July 2026); needs an updated Main_MiSTer, see [Updating Main_MiSTer](#updating-main_mister) |
 
 **CD audio is fully supported** (July 2026): audio and mixed-mode discs mount correctly
 (pure-audio discs reject data reads like a real drive — the Audio CD Access extension
@@ -166,23 +168,25 @@ commands simply report that no shared folder is available.
 ## Updating Main_MiSTer
 
 Two features — **file transfer** and **CUE/BIN + CHD CD images** — need support in
-MiSTer's main executable that is **not in an official release yet**. The changes are
-open as [PR #1255](https://github.com/MiSTer-devel/Main_MiSTer/pull/1255); until that
-is merged and included in a MiSTer update, install the binary by hand:
+MiSTer's main executable. The changes are **merged upstream**
+([PR #1255](https://github.com/MiSTer-devel/Main_MiSTer/pull/1255)) but have not
+appeared in a released MiSTer binary yet, so `update_all` / the standard updater will
+not give you them. Until a release includes them, install the binary by hand:
 
 1. Back up the existing one: `mv /media/fat/MiSTer /media/fat/MiSTer.bak`
 2. Copy [`releases/MiSTer`](releases/) (md5 `dda65f18`) to `/media/fat/MiSTer`
    and make it executable (`chmod +x /media/fat/MiSTer`).
 3. Reboot the MiSTer.
 
-Note that the normal MiSTer updater will overwrite this file with the official build,
-which silently removes both features — re-copy it after running an update, until the
-PR lands.
+Note that the normal MiSTer updater will overwrite this file with the current official
+build, which silently removes both features — re-copy it after running an update, until
+a release ships with the merged support. Once one does, the updater is all you need and
+this step goes away.
 
-Prefer to build it yourself? The source is on the
-[`add-bluescsi-toolbox-for-MacLC`](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC)
-branch; it needs an `arm-none-linux-gnueabihf` cross-toolchain (the shipped binary is
-built against a glibc 2.x baseline the MiSTer's own image satisfies).
+Prefer to build it yourself? Build from upstream
+[Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer) `master`, which now contains
+the support; it needs an `arm-none-linux-gnueabihf` cross-toolchain (the shipped binary
+is built against a glibc 2.x baseline the MiSTer's own image satisfies).
 
 ## Floppy disk support
 
