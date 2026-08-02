@@ -2462,7 +2462,16 @@ assign tb_stream_stall = tb_get_stall || tb_col_stall;
 //
 // (The app's own pre-existing defect is unrelated and still present at 0x02:
 // downloads >64 KB lose one byte per 64 KiB chunk. See the note below.)
-localparam [7:0] TB_CAPS = 8'h02;
+//
+// 2026-08-02: bit 7 is a VENDOR bit — "multi-block GET is safe" — so MacAtrium
+// can size 32 KB GETs WITHOUT bit 0 (its read path passes LARGE_XFER|0x80; see
+// MacAtrium toolbox.h TB_CAP_MISTER_XFER). Bit 7 is unallocated in the BlueSCSI
+// caps byte as far as we know, so the official app should ignore it — that is
+// an ASSUMPTION until the §4 gate test in
+// docs/resume_macatrium_fast_downloads_2026-08-02.md passes on hardware. If the
+// official app bombs on 0x82 too, revert this line to 8'h02 (the fallback is
+// MacAtrium detecting the core by INQUIRY instead — §7). Bit 0 stays CLEAR.
+localparam [7:0] TB_CAPS = 8'h82;   // bit 7 = vendor multi-block GET; bit 1 = CAP_LARGE_SEND
 function [7:0] tb_caps_byte;
 	input [31:0] cnt;
 	begin
