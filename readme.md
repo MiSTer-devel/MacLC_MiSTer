@@ -150,11 +150,14 @@ commands and MiSTer's Main serves a folder on the SD card as shared storage.
 
 1. Put files in `games/MacLC/shared` on the SD card (or set `SHARED_FOLDER=` in
    `MiSTer.ini` to point elsewhere).
-2. Run a Toolbox client in the guest. The **BlueSCSI SD Transfer** app is included as a
-   mountable disk image in [`releases/`](releases/) — mount it, then run the app from it
-   or drag it onto your boot volume.
-3. The app lists the shared folder: **Download** copies a file to the Mac, and
-   **File → Upload File** copies one back to the SD card.
+2. Install the client, once: unzip
+   [`releases/MiSTer_BlueSCSI_Toolbox_1.1.0b5.hda.zip`](releases/), put the `.hda`
+   in your `MACLC` folder, and mount it with **Mount SCSI-1** (the secondary drive).
+   It appears on the desktop — copy its contents to a folder on your boot volume,
+   then unmount it; you won't need it again.
+3. Run **BlueSCSI SD Transfer** from that folder. It lists the shared folder:
+   **Download** copies a file to the Mac, and **File → Upload File** copies one
+   back to the SD card.
 
 Both directions are verified byte-exact on hardware for multi-megabyte files
 (August 2026), at roughly 120 KB/s down and 170 KB/s up.
