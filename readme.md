@@ -7,8 +7,7 @@ which originated from the [Plus Too project](http://www.bigmessowires.com/plus-t
 emulates a Motorola 68020 CPU (via a modified TG68K core), the V8 gate array (video/glue),
 the Egret (HC05) system controller, and the LC's other peripherals.
 
-> **Work in progress.** This is an actively-developed core. Keep backups of any disk
-> images you mount.
+> **Work in progress.** This is an actively-developed core.
 
 ## Status
 
@@ -98,7 +97,7 @@ also available from the
 A tool to create hard-disk images (with driver and partition table) is available
 [here](https://diskjockey.onegeekarmy.eu/).
 
-> Multiple simultaneous SCSI drives have not been tested — keep backups.
+> Multiple simultaneous SCSI drives have not been tested.
 
 ## CD-ROM support (SCSI)
 
@@ -135,10 +134,8 @@ The drive also implements the **BlueSCSI CD changer** commands, so a guest-side 
 utility can list the discs in `games/MacLC/CD3` and swap between them without going
 through the OSD.
 
-The exact Main_MiSTer binary these features were validated against ships in
-[`releases/MiSTer`](releases/) (md5 `dda65f18`) — copy it to `/media/fat/MiSTer`
-(back up the original first). The same binary also provides the file-transfer
-support described below.
+CUE/BIN and CHD support needs the updated Main_MiSTer — see
+[Updating Main_MiSTer](#updating-main_mister).
 
 Ejecting from the Finder (drag to Trash) is honored; use the OSD to insert a
 different disc.
@@ -160,11 +157,32 @@ commands and MiSTer's Main serves a folder on the SD card as shared storage.
 Both directions are verified byte-exact on hardware for multi-megabyte files
 (August 2026), at roughly 120 KB/s down and 170 KB/s up.
 
-This requires the [forked Main_MiSTer](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC)
-build — stock Main has no Toolbox handler. The core degrades gracefully without it:
-Toolbox commands simply report that no shared folder is available.
+This requires the updated Main_MiSTer — see [Updating Main_MiSTer](#updating-main_mister).
+Stock Main has no Toolbox handler; the core degrades gracefully without it, and Toolbox
+commands simply report that no shared folder is available.
 
 *BlueSCSI Toolbox files distributed with permission from Eric Helgeson (c) 2026*
+
+## Updating Main_MiSTer
+
+Two features — **file transfer** and **CUE/BIN + CHD CD images** — need support in
+MiSTer's main executable that is **not in an official release yet**. The changes are
+open as [PR #1255](https://github.com/MiSTer-devel/Main_MiSTer/pull/1255); until that
+is merged and included in a MiSTer update, install the binary by hand:
+
+1. Back up the existing one: `mv /media/fat/MiSTer /media/fat/MiSTer.bak`
+2. Copy [`releases/MiSTer`](releases/) (md5 `dda65f18`) to `/media/fat/MiSTer`
+   and make it executable (`chmod +x /media/fat/MiSTer`).
+3. Reboot the MiSTer.
+
+Note that the normal MiSTer updater will overwrite this file with the official build,
+which silently removes both features — re-copy it after running an update, until the
+PR lands.
+
+Prefer to build it yourself? The source is on the
+[`add-bluescsi-toolbox-for-MacLC`](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC)
+branch; it needs an `arm-none-linux-gnueabihf` cross-toolchain (the shipped binary is
+built against a glibc 2.x baseline the MiSTer's own image satisfies).
 
 ## Floppy disk support
 
