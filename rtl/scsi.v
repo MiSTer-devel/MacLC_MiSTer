@@ -1219,12 +1219,23 @@ reg [4:0]  tb_ship_slot;    // rotating ring slot of the NEXT sector to ship (1.
 // when writing the CDB, so the HPS contract stays 'offset in 512-blocks' and
 // needs no change. v0 512-byte sends reproduce the client's own numbering.
 reg [23:0] tb_send_pos = 24'd0;
-reg  [6:0] tb_retry;        // status-block re-looks / data-fetch re-arms (per sector)
+reg  [9:0] tb_retry;        // status-block re-looks / data-fetch re-arms / ship re-arms (per sector)
 // A slow HPS answer must not read as "no handler". The SD is mounted
 // sync,dirsync, so one SEND chunk is a synchronous card write; when the card
 // hits an erase cycle it stalls far past one watchdog period. Re-look up to
 // TB_RETRY_MAX times (~0.8 s total) before giving up. (2026-07-31)
-localparam [6:0] TB_RETRY_MAX = 7'd96;
+localparam [9:0] TB_RETRY_MAX = 10'd96;
+// SEND ship re-arms get a much larger budget than the ~0.8 s used above, and
+// the reason is measured, not guessed: the HPS blocks its own poll loop on
+// unrelated work (a screenshot encode, an md5 of a file on the same card, any
+// OSD/file I/O), and 0.8 s is well inside that. HW 2026-08-02: with the ship
+// budget at 96 an upload aborted mid-file with CHECK whenever such a stall
+// landed — visibly, but a failed 2 MB upload all the same. 4.2 s rides those
+// out while staying bounded, and the guest waits happily (the data phase is
+// PIO; only a genuinely dead HPS reaches the cap, and then CHECK is right).
+// Pre-fix builds did not "survive" these stalls -- they silently corrupted the
+// file, which is the whole defect this path exists to end.
+localparam [9:0] TB_SHIP_RETRY_MAX = 10'd512;
 // GET data-fetch retry budget exhausted while the serve was mid-phase: force
 // the data phase closed (data_done) and turn the status byte into CHECK — see
 // TBS_STREAM. One-shot per round trip, cleared in TBS_IDLE.
@@ -1362,7 +1373,7 @@ always @(posedge clk) begin
 	if (rst) begin
 		tb_state <= TBS_IDLE; tb_rd_r <= 1'b0; tb_wr_r <= 1'b0; tb_lba_r <= 32'd0;
 		tb_status <= 8'h02; tb_len <= 17'd0; tb_load_w <= 4'd0; tb_settle <= 4'd0; tb_to <= 18'd0;
-		tb_fetch_sec <= 8'd0; tb_retry <= 7'd0; tb_get_fault <= 1'b0;
+		tb_fetch_sec <= 8'd0; tb_retry <= 10'd0; tb_get_fault <= 1'b0;
 		tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b0; tb_col_slot <= 5'd0; tb_col_lba <= 8'd0;
 		tb_ship_done <= 8'd0; tb_ship_slot <= 5'd1;
 		tb_send_fault <= 1'b0;
@@ -1387,7 +1398,7 @@ always @(posedge clk) begin
 		TBS_IDLE: begin
 			tb_load_w <= 4'd0;
 			tb_fetch_sec <= 8'd0;   // sector-0 addressing for the next LOAD/REQ/STAT
-			tb_retry <= 7'd0;                    // per-round-trip
+			tb_retry <= 10'd0;                    // per-round-trip
 			tb_get_fault <= 1'b0;                // consumed by the phase FSM by now
 			// NOTE: tb_sec_done is deliberately NOT cleared here. TBS_RDY drops
 			// through to IDLE the moment the main FSM leaves PHASE_TB -- i.e.
@@ -1416,7 +1427,7 @@ always @(posedge clk) begin
 				tb_lba_r     <= {24'd0, tb_ship_done + 8'd1};   // strictly in order
 				tb_wr_r      <= 1'b1;
 				tb_to        <= 18'd0;
-				tb_retry     <= 7'd0;   // per-sector ship budget
+				tb_retry     <= 10'd0;   // per-sector ship budget
 				tb_state     <= TBS_COLLW;
 			end else if (phase == PHASE_TB) begin
 				// Phase over. Anything still in the current slot is a short final
@@ -1426,7 +1437,7 @@ always @(posedge clk) begin
 					tb_lba_r     <= {24'd0, tb_col_lba};
 					tb_wr_r      <= 1'b1;
 					tb_to        <= 18'd0;
-					tb_retry     <= 7'd0;
+					tb_retry     <= 10'd0;
 					tb_col_lba   <= 8'd0;   // one-shot: do not ship it twice
 					tb_state     <= TBS_COLLW;
 				end else begin
@@ -1458,10 +1469,10 @@ always @(posedge clk) begin
 			if (old_tb_ack & ~tb_ack) begin
 				tb_ship_done <= tb_ship_done + 8'd1;
 				tb_ship_slot <= (tb_ship_slot >= (TB_MAXSEC - 5'd1)) ? 5'd1 : (tb_ship_slot + 5'd1);
-				tb_retry     <= 7'd0;
+				tb_retry     <= 10'd0;
 				tb_state     <= TBS_COLL;
 			end else if (&tb_to) begin
-				if (tb_retry != TB_RETRY_MAX) begin
+				if (tb_retry != TB_SHIP_RETRY_MAX) begin
 					tb_retry <= tb_retry + 1'b1;
 					tb_to    <= 18'd0;
 					// Re-arm unless a transfer is in flight (ack high): re-raising
@@ -1611,7 +1622,7 @@ always @(posedge clk) begin
 					// is the only point where "no sector is resident yet" is true.
 					// tb_retry restarts too: whatever the status re-looks consumed
 					// must not shrink the data path's per-sector budget.
-					tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b1; tb_retry <= 7'd0;
+					tb_sec_done <= 9'd0; tb_fetch_busy <= 1'b1; tb_retry <= 10'd0;
 					tb_state <= TBS_DATA;
 				end else tb_state <= TBS_RDY;                // status-only
 			end
@@ -1641,7 +1652,7 @@ always @(posedge clk) begin
 			if (tb_ack) tb_rd_r <= 1'b0;
 			tb_to <= tb_to + 1'b1;
 			if (old_tb_ack & ~tb_ack) begin
-				tb_retry    <= 7'd0;                       // per-sector budget
+				tb_retry    <= 10'd0;                       // per-sector budget
 				tb_sec_done <= tb_sec_done + 9'd1;         // this sector is resident
 				if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) begin
 					tb_fetch_busy <= 1'b0;
@@ -1691,7 +1702,7 @@ always @(posedge clk) begin
 			tb_to <= tb_to + 1'b1;
 			if (tb_fetch_busy) begin
 				if (old_tb_ack & ~tb_ack) begin
-					tb_retry      <= 7'd0;                 // per-sector budget
+					tb_retry      <= 10'd0;                 // per-sector budget
 					tb_fetch_busy <= 1'b0;
 					tb_sec_done   <= tb_sec_done + 9'd1;
 					if (({1'd0, tb_fetch_sec} + 9'd1) >= tb_nsec) tb_state <= TBS_RDY;
