@@ -1,5 +1,35 @@
 # Resume — fast MacAtrium downloads via a vendor capability bit (2026-08-02)
 
+**✅ MISSION COMPLETE (2026-08-02 PM session). The gate PASSED — do not re-run.**
+Core `1c4c159f` (`TB_CAPS = 8'h82`, commit `422e261`, STA +0.176 ns) validated on
+hardware, full §4 matrix:
+
+1. **GATE ×2 fresh boots:** official BlueSCSI SD Transfer app clean on 0x82 —
+   zero bombs, reached its overwrite prompt and completed every download.
+2. **Official app unchanged:** 118–120 KB/s down, 173 KB/s up — and the full
+   download+upload round trip came back **byte-exact** (`c42818…`; the shipped
+   MiSTer client build evidently also fixes the old 64K-chunk byte loss).
+3. **NEW MacAtrium (`0feaf68`, LARGE_XFER|0x80 mask): downloads 91 KB/s (was
+   33)**, round trip byte-exact against the pristine fixture md5.
+4. **OLD MacAtrium vs new core:** degrades cleanly to 4 KB GETs at exactly
+   33 KB/s — works, never misbehaves.
+
+Shipped: `releases/MacLC_20260802.rbf` (md5 `1c4c159f…`). The SD's guest disk
+now carries the vendor-bit MacAtrium build (old image kept as
+`Mac68KColorGames_v1_prev20260802.hda`); `MACLC.s4` CD attach restored;
+`shared/` left as found (Machine Data.bin / MacsBug.bin / TBT.BIN pristine).
+
+Drive tooling for future sessions: `/media/fat/mmouse.py` — evdev injection
+via the PHYSICAL mouse's event node (`Composite Device Mouse` in
+/proc/bus/input/devices). A freshly created uinput mouse gets its MOTION
+forwarded by Main but its BUTTONS dropped; the Remote ws API has no mouse
+channel at all ("invalid"). Verbs: pinwalk/cw/dcw/drag (pin = corner-clamp
+sweep; walks are 1:1, no acceleration compensation needed on this guest).
+SFGetFile type-select gotcha: in /MacAtrium, "images" sorts before "Incoming" —
+type "in", not "i". Historical content below.
+
+---
+
 Paste the block below as the opening message of the next session. It spans TWO
 repos: this core and MacAtrium (`~/repos/MacAtrium` in WSL — see
 [[macatrium-wsl-env]]).
