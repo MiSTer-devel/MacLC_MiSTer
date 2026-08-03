@@ -918,6 +918,12 @@ module emu
 			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
 			dsk_int_hd  <= (dio_addr == 737280) ||
 			               (dc42_skip && dc42_disk_format == 8'd3);
+			$display("SIM: floppy0 download end dio_addr(words)=%0d dc42=%b fmt=%02x -> ds=%b ss=%b mfm=%b hd=%b",
+			         dio_addr, dc42_skip, dc42_disk_format,
+			         (dio_addr == 409600) || (dc42_skip && (dio_addr == 409642 || dio_addr == 419242)),
+			         (dio_addr == 204800) || (dc42_skip && (dio_addr == 204842 || dio_addr == 209642)),
+			         (dio_addr == 368640) || (dio_addr == 737280) || (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3)),
+			         (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3));
 		end
 		if(diskEject[0]) begin
 			dsk_int_ds <= 0;

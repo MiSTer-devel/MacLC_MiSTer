@@ -507,6 +507,24 @@ module dataController_top(
 	assign snd_vol = ~via_pa_oe[2:0] | via_pa_o[2:0];
 	assign driveSel = ~via_pa_oe[4] | via_pa_o[4];  // Drive select from VIA PA4
 	assign SEL = ~via_pa_oe[5] | via_pa_o[5];
+
+`ifdef SIMULATION
+	// PA trace: SEL (PA5/HDSEL) picks the drive sense bank (regs 8-F) and the
+	// head; the Sony driver toggles it with read-modify-writes around every
+	// high-bank sense read. Diff against the MAME capture's "V8-PA5 HDSEL -> x".
+	reg [7:0] dbg_pa_o_d = 8'hxx, dbg_pa_oe_d = 8'hxx;
+	reg [11:0] dbg_pa_cnt = 0;
+	always @(posedge clk32) begin
+		if ((via_pa_o != dbg_pa_o_d || via_pa_oe != dbg_pa_oe_d) && dbg_pa_cnt < 12'd600) begin
+			dbg_pa_cnt <= dbg_pa_cnt + 1'd1;
+			$display("VIA-PA: o=%02x oe=%02x -> SEL=%b driveSel=%b @%0t",
+			         via_pa_o, via_pa_oe, ~via_pa_oe[5] | via_pa_o[5],
+			         ~via_pa_oe[4] | via_pa_o[4], $time);
+			dbg_pa_o_d  <= via_pa_o;
+			dbg_pa_oe_d <= via_pa_oe;
+		end
+	end
+`endif
 	assign vid_alt = ~via_pa_oe[6] | via_pa_o[6];
 
 	// Port B - Mac LC Egret/CUDA interface (V8 protocol)
