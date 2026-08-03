@@ -186,9 +186,11 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
   (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO
   reference). Release fits no longer carry the JTAG probe decks — an
-  always-on anchor in MacLC.sv (4dfb463) pins the SCSI capture cones; do
+  always-on anchor in MacLC.sv (4dfb463, extended 2026-08-03 with per-disk
+  read-ring words after the 11-word anchor proved insufficient on the
+  post-floppy netlist) pins the SCSI capture + ring-serve cones; do
   not remove it (comment block explains), and gate every new fit in the
-  FINDER on colour icons on colour icons (see the probes-off anchor comment in MacLC.sv).
+  FINDER on colour icons (see the probes-off anchor comment in MacLC.sv).
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
 - CD-ROM (SCSI ID 3, OSD slot `SC4`): data, mixed-mode, and audio CDs.

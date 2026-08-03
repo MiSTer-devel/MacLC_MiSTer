@@ -46,6 +46,8 @@ module dataController_top(
 	output [31:0] dbg_ncr2,   // req_deferred/req_bus + IRQ machine + counters
 	output [31:0] dbg_wr,     // write-stall snapshot (DATA_IN target)
 	output [31:0] dbg_wrfb,   // write first-beat forensics (JTAG WRFB)
+	output [31:0] dbg_ring0,  // disk-0 read-ring bookkeeping (anchor feed)
+	output [31:0] dbg_ring1,  // disk-1 read-ring bookkeeping (anchor feed)
 	input selectSCC,
 	input selectIWM,
 	input selectVIA,
@@ -476,7 +478,9 @@ module dataController_top(
 		.dbg_cdur(dbg_cdur),
 		.dbg_ncr2(dbg_ncr2),
 		.dbg_wr(dbg_wr),
-		.dbg_wrfb(dbg_wrfb)
+		.dbg_wrfb(dbg_wrfb),
+		.dbg_ring0(dbg_ring0),
+		.dbg_ring1(dbg_ring1)
 	);
 
 	// onesec (VIA1 CA2) is derived from the fixed 60.15 Hz system tick — see

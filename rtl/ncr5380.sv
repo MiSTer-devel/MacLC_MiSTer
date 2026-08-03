@@ -143,6 +143,10 @@ module ncr5380
 	//   [13]=irq_latch [14]=scsi_req_bus [15]=req_deferred
 	//   [31:16]=req_drop_count (scsi_req 1->0 edges while dma_en — REQ pauses)
 	output      [31:0] dbg_ncr2,
+	// Read-ring serve/refill bookkeeping per disk target (scsi.v dbg_ring),
+	// consumed ONLY by the always-on marginality anchor in MacLC.sv.
+	output      [31:0] dbg_ring0,
+	output      [31:0] dbg_ring1,
 	// JTAG debug (PSCW): write-stall snapshot of whichever target is in the
 	// WRITE data phase (PHASE_DATA_IN=3); defaults to target 1 (the
 	// OSD-mounted disk usually lands there). Layout = scsi.v dbg_wrstall:
@@ -655,6 +659,7 @@ module ncr5380
 	wire [31:0]     target_selsnap[DEVS];  // JTAG debug: selection/command handshake
 	wire [31:0]     target_wrstall[DEVS];  // JTAG debug: write-stall snapshot (PSCW)
 	wire [31:0]     target_wrfb[DEVS];     // JTAG debug: write first-beat forensics (WRFB)
+	wire [31:0]     target_ring[DEVS];     // read-ring bookkeeping (anchor feed)
 	wire [DEVS-1:0] target_bsy;
 
 	// Count SCSI bus resets (Mac asserting ICR.RST) -- the abort/retry signal.
@@ -791,7 +796,8 @@ module ncr5380
 		.dbg_wrsnap( ),
 		.dbg_selsnap( ),
 		.dbg_wrstall( ),
-		.dbg_wrfb( )
+		.dbg_wrfb( ),
+		.dbg_ring( )
 	);
 
 	generate
@@ -873,7 +879,8 @@ module ncr5380
 				.dbg_wrsnap( target_wrsnap[i] ),
 				.dbg_selsnap( target_selsnap[i] ),
 				.dbg_wrstall( target_wrstall[i] ),
-				.dbg_wrfb( target_wrfb[i] )
+				.dbg_wrfb( target_wrfb[i] ),
+				.dbg_ring( target_ring[i] )
 			);
 		end
 	endgenerate
@@ -909,6 +916,10 @@ module ncr5380
 	assign dbg_scsi4 = { dbg_rst_count, target_hs2[1], target_hs2[0] };
 
 	assign dbg_scsi5 = { target_cmd[1], target_cmd[0] };
+
+	// Anchor feeds: per-disk read-ring bookkeeping, straight through.
+	assign dbg_ring0 = target_ring[0];
+	assign dbg_ring1 = target_ring[1];
 
 	// ---- JTAG probe feeds (PSNC / PSWL / PSCW) — synthesizable, mirror
 	// ---- lbmactwo's dbg_min decode layouts exactly. ----------------------

@@ -701,6 +701,7 @@ module emu
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w, dbg_wrfb_w;
+	wire [31:0] dbg_ring0_w, dbg_ring1_w;  // read-ring bookkeeping (anchor-only)
 	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
 	wire [31:0] dbg_cdur_w;
 	wire [23:0] overlay_trigger_addr;
@@ -1181,6 +1182,17 @@ module emu
 	                                   anchor_cda3, anchor_cda4, anchor_cdur;
 	(* preserve, noprune *) reg [31:0] anchor_psdt, anchor_psds, anchor_psd2,
 	                                   anchor_psd3, anchor_wrfb;
+	// (2026-08-03) Extension: the 11-word anchor above proved INSUFFICIENT on
+	// the post-floppy netlist — probes-off SEED-7 fit ccb82d32 corrupted the
+	// Finder colour-icon read path with the anchor present, while the ISSP
+	// deck on the same RTL/seed lineage passed the gate + 3-boot soak. The
+	// recurring failure fingerprint of this class is RING-STALE serving
+	// (f5a3dec, 082dcc4, e66fd82, 2026-08-03): a ring slot served at/past the
+	// rd_hps_blk fill boundary. These two words pin that exact cone — the
+	// stall comparators, fill counter, and look-ahead adder of each disk
+	// target (scsi.v dbg_ring; comparator nets shared with io_busy by
+	// construction). Same law as above: never remove, ifdef, or fold.
+	(* preserve, noprune *) reg [31:0] anchor_ring0, anchor_ring1;
 	always @(posedge clk_sys) begin
 		anchor_cda0 <= dbg_cda0_w;
 		anchor_cda1 <= dbg_cda1_w;
@@ -1193,6 +1205,8 @@ module emu
 		anchor_psd2 <= sdma_snap_ncr;
 		anchor_psd3 <= sdma_snap_wr;
 		anchor_wrfb <= dbg_wrfb_w;
+		anchor_ring0 <= dbg_ring0_w;
+		anchor_ring1 <= dbg_ring1_w;
 	end
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
@@ -1541,6 +1555,8 @@ module emu
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
 		.dbg_wrfb(dbg_wrfb_w),
+		.dbg_ring0(dbg_ring0_w),
+		.dbg_ring1(dbg_ring1_w),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),
