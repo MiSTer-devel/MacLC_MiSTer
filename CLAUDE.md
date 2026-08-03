@@ -188,7 +188,7 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   reference). Release fits no longer carry the JTAG probe decks — an
   always-on anchor in MacLC.sv (4dfb463) pins the SCSI capture cones; do
   not remove it (comment block explains), and gate every new fit in the
-  FINDER on colour icons per docs/resume_probes_off_hunt_2026-07-29.md §3.
+  FINDER on colour icons on colour icons (see the probes-off anchor comment in MacLC.sv).
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
 - CD-ROM (SCSI ID 3, OSD slot `SC4`): data, mixed-mode, and audio CDs.
@@ -199,7 +199,7 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   2026-07-29 (MODE SELECT/SENSE page 0x0E scales the CD-DA PCM),
   alongside 0x42 sub-channel formats 2/3, 0x44 READ HEADER, 0x45 PLAY
   AUDIO, 0xBB SET CD SPEED and mode page 0x2A — see
-  docs/resume_cd_commands_2026-07-30.md.
+  the CD command notes in rtl/scsi.v.
 - **★ Gating CD work: DETACH the CD image from the boot config first**
   (`mv /media/fat/config/MACLC.s4 …bak`), and OSD-mount after the
   desktop is up. The open CUE/CHD-at-boot-attach hang fires

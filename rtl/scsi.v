@@ -451,7 +451,7 @@ reg    wr_pending;
 // At a just-in-time fill the capture read the ring slot's PREVIOUS occupant:
 // TIM Voices 1 fork 0x18200 got 0x8080 (the bytes exactly one ring-depth =
 // 4 KB earlier) instead of 0x3840; deterministic, 2 runs x 2 builds
-// (docs/resume_prompt_2026-07-29.md §8, CD sector 49385+512). Stall REQ
+// (HW 2026-07-29, CD sector 49385+512). Stall REQ
 // until every byte the transaction can touch is in the ring. rd_ahead_needed
 // clamps at the transfer TAIL, where +3 pokes past the last armed block: no
 // fetch would ever arrive (deadlock), and the host never consumes those
@@ -2468,7 +2468,7 @@ assign tb_stream_stall = tb_get_stall || tb_col_stall;
 // MacAtrium toolbox.h TB_CAP_MISTER_XFER). Bit 7 is unallocated in the BlueSCSI
 // caps byte as far as we know, so the official app should ignore it — that is
 // an ASSUMPTION until the §4 gate test in
-// docs/resume_macatrium_fast_downloads_2026-08-02.md passes on hardware. If the
+// the vendor-bit gate passes on hardware. If the
 // official app bombs on 0x82 too, revert this line to 8'h02 (the fallback is
 // MacAtrium detecting the core by INQUIRY instead — §7). Bit 0 stays CLEAR.
 localparam [7:0] TB_CAPS = 8'h82;   // bit 7 = vendor multi-block GET; bit 1 = CAP_LARGE_SEND
