@@ -210,6 +210,7 @@ module swim
 		.dskReadAddr(dskReadAddrInt),
 		.dskReadAck(dskReadAckInt),
 		.dskReadData(dskReadData),
+		.ism_active(ism_mode),
 		.mfm_disk(diskMFM[0]),
 		.mfm_hd(diskHD[0]),
 		.mfm_byte(mfm_byte_int),
@@ -255,6 +256,7 @@ module swim
 		.dskReadAddr(dskReadAddrExt),
 		.dskReadAck(dskReadAckExt),
 		.dskReadData(dskReadData),
+		.ism_active(ism_mode),
 		.mfm_disk(diskMFM[1]),
 		.mfm_hd(diskHD[1]),
 		.mfm_byte(mfm_byte_ext),
@@ -507,6 +509,16 @@ module swim
 				acc_addr_l <= cpuAddrRegHi;
 				acc_rw_l   <= _cpuRW;
 				acc_data_l <= dataInLo;
+
+				// MAME's "any non-0xF SWIM access resets the switch counter" is
+				// applied LEVEL-wise, not at acc_end: cen is clk_sys/4, so two
+				// back-to-back CPU accesses can share a single sampled UDS-low
+				// window and merge into one acc_end. A missed reset is the one
+				// error that matters here — it lets an unrelated run of mode
+				// register writes complete the 1,0,1,1 pattern and drop us into
+				// ISM behind the driver's back. Resetting early is harmless: the
+				// deliberate switch sequence is four consecutive 0xF writes.
+				if (!ism_mode && cpuAddrRegHi != 4'hF) iwm_to_ism_counter <= 0;
 			end
 
 			// ============================================================

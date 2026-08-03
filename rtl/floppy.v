@@ -91,6 +91,8 @@ module floppy
 	// an MFM disk is in and the motor runs, a decoded byte falls off the head
 	// every 16 us (HD) / 32 us (DD). Each delivery latches the encoder's output
 	// and strobes mfm_stb for one cep period (the SWIM samples it on cen).
+	input            ism_active, // SWIM is in ISM mode: the phase lines are ISM
+	                             // register traffic, not IWM drive commands
 	input            mfm_disk,   // this disk is MFM (use the MFM generator for fetch+bytes)
 	input            mfm_hd,     // 1.44MB HD (18 spt) vs 720K DD (9 spt)
 	output reg [7:0] mfm_byte,   // delivered decoded MFM byte
@@ -136,9 +138,17 @@ module floppy
 	// same wires as MAME's m_reg = {ss,ca2,ca1,ca0} (floppy.cpp mac_floppy::wpt_r).
 	// THE OS IDENTIFIES THE DRIVE by reading sense regs 0xC,0xD,0xE,0xF and matching
 	// a 4-bit pattern (wpt_r comment "Initial state of bits f-c = 2M,ready,MFM,rd1"):
-	//   0000=400K GCR, 1010=800K GCR, x011=SuperDrive (x=HD hole of inserted disk).
-	// => SuperDrive+HD = 1011, SuperDrive+DD = 0011. So we must report:
-	//   reg 0xF (our [15] DRVIN)     = is_2m  = mfm_hd   (1 = 1.44MB HD disk)
+	//   0000=400K GCR, 1010=800K GCR, x011=SuperDrive (x=is_2m of inserted disk).
+	// ★ POLARITY (settled by the MAME 0.264 RUNTIME capture, which watched both
+	// disks actually mount — findings_mame_floppy_groundtruth_2026-07-02.md §4;
+	// it OVERTURNED the earlier source-reading guess that HD reports 1):
+	//   is_2m = 1 -> DD disk -> the OS mounts via GCR/IWM  => SuperDrive+DD = 1011
+	//   is_2m = 0 -> HD disk -> the OS mounts via MFM/ISM  => SuperDrive+HD = 0011
+	// Do NOT "fix" this back; inverting it sends 800K disks down MFM and 1.44M
+	// disks down GCR, and both then fail. HW-confirmed 2026-08-03: with is_2m=0
+	// a 1.44M disk takes the ISM path (its dialog differs from the GCR one).
+	// So we must report:
+	//   reg 0xF (our [15] DRVIN)     = is_2m  = ~mfm_hd  (1 = DD disk, 0 = HD)
 	//   reg 0xE (our [13] READY)     = 0      (0 = ready, Apple active-low)
 	//   reg 0xD (our [11] MFMModeOn) = 1      (m_mfm dflt = has_mfm on a SuperDrive)
 	//   reg 0xC (our [9]  RDDATA1)   = 1      (motor-off RdData reads 1)
@@ -428,7 +438,18 @@ module floppy
 			ejectIndicatorTimer <= 24'd0;
 		end 
 		else if(cep) begin
-			if (_enable == 1'b0 && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1) begin
+			// EJECT is ignored while the SWIM is in ISM mode. The ISM Phases
+			// register drives the SAME ca0-2/LSTRB lines as the IWM soft
+			// switches, and the register walks the driver/ROM perform there
+			// pass through $FF = {LSTRB=1, ca2=1, ca1=1, ca0=1}, which this
+			// layer decodes as driveWriteAddr 6 (EJECT) + ca2=1 = "eject the
+			// disk". With a drive selected by ISM devsel that silently ejected
+			// the just-inserted image on every per-mount ISM probe, so the
+			// internal drive could never hold a disk (2026-08-03: the primary
+			// drive stopped reacting to mounts entirely; the external drive was
+			// unaffected because it is not the drive ISM selects). An ISM read
+			// session never needs to eject.
+			if (_enable == 1'b0 && !ism_active && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1) begin
 				// eject the disk
 				driveRegs[`DRIVE_REG_CSTIN] <= 1'b1;
 				ejectIndicatorTimer <= 24'hFFFFFF;
