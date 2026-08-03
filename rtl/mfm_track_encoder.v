@@ -56,7 +56,10 @@ module mfm_track_encoder
 
 	output reg [7:0]  odata,   // current decoded MFM byte
 	output reg        omark,   // current byte is an address-mark (A1) -> ISM M_MARK
-	output reg        ocrc0    // current byte completes a valid CRC field -> ISM M_CRC0
+	output reg        ocrc0,   // current byte completes a valid CRC field -> ISM M_CRC0
+	output            oneeds   // current byte is sector payload (odata = idata):
+	                           // the consumer must not deliver it until the SDRAM
+	                           // fetch for `addr` has landed in idata
 );
 
 	// ---- sector geometry ----------------------------------------------------
@@ -105,6 +108,7 @@ module mfm_track_encoder
 
 	reg [3:0] state;
 	reg [9:0] cnt;          // byte index within the current state (max 511)
+	assign oneeds = (state == S_DATA);
 	reg [4:0] sector;       // current sector index (0..spt_max)
 	reg [8:0] src_offset;   // byte within the current sector's data (0..511)
 	reg [15:0] crc;

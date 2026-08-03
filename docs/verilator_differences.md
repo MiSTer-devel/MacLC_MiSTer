@@ -12,7 +12,19 @@ CPU-glue or top-level wiring fix must be made in **both** files or sim and FPGA
 silently diverge. (This has bitten us before — e.g. sim once hardwired
 `.berr(1'b0)`, masking the MOVES bus-error fix.)
 
-Last audited: 2026-06-12 (cold-load reset hardening added FPGA-only — see below).
+Last audited: 2026-08-02 (sim MFM floppy detection wired — see below).
+
+**2026-08-02 — sim floppy MFM/HD detection un-hardwired (both tops now
+equivalent):** `sim.v` used to pass `.diskMFM(2'b00)/.diskHD(2'b00)` ("MFM path
+not exercised"). With the ISM read engine implemented it now mirrors
+`MacLC.sv`'s mount detection: `dsk_{int,ext}_{mfm,hd}` latched at download end
+from the raw word count (368640 = 720K, 737280 = 1.44M) or the DC42
+`disk_format` byte (word 40 low byte, values 2/3), the latter newly latched in
+sim's DC42 block. `--floppy0/--floppy1 <img>` therefore exercises the full
+ISM/MFM read path in sim. Remaining sim-only difference: none for floppy;
+MacLC.sv additionally latches `dsk_*_ds/ss` from `dc42_disk_format` 0/1 while
+sim keys GCR sizes off byte counts (+42-word DC42 variants) — same outcomes for
+valid images.
 
 **2026-06-13 — floppy byte-demux fix (both tops, kept identical):** the disk
 image is packed 2 bytes/SDRAM-word; the byte returned to the track encoder must

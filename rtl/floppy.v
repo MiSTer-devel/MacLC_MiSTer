@@ -87,13 +87,16 @@ module floppy
 	input dskReadAck,
 	input [7:0] dskReadData,
 
-	// MFM (ISM/SWIM) read path — 720K/1.44MB
-	input        mfm_disk,   // this disk is MFM (use the MFM generator for fetch+bytes)
-	input        mfm_hd,     // 1.44MB HD (18 spt) vs 720K DD (9 spt)
-	input        mfm_pull,   // SWIM ISM read: advance one decoded byte
-	output [7:0] mfm_byte,   // current decoded MFM byte
-	output       mfm_mark,   // current byte is an address-mark (A1)
-	output       mfm_crc0,   // current byte completes a valid CRC field
+	// MFM (ISM/SWIM) read path — 720K/1.44MB. The disk spins on its own: while
+	// an MFM disk is in and the motor runs, a decoded byte falls off the head
+	// every 16 us (HD) / 32 us (DD). Each delivery latches the encoder's output
+	// and strobes mfm_stb for one cep period (the SWIM samples it on cen).
+	input            mfm_disk,   // this disk is MFM (use the MFM generator for fetch+bytes)
+	input            mfm_hd,     // 1.44MB HD (18 spt) vs 720K DD (9 spt)
+	output reg [7:0] mfm_byte,   // delivered decoded MFM byte
+	output reg       mfm_mark,   // delivered byte is an address-mark (A1)
+	output reg       mfm_crc0,   // delivered byte completes a valid CRC field
+	output reg       mfm_stb,    // 1-cep-period delivery strobe
 
 	// --- diagnostic ports (PFLP probes; safe to leave dangling when unused) ---
 	// Ported from lbmactwo_MiSTer ac44312 (the debug deck that root-caused its
@@ -219,27 +222,81 @@ module floppy
 		.odata   ( dskReadDataEnc )
 	);
 
-	// MFM (ISM-mode) track encoder — 720K/1.44MB. Advances one decoded byte each
-	// time the SWIM pulls (mfm_pull rising edge); shares the same SDRAM fetch latch
-	// (dskReadDataLatch) and head position (driveTrack/driveSide) as the GCR path.
-	reg mfm_pull_d;
-	always @(posedge clk) mfm_pull_d <= mfm_pull;
-	wire mfm_adv = mfm_pull & ~mfm_pull_d;
+	// MFM (ISM-mode) track encoder — 720K/1.44MB. Free-runs at the byte-cell
+	// rate below; shares the same SDRAM fetch latch (dskReadDataLatch) and head
+	// position (driveTrack/driveSide) as the GCR path.
+	wire [7:0] mfm_odata;
+	wire       mfm_omark, mfm_ocrc0, mfm_needs_data;
+	reg        mfm_ready_pulse;
 
 	mfm_track_encoder menc
 	(
-		.clk   ( clk ),
-		.ready ( mfm_adv ),
-		.rst   ( !_reset ),
-		.side  ( driveSide ),
-		.track ( driveTrack ),
-		.hd    ( mfm_hd ),
-		.addr  ( mfmReadAddr ),
-		.idata ( dskReadDataLatch ),
-		.odata ( mfm_byte ),
-		.omark ( mfm_mark ),
-		.ocrc0 ( mfm_crc0 )
+		.clk    ( clk ),
+		.ready  ( mfm_ready_pulse ),
+		.rst    ( !_reset ),
+		.side   ( driveSide ),
+		.track  ( driveTrack ),
+		.hd     ( mfm_hd ),
+		.addr   ( mfmReadAddr ),
+		.idata  ( dskReadDataLatch ),
+		.odata  ( mfm_odata ),
+		.omark  ( mfm_omark ),
+		.ocrc0  ( mfm_ocrc0 ),
+		.oneeds ( mfm_needs_data )
 	);
+
+	// ---- MFM byte-cell delivery timer -----------------------------------
+	// HD MFM = 500 kbit/s = 16 us/byte = 130 cep ticks @8.125 MHz; DD = 260.
+	// Payload bytes (oneeds) additionally wait for a post-advance SDRAM fetch:
+	// mfm_fresh means idata belongs to the encoder's CURRENT addr. One ack is
+	// skipped after each advance so an in-flight pre-advance ack can't hand us
+	// the previous byte's data. The internal-drive extra slot acks every ~2 us,
+	// so a stall only stretches the odd byte (the driver is poll-driven).
+	wire       mfm_spinning = mfm_disk && motor && ~driveRegs[`DRIVE_REG_CSTIN];
+	wire [8:0] mfm_period   = mfm_hd ? 9'd129 : 9'd259;
+	reg  [8:0] mfm_timer;
+	reg        mfm_fresh;
+	reg        mfm_ack_skip;
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			mfm_timer       <= 9'd0;
+			mfm_fresh       <= 1'b0;
+			mfm_ack_skip    <= 1'b0;
+			mfm_ready_pulse <= 1'b0;
+			mfm_stb         <= 1'b0;
+			mfm_byte        <= 8'h00;
+			mfm_mark        <= 1'b0;
+			mfm_crc0        <= 1'b0;
+		end else begin
+			mfm_ready_pulse <= 1'b0;   // 1-clk advance pulse to the encoder
+			if (cep) begin
+				mfm_stb <= 1'b0;
+				// idata freshness: the fetch latch lands on cep && dskReadAckD
+				if (dskReadAckD) begin
+					if (mfm_ack_skip) mfm_ack_skip <= 1'b0;
+					else              mfm_fresh    <= 1'b1;
+				end
+				if (!mfm_spinning) begin
+					mfm_timer <= mfm_period;
+				end
+				else if (mfm_timer != 0) begin
+					mfm_timer <= mfm_timer - 9'd1;
+				end
+				else if (!mfm_needs_data || mfm_fresh) begin
+					// deliver the current byte, then advance the encoder
+					mfm_byte        <= mfm_odata;
+					mfm_mark        <= mfm_omark;
+					mfm_crc0        <= mfm_ocrc0;
+					mfm_stb         <= 1'b1;
+					mfm_ready_pulse <= 1'b1;
+					mfm_fresh       <= 1'b0;
+					mfm_ack_skip    <= 1'b1;
+					mfm_timer       <= mfm_period;
+				end
+				// else: payload byte not fetched yet — stall until an ack lands
+			end
+		end
+	end
 
 	// SDRAM fetch address: the MFM generator for MFM disks, else the GCR encoder.
 	assign dskReadAddr = mfm_disk ? mfmReadAddr : gcrReadAddr;
