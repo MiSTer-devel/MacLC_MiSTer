@@ -1167,7 +1167,7 @@ module emu
 	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
 	// path on hardware (Finder colour-icon noise → error-11 / F-Line bombs)
 	// while every probe-bearing fit passes; STA is met either way and does not
-	// predict it (docs/resume_probes_off_hunt_2026-07-29.md §5). A two-way
+	// predict it (HW-bisected 2026-07-29: observer-only FAILED, ISSP-only PASSED). A two-way
 	// bisect isolated the protective effect to the fanout of the 11 top-level
 	// ISSP probes below — NOT the dbg_probes observer deck: observer-only
 	// (54b6c8e1) bombed the Finder on boot 1; ISSP-only (063c2354) passed the

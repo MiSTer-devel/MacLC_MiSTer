@@ -7,8 +7,7 @@ which originated from the [Plus Too project](http://www.bigmessowires.com/plus-t
 emulates a Motorola 68020 CPU (via a modified TG68K core), the V8 gate array (video/glue),
 the Egret (HC05) system controller, and the LC's other peripherals.
 
-> **Work in progress.** This is an early, actively-developed core. Expect bugs and data loss.
-> Keep backups of any disk images you mount.
+> **Work in progress.** This is an actively-developed core.
 
 ## Status
 
@@ -16,11 +15,15 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 
 - Boots **Mac OS 6.0.8, 7.1, and 7.5.5** from SCSI to the Finder desktop
 - **68020 CPU** via TG68K (with core-specific tweaks), running at the LC's native ~15.67 MHz
-- **SCSI hard disk** on ID 6 (read/write, boot). Multiple drives untested.
-- **CD-ROM drive** on SCSI ID 3 (read-only, data discs). ISO images verified on hardware
-  (July 2026); needs a CD driver in the guest System — see
+- **SCSI hard disks** on IDs 0 and 1 (read/write, boot) — two drives plus the CD-ROM
+  run together
+- **File transfer** to/from the SD card via the BlueSCSI Toolbox — see
+  [File transfer](#file-transfer-bluescsi-toolbox)
+- **CD-ROM drive** on SCSI ID 3 — data, mixed-mode and audio discs, including the
+  AppleCD Audio Player. Needs a CD driver in the guest System — see
   [CD-ROM support](#cd-rom-support-scsi).
-- **Display:** 512×384 (12" RGB) or 640×480 (VGA), **1bpp and 2bpp black & white only**
+- **Color display** — 1/2/4/8/16bpp, 512×384 (12" RGB) or 640×480 (VGA)
+- **Sound**, including CD audio
 - **Memory:** 2 MB or 10 MB configurations
 - **PRAM/NVRAM:** save (on entering the OSD), automatic load at core start (or forced load),
   and clear
@@ -28,8 +31,7 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 
 ### Not working yet
 
-- **Color** — any video mode above 2bpp (4/8/16bpp)
-- **Sound** (silent on hardware; plays in simulation)
+- **QuickTime video playback**
 - **Floppy disks**
 
 ## Usage
@@ -37,6 +39,8 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 1. Copy the `*.rbf` to the root of your MiSTer SD card.
 2. Place the 512 KB Mac LC ROM as `boot0.rom` in the `MACLC` folder.
 3. Place a bootable SCSI hard-disk image (`.vhd` / `.img` / `.hda`) in the `MACLC` folder.
+4. Optional: put files to share with the Mac in `games/MacLC/shared` — see
+   [File transfer](#file-transfer-bluescsi-toolbox).
 
 Open the on-screen display with **F12** to mount images and change options.
 
@@ -46,28 +50,56 @@ The core requires the 512 KB Macintosh LC ROM (version `$67C`, checksum `$350EAC
 placed as `boot0.rom`. The ROM is loaded into SDRAM at core start; changing it requires
 a reset/reload.
 
+## SCSI bus layout
+
+Three real targets sit on the emulated SCSI bus. The remaining OSD slots are
+**not SCSI devices** — they are private channels the core uses to talk to MiSTer's
+Main (file transfer, PRAM, CD swapping), and the guest never sees them:
+
+| OSD slot | SCSI ID | Purpose |
+|---|---|---|
+| `Mount SCSI-0` | **0** | Primary hard disk (boot device) |
+| `Mount SCSI-1` | **1** | Secondary hard disk |
+| `Mount CD-ROM` | **3** | CD-ROM drive |
+| `Mount PRAM` | — | PRAM/NVRAM save image (host channel) |
+| *(no OSD entry)* | — | BlueSCSI Toolbox shared folder (host channel) |
+| *(no OSD entry)* | — | BlueSCSI Toolbox CD changer control (host channel) |
+
+The two host channels without an OSD entry are mounted automatically by an updated
+Main_MiSTer (see [Updating Main_MiSTer](#updating-main_mister)); on an older Main they
+stay unmounted and the features that use them degrade gracefully.
+
+The Toolbox file-transfer commands are answered by the **SCSI ID 0** target and the
+CD changer commands by the **ID 3** target — clients find them by INQUIRY, not by ID.
+
 ## Hard disk support (SCSI)
 
 The on-screen display exposes two SCSI slots:
 
-- **Mount SCSI-6** — primary drive (ID 6), the usual boot device
-- **Mount SCSI-5** — secondary drive (ID 5)
+- **Mount SCSI-0** — primary drive (SCSI ID 0), the usual boot device
+- **Mount SCSI-1** — secondary drive (SCSI ID 1)
+
+> **The disk IDs are 0 and 1** (they were 6 and 5 in earlier builds). The boot SCSI ID
+> is stored in PRAM, so an existing install blessed for ID 6 will not boot until you
+> run **Reset PRAM & Core** — or re-bless the volume for its new ID.
 
 Images use a raw SCSI format (same as the SCSI2SD project, documented
 [here](http://www.codesrc.com/mediawiki/index.php?title=HFSFromScratch)) with a `.vhd`,
 `.img`, or `.hda` extension. The SCSI disk is writable; data written from within the OS is
 persisted to the image file.
 
-Cold boots of System 6.0.8, 7.1, and 7.5.5 to the Finder desktop have been verified (July 2026,
-after a series of SCSI reliability fixes: a registered CPU status-read path, DREQ data-settle
-pacing to stop byte slip, and read-prefetch/completion-IRQ fixes). A blank 20 MB image with
+Cold boots of System 6.0.8, 7.1, and 7.5.5 to the Finder desktop have been verified, and
+SCSI writes were validated byte-exact on hardware (July 2026) after a series of reliability
+fixes: a registered CPU status-read path, DREQ data-settle pacing to stop byte slip,
+read-prefetch/completion-IRQ fixes, and a write word-pairing fix. A blank 20 MB image with
 a partition table and SCSI driver is included as `releases/empty_hdd.zip`; a matching image is
 also available from the
 [MacPlus core releases](https://github.com/MiSTer-devel/MacPlus_MiSTer/tree/master/releases).
 A tool to create hard-disk images (with driver and partition table) is available
 [here](https://diskjockey.onegeekarmy.eu/).
 
-> Multiple simultaneous SCSI drives have not been tested. Expect data loss — keep backups.
+Both drives can be mounted at once, with the CD-ROM alongside them — all three targets
+active on the bus is the normal, tested configuration.
 
 ## CD-ROM support (SCSI)
 
@@ -90,21 +122,68 @@ Image format support:
 | Format | Status |
 |---|---|
 | `.iso` / `.toast` / `.bin` (2048-byte sectors) | **Working** — verified on hardware, stock MiSTer Main |
-| `.cue`+`.bin` (2352-byte raw), `.chd` | **Working** — verified on hardware (July 2026); requires a [forked Main_MiSTer](https://github.com/danifunker/Main_MiSTer/tree/add-bluescsi-toolbox-for-MacLC) build |
+| `.cue`+`.bin` (2352-byte raw), `.chd` | **Working** — verified on hardware (July 2026); needs an updated Main_MiSTer, see [Updating Main_MiSTer](#updating-main_mister) |
 
 **CD audio is fully supported** (July 2026): audio and mixed-mode discs mount correctly
 (pure-audio discs reject data reads like a real drive — the Audio CD Access extension
 depends on that), and the **AppleCD Audio Player** works end to end: full track listing
 with durations, play, pause/resume, next/previous track, stop, and fast-forward/rewind
-scan with audio. CD audio requires `.cue`+`.bin` or `.chd` images (and therefore the
-forked Main, below) — flat 2048-byte images carry no audio tracks.
+scan with audio, and the player's **volume slider** scales the audio. CD audio requires
+`.cue`+`.bin` or `.chd` images (and therefore the forked Main, below) — flat 2048-byte
+images carry no audio tracks.
 
-The exact Main_MiSTer binary these features were validated against ships in
-[`releases/MiSTer`](releases/) (md5 `9d5f18d3`) — copy it to `/media/fat/MiSTer`
-(back up the original first).
+The drive also implements the **BlueSCSI CD changer** commands, so a guest-side changer
+utility can list the discs in `games/MacLC/CD3` and swap between them without going
+through the OSD.
+
+CUE/BIN and CHD support needs the updated Main_MiSTer — see
+[Updating Main_MiSTer](#updating-main_mister).
 
 Ejecting from the Finder (drag to Trash) is honored; use the OSD to insert a
 different disc.
+
+## File transfer (BlueSCSI Toolbox)
+
+Files move between the SD card and the running Mac using the **BlueSCSI Toolbox**
+protocol — no floppies or network needed. The core answers the Toolbox vendor SCSI
+commands and MiSTer's Main serves a folder on the SD card as shared storage.
+
+1. Put files in `games/MacLC/shared` on the SD card (or set `SHARED_FOLDER=` in
+   `MiSTer.ini` to point elsewhere).
+2. Install the client, once: unzip
+   [`releases/MiSTer_BlueSCSI_Toolbox_1.1.0b5.hda.zip`](releases/), put the `.hda`
+   in your `MACLC` folder, and mount it with **Mount SCSI-1** (the secondary drive).
+   It appears on the desktop — copy its contents to a folder on your boot volume,
+   then unmount it; you won't need it again.
+3. Run **BlueSCSI SD Transfer** from that folder. It lists the shared folder:
+   **Download** copies a file to the Mac, and **File → Upload File** copies one
+   back to the SD card.
+
+Both directions are verified byte-exact on hardware for multi-megabyte files
+(August 2026), at roughly 120 KB/s down and 170 KB/s up.
+
+This requires the updated Main_MiSTer — see [Updating Main_MiSTer](#updating-main_mister).
+Stock Main has no Toolbox handler; the core degrades gracefully without it, and Toolbox
+commands simply report that no shared folder is available.
+
+*BlueSCSI Toolbox files distributed with permission from Eric Helgeson (c) 2026*
+
+## Updating Main_MiSTer
+
+Two features — **file transfer** and **CUE/BIN + CHD CD images** — need support in
+MiSTer's main executable. The changes are **merged upstream**
+([PR #1255](https://github.com/MiSTer-devel/Main_MiSTer/pull/1255)) but have not
+appeared in a released MiSTer binary yet, so `update_all` / the standard updater will
+not give you them. Until a release includes them, install the binary by hand:
+
+1. Back up the existing one: `cp /media/fat/MiSTer /media/fat/MiSTer.orig`
+2. cp `/media/fat/games/MacLC/MiSTer /media/fat/MiSTer` and make it executable (`chmod +x /media/fat/MiSTer`).
+3. Reboot the MiSTer.
+
+Note that the normal MiSTer updater will overwrite this file with the current official
+build, which silently removes both features — re-copy it after running an update, until
+a release ships with the merged support. Once one does, the updater is all you need and
+this step goes away.
 
 ## Floppy disk support
 
@@ -169,7 +248,7 @@ The core supports two monitors, selectable in the OSD:
 - **640×480 VGA**
 - **512×384 12" RGB** (the LC's "Macintosh 12-inch RGB Display")
 
-Only 1bpp and 2bpp black/white and color modes currently render correctly (but no color is displayed in any mode). Aspect ratio and scaling
+All the LC's colour depths render — 1, 2, 4, 8 and 16bpp. Aspect ratio and scaling
 options are available in the OSD.
 
 ## Keyboard & mouse
@@ -210,4 +289,5 @@ development workflow.
 
 - **MacPlus MiSTer** core by Sorgelig
 - **Plus Too** by Steve Chamberlin (Big Mess o' Wires)
+- **BlueSCSI Toolbox** protocol and client by [Eric Helgeson](https://github.com/erichelgeson)
 - Mac LC port and ongoing development by [danifunker](https://github.com/danifunker) and [alanswx](https://github.com/alanswx)

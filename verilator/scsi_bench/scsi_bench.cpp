@@ -29,6 +29,7 @@
 #include <vector>
 #include <string>
 #include <deque>
+#include <algorithm>
 
 #include "Vscsi_bench_top.h"
 #include "verilated.h"
@@ -60,6 +61,154 @@ static uint8_t ramp(uint64_t off) {
 	return (uint8_t)((off & 0xff) ^ ((off >> 8) & 0xff) ^ ((off >> 16) & 0xff));
 }
 
+// ---------------- HPS BlueSCSI Toolbox model ----------------
+// Faithful mirror of ../Main_MiSTer/toolbox.cpp, so the desk bench exercises the
+// exact wire contract the box runs:
+//   request  (tb_wr @LBA0) : CDB at [0..9], SEND payload at [16..]
+//   request  (tb_wr @LBA1) : the SEND payload bytes that do not fit under the
+//                            CDB (payload[496..511]) — the 2026-07-30 tail block
+//   status   (tb_rd @LBA0) : {status, 0xB5, len_hi, len_lo}
+//   data     (tb_rd @LBA1+k): DataIn payload, 512 bytes per block
+// The upload store uses fseek/fwrite semantics (a write past the end leaves a
+// zero-filled hole) so transport byte-slip shows up as it does on the SD card.
+static const uint8_t TB_SIG = 0xB5;    // status-block signature (Main: toolbox.cpp)
+struct TbFile { std::string name; std::vector<uint8_t> data; };
+struct TbHps {
+	std::vector<TbFile>  files;
+	std::vector<uint8_t> resp;
+	uint8_t              status = 0x02;
+	int                  get_idx = -1;         // file open for GET
+	std::vector<uint8_t> upload;               // SEND destination bytes
+	std::string          upload_name;
+	bool                 upload_open = false;
+	// Tail request blocks LBA 1..TB_TAIL_BLKS, flattened: payload byte P >= 496
+	// sits at tail[P - 496]. 512-byte chunks use one block; a 4 KB large-send
+	// chunk spans eight (mirrors Main_MiSTer 952994d).
+	// 64 KB since the streaming rework (2026-07-31), matching the new HPS: the
+	// official client sends 127x512 chunks and asks for 16x4096 reads.
+	static const uint32_t CHUNK_MAX = 65536;
+	static const uint32_t TAIL_BLKS = (CHUNK_MAX + 16 - 1) / 512;   // 128
+	uint8_t              tail[TAIL_BLKS * 512];
+	uint64_t             reqs = 0, fills = 0;
+	// Which tail LBAs actually arrived before the CDB block ran the handler.
+	// Main has no such tracking (that is the point -- it copies tb_tail blind),
+	// so this is bench-only diagnosis of WHICH block went missing.
+	bool                 tail_seen[TAIL_BLKS + 1] = {};
+	int                  last_missing = -1, last_missing_cnt = 0;
+
+	TbHps() { memset(tail, 0, sizeof(tail)); }
+
+	void reset() {
+		resp.clear(); status = 0x02; get_idx = -1;
+		upload.clear(); upload_name.clear(); upload_open = false;
+		memset(tail, 0, sizeof(tail)); reqs = fills = 0;
+	}
+
+	// ---- 0xD2 COUNT / 0xD0 LIST ----
+	void op_count() { resp.push_back((uint8_t)files.size()); status = 0x00; }
+	void op_list() {
+		for (size_t i = 0; i < files.size(); i++) {
+			uint8_t fe[40] = {};
+			fe[0] = (uint8_t)i; fe[1] = 0x01;                 // index, type=file
+			for (size_t c = 0; c < files[i].name.size() && c < 32; c++) fe[2+c] = (uint8_t)files[i].name[c];
+			uint32_t sz = (uint32_t)files[i].data.size();
+			fe[36] = sz >> 24; fe[37] = sz >> 16; fe[38] = sz >> 8; fe[39] = sz;
+			resp.insert(resp.end(), fe, fe + 40);
+		}
+		status = 0x00;
+	}
+	// ---- 0xD1 GET (host -> Mac), 4096-byte blocks ----
+	void op_get(const uint8_t* cdb) {
+		const uint32_t BLOCK = 4096;
+		uint32_t offset = ((uint32_t)cdb[2]<<24)|((uint32_t)cdb[3]<<16)|((uint32_t)cdb[4]<<8)|cdb[5];
+		uint32_t blocks = cdb[6] ? cdb[6] : 1;
+		uint32_t want   = blocks * BLOCK;
+		if (want > CHUNK_MAX) want = CHUNK_MAX;                // cap only, not a clamp to 4 KB
+		if (offset == 0) get_idx = (cdb[1] < files.size()) ? cdb[1] : -1;
+		if (get_idx < 0) { status = 0x02; return; }
+		const std::vector<uint8_t>& d = files[get_idx].data;
+		uint64_t base = (uint64_t)offset * BLOCK;
+		uint32_t got  = (base >= d.size()) ? 0 : (uint32_t)std::min<uint64_t>(want, d.size() - base);
+		resp.assign(d.begin() + (size_t)base, d.begin() + (size_t)base + got);
+		if (!got) get_idx = -1;
+		status = 0x00;
+	}
+	// ---- 0xD3/D4/D5 SEND (Mac -> host) ----
+	void op_send_prep(const uint8_t* buf) {
+		char name[33]; int n = 0;
+		for (int i = 0; i < 32; i++) { uint8_t c = buf[16+i]; if (!c) break; name[n++] = (char)c; }
+		name[n] = 0;
+		if (!n) { status = 0x02; return; }
+		upload_name = name; upload.clear(); upload_open = true; status = 0x00;
+	}
+	void op_send_data(const uint8_t* buf) {
+		if (!upload_open) { status = 0x02; return; }
+		{	// diagnosis: which tail blocks this chunk needs, and which arrived
+			uint32_t nb    = buf[6] ? (uint32_t)buf[6]*512 : (((uint32_t)buf[1]<<8)|buf[2]);
+			if (nb > CHUNK_MAX) nb = CHUNK_MAX;
+			int need = (nb > 496) ? (int)((nb - 496 + 511) / 512) : 0;
+			last_missing = -1; last_missing_cnt = 0;
+			for (int k = 1; k <= need; k++)
+				if (!tail_seen[k]) { if (last_missing < 0) last_missing = k; last_missing_cnt++; }
+			for (int k = 0; k <= (int)TAIL_BLKS; k++) tail_seen[k] = false;
+		}
+		uint32_t off   = ((uint32_t)buf[3]<<16)|((uint32_t)buf[4]<<8)|buf[5];        // 512-blocks
+		uint32_t bytes = buf[6] ? (uint32_t)buf[6]*512 : (((uint32_t)buf[1]<<8)|buf[2]);
+		if (bytes > CHUNK_MAX) bytes = CHUNK_MAX;
+		static uint8_t chunk[CHUNK_MAX];   // 64 KB: must NOT be a stack array
+		uint32_t head = bytes < 496 ? bytes : 496;
+		memcpy(chunk, buf + 16, head);
+		if (bytes > 496) memcpy(chunk + 496, tail, bytes - 496);   // tail block
+		size_t pos = (size_t)off * 512;
+		if (upload.size() < pos + bytes) upload.resize(pos + bytes, 0);  // fseek hole = zeros
+		memcpy(&upload[pos], chunk, bytes);
+		status = 0x00;
+	}
+	void op_send_end() {
+		if (!upload_open) { status = 0x02; return; }
+		upload_open = false; status = 0x00;
+	}
+
+	void request(uint32_t lba, const uint8_t* buf) {
+		reqs++;
+		if (lba >= 1 && lba <= TAIL_BLKS) {
+			memcpy(tail + (lba-1)*512, buf, 512);
+			tail_seen[lba] = true;
+			return;
+		}
+		if (lba != 0) return;
+		resp.clear(); status = 0x02;
+		switch (buf[0]) {
+		case 0xD2: op_count();         break;
+		case 0xD0: op_list();          break;
+		case 0xD1: op_get(buf);        break;
+		case 0xD3: op_send_prep(buf);  break;
+		case 0xD4: op_send_data(buf);  break;
+		case 0xD5: op_send_end();      break;
+		default:   status = 0x02;      break;
+		}
+	}
+	void fill(uint32_t lba, uint8_t* buf) {
+		fills++;
+		memset(buf, 0, 512);
+		if (lba == 0) {
+			// 17-bit length (2026-07-31): bytes 2..3 carry length[15:0] and byte 4
+			// bit 0 carries length[16]. A CDB[6]=16 GET asks for exactly 65536,
+			// which a BE16 field cannot express -- the old 0xFFFF clamp cost one
+			// byte per 64 KB chunk, and this client zero-fills what it does not
+			// receive. Byte 4 was reserved-zero, so old cores are unaffected.
+			size_t   full = (resp.size() > 0x1FFFF) ? 0x1FFFF : resp.size();
+			uint16_t len  = (uint16_t)(full & 0xFFFF);
+			buf[0] = status; buf[1] = TB_SIG; buf[2] = len >> 8; buf[3] = len & 0xFF;
+			buf[4] = (uint8_t)((full >> 16) & 1);
+		} else {
+			size_t off = (size_t)(lba - 1) * 512;
+			if (off < resp.size()) memcpy(buf, resp.data() + off, std::min<size_t>(512, resp.size() - off));
+		}
+	}
+};
+static TbHps tbx;
+
 // ---------------- HPS block-device model ----------------
 // READ fetch (io_rd): (latency) -> io_ack=1, stream 256 words into the target
 // (1 word / 2 cycles, sim byte-packing: disk byte0 in sd_buff_dout[15:8]),
@@ -67,21 +216,74 @@ static uint8_t ramp(uint64_t off) {
 // capture sd_buff_din_N into the written-image store, io_ack=0.
 // scsi.v bumps lba / rd_hps_blk / sd_buff_sel on the io_ack falling edge.
 struct Hps {
-	enum St { IDLE, WAIT, STREAM, WWAIT, WCAP, FINISH } st = IDLE;
+	enum St { IDLE, WAIT, STREAM, WWAIT, WCAP, FINISH,
+	          TBWWAIT, TBWCAP, TBRWAIT, TBRSTREAM, TBFINISH, TBAHOLD,
+	          TBRDEFER, TBWDEFER } st = IDLE;
 	int t = 0, wi = 0, tgt = 0;
 	bool was_write = false;
 	uint32_t lba = 0;
 	int latency = 600;
 	uint64_t fetches = 0, flushes = 0;
 	std::vector<uint8_t> written;   // captured write-flush image (lba*512 indexed)
+	uint8_t tbblk[512] = {};        // in-flight Toolbox request/response block
 
-	void reset() { st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear(); }
+	// Slow-HPS injection. /media/fat is mounted sync,dirsync, so one SEND chunk
+	// is a synchronous card write and the card can stall well past the core's
+	// ~262144-cycle (~8 ms) watchdog. Every tb_slow_every'th tb READ is answered
+	// after tb_slow_latency cycles instead of `latency`.
+	int tb_slow_every = 0, tb_slow_latency = 0;
+	uint64_t tb_reads = 0;
+	int cur_tb_latency = 600;
+
+	// Deferred-LATCH stall injection (2026-08-01, the GET stale-sector race).
+	// tb_slow_every models a stall AFTER Main latched the request (lba and data
+	// captured at issue, the stream just late). The HW corruption needs the
+	// OTHER stall: Main descheduled BEFORE its poll loop even saw tb_rd, so
+	// nothing is latched until it wakes — and what it then latches is the LIVE
+	// tb_lba, which a watchdog-advancing core has already moved past the stalled
+	// sector. Every tb_defer_every'th tb READ sits unlatched for
+	// tb_defer_latency cycles first. Sized ~1.5 watchdog periods, this skips
+	// exactly one sector on watchdog-as-completion RTL: the field signature
+	// (one 512-byte block served one full ring cycle stale).
+	int tb_defer_every = 0, tb_defer_latency = 0;
+	uint64_t tb_defers = 0;
+
+	// The same deferred latch on the WRITE (upload) side — the SEND counterpart,
+	// confirmed on HW 2026-08-01: the official client's 65024-byte chunks lost
+	// 4594 bytes per 2 MB, and the stale data came from exactly one chunk back.
+	// Main's tb_tail[] is static and never cleared between chunks, so a tail
+	// block that never arrives leaves the PREVIOUS chunk's bytes at that offset
+	// (mac_toolbox.cpp: memcpy(chunk+496, tb_tail, ...) copies unconditionally).
+	// A core whose ship watchdog counts a stalled write as delivered advances
+	// its lba while we sleep, so the sector we wake up to is the NEXT one and
+	// the stalled one is never sent again. Every tb_wdefer_every'th tb WRITE
+	// sleeps tb_wdefer_latency cycles before looking at the request.
+	int tb_wdefer_every = 0, tb_wdefer_latency = 0;
+	uint64_t tb_writes = 0, tb_wdefers = 0, tb_wlost = 0;
+	uint32_t lba_at_defer = 0;   // what the core was asking for when we dozed off
+
+	// Ack-fall model. The core's 2026-07-21 comment records that on HW the tb
+	// READ ack fall is NOT observed, so the ~8 ms watchdog — not the ack — is
+	// what advances the round trip. This bench completes on the ack fall by
+	// default, i.e. it exercises a path HW does not use, which is exactly how a
+	// core regression that broke every Toolbox command on hardware still passed
+	// every mode. tb_ack_hold > the watchdog holds tb_ack high past the
+	// force-latch so the WATCHDOG is the completion path and the ack fall lands
+	// late and stale, the way HW appears to behave.
+	int tb_ack_hold = 0;   // 0 = drop tb_ack promptly (original model)
+
+	void reset() {
+		st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear();
+		tb_reads = 0; cur_tb_latency = latency; tb_defers = 0;
+		tb_writes = tb_wdefers = tb_wlost = 0;
+	}
 
 	void service() {
 		switch (st) {
 		case IDLE:
 			top->sd_buff_wr = 0;
 			top->io_ack = 0;
+			top->tb_ack = 0;
 			for (int i = 0; i < 2; i++) {
 				if ((top->io_rd >> i) & 1) {
 					tgt = i;
@@ -97,6 +299,34 @@ struct Hps {
 					st = WWAIT; t = 0;
 					break;
 				}
+			}
+			// Toolbox slot (target 0). Disk io and tb round-trips never overlap:
+			// the target is mid-command in PHASE_TB while the tb transfer runs.
+			if (st == IDLE && top->tb_wr) {
+				tb_writes++;
+				if (tb_wdefer_every && (tb_writes % tb_wdefer_every) == 0) {
+					// Descheduled before polling: latch nothing yet, but remember
+					// what was on the wire so we can tell a retry from a skip.
+					tb_wdefers++;
+					lba_at_defer = top->tb_lba;
+					st = TBWDEFER; t = 0;
+					break;
+				}
+				lba = top->tb_lba; st = TBWWAIT; t = 0;
+			}
+			else if (st == IDLE && top->tb_rd) {
+				tb_reads++;
+				if (tb_defer_every && (tb_reads % tb_defer_every) == 0) {
+					// Main descheduled BEFORE polling: latch nothing yet.
+					tb_defers++;
+					st = TBRDEFER; t = 0;
+					break;
+				}
+				lba = top->tb_lba;
+				tbx.fill(lba, tbblk);
+				cur_tb_latency = (tb_slow_every && (tb_reads % tb_slow_every) == 0)
+				                 ? tb_slow_latency : latency;
+				st = TBRWAIT; t = 0;
 			}
 			break;
 		case WAIT:
@@ -136,6 +366,73 @@ struct Hps {
 			top->io_ack = 0;
 			if (was_write) flushes++; else fetches++;
 			st = IDLE;
+			break;
+
+		// ---- Toolbox request: core -> HPS (tb_wr). Same registered-q_a capture
+		// cadence as WCAP; the block is handed to the handler once complete.
+		case TBWWAIT:
+			if (++t >= latency) { top->tb_ack = 1; st = TBWCAP; wi = 0; t = 0; }
+			break;
+		case TBWCAP:
+			if ((t % 3) == 0) top->sd_buff_addr = wi;
+			else if ((t % 3) == 2) {
+				uint16_t w = top->tb_buff_din;
+				tbblk[wi*2]   = (uint8_t)(w >> 8);     // sim packing: even byte HIGH
+				tbblk[wi*2+1] = (uint8_t)(w & 0xff);
+				if (++wi == 256) { tbx.request(lba, tbblk); st = TBFINISH; }
+			}
+			t++;
+			break;
+		// ---- Toolbox response: HPS -> core (tb_rd), block already staged ----
+		case TBRWAIT:
+			if (++t >= cur_tb_latency) { top->tb_ack = 1; st = TBRSTREAM; wi = 0; t = 0; }
+			break;
+		case TBRSTREAM:
+			if ((t & 1) == 0) {
+				top->sd_buff_addr = wi;
+				top->sd_buff_dout = ((uint16_t)tbblk[wi*2] << 8) | tbblk[wi*2+1];
+				top->sd_buff_wr = 1;
+			} else {
+				top->sd_buff_wr = 0;
+				if (++wi == 256) st = TBFINISH;
+			}
+			t++;
+			break;
+		case TBFINISH:
+			top->sd_buff_wr = 0;
+			if (tb_ack_hold) { st = TBAHOLD; t = 0; break; }   // hold tb_ack high
+			top->tb_ack = 0;
+			st = IDLE;
+			break;
+		// tb_ack stays asserted past the core's watchdog, so the force-latch is
+		// what completes the round trip and the eventual fall arrives stale.
+		case TBAHOLD:
+			if (++t >= tb_ack_hold) { top->tb_ack = 0; st = IDLE; }
+			break;
+		// Main was descheduled before it ever polled: wake up, THEN read the
+		// LIVE request state. A core that advanced its lba while we slept gets
+		// the advanced sector served — and the one it stalled on, never.
+		case TBRDEFER:
+			if (++t >= tb_defer_latency) {
+				if (!top->tb_rd) { st = IDLE; break; }   // request withdrawn
+				lba = top->tb_lba;                       // LIVE lba, the whole point
+				tbx.fill(lba, tbblk);
+				cur_tb_latency = latency;
+				st = TBRWAIT; t = 0;
+			}
+			break;
+		// SEND counterpart of TBRDEFER. On waking we read the LIVE lba: a core
+		// that gave up on the stalled sector has already retargeted, so that
+		// sector is silently lost (tb_wlost counts it) and Main's tb_tail keeps
+		// the previous chunk's bytes there. A core that RETRIES is still holding
+		// the same lba, so nothing is lost — which is exactly the pass/fail edge.
+		case TBWDEFER:
+			if (++t >= tb_wdefer_latency) {
+				if (!top->tb_wr) { tb_wlost++; st = IDLE; break; }   // request withdrawn
+				if (top->tb_lba != lba_at_defer) tb_wlost++;         // core moved on
+				lba = top->tb_lba;
+				st = TBWWAIT; t = 0;
+			}
 			break;
 		}
 	}
@@ -273,7 +570,13 @@ static bool dma_write16(bool word, uint16_t wdata, int gap) {
 }
 
 // ---------------- SCSI Manager-style PIO ----------------
-static bool wait_csr(uint8_t mask, uint8_t val, int max_polls = 50000) {
+// Initiator patience, in CSR polls. The default matches a Mac driver that gives
+// up quickly; the slow-HPS test raises it because a legitimately stalled SD
+// write holds the target far longer than any normal round trip.
+static int csr_patience = 50000;
+
+static bool wait_csr(uint8_t mask, uint8_t val, int max_polls = 0) {
+	if (max_polls <= 0) max_polls = csr_patience;
 	for (int i = 0; i < max_polls; i++)
 		if ((reg_read(RREG_CSR) & mask) == val) return true;
 	return false;
@@ -301,6 +604,7 @@ static void reset_dut(int id_slot) {
 	bus_release();
 	top->img_mounted = 0; top->img_size = 0;
 	top->io_ack = 0; top->sd_buff_wr = 0; top->sd_buff_addr = 0; top->sd_buff_dout = 0;
+	top->tb_ack = 0; top->tb_mounted = 0;
 	hps.reset();
 	top->reset = 1;
 	for (int i = 0; i < 8; i++) tick();
@@ -874,6 +1178,773 @@ static int run_gapcmds() {
 	return fails ? 1 : 0;
 }
 
+// ---------------- BlueSCSI Toolbox transport test (toolbox) ----------------
+// Desk reproduction of the 2026-07-30 hardware failure "a lot of errors copying
+// from the Mac to the SD card". Drives target 0 (TOOLBOX_ENABLE) through the
+// real client sequence against the TbHps mirror of Main's handler:
+//
+//   0xD2 COUNT -> 0xD0 LIST (>512 B: multi-sector DataIn)
+//   0xD3 SEND PREP / 0xD4 SEND DATA x3 / 0xD5 SEND END, then byte-compare the
+//        uploaded image against the source
+//   0xD1 GET  (4096-byte block: multi-sector DataIn)
+//
+// Client model for 0xD4 (BlueSCSI SEND_FILE_10): the DataOut phase is ALWAYS a
+// full 512-byte block; CDB[6] (512-blocks) or CDB[1..2] (legacy byte count) says
+// how many of those bytes are valid. The last chunk of a file is therefore a
+// full block carrying a short valid count.
+static bool tb_select() {
+	reg_write(WREG_ODR, 0x01);                   // target SCSI ID 0
+	reg_write(WREG_ICR, ICR_DATA | ICR_SEL);
+	if (!wait_csr(CSR_BSY, CSR_BSY)) return false;
+	reg_write(WREG_ICR, ICR_DATA);
+	return true;
+}
+
+// One command: 10-byte CDB, optional DataOut payload, optional DataIn read,
+// then status + message. Returns status, or -1 on any stall.
+static int tb_cmd(const uint8_t* cdb, const uint8_t* payload, int paylen,
+                  uint8_t* din, int dinlen, const char* what) {
+	if (!tb_select()) { printf("toolbox: %s select failed\n", what); return -1; }
+	for (int i = 0; i < 10; i++)
+		if (!pio_put(cdb[i])) { printf("toolbox: %s CDB stalled at %d\n", what, i); return -1; }
+	for (int i = 0; i < paylen; i++)
+		if (!pio_put(payload[i])) {
+			printf("toolbox: %s DataOut stalled at byte %d of %d "
+			       "(target ended the data phase early)\n", what, i, paylen);
+			return -1;
+		}
+	reg_write(WREG_ICR, 0);                       // release the data bus
+	for (int i = 0; i < dinlen; i++) {
+		int v = pio_get();
+		if (v < 0) { printf("toolbox: %s DataIn stalled at %d of %d\n", what, i, dinlen); return -1; }
+		din[i] = (uint8_t)v;
+	}
+	int st = pio_get(), msg = pio_get();
+	if (msg != 0x00) { printf("toolbox: %s message %02x\n", what, msg); return -1; }
+	return st;
+}
+
+static int run_toolbox() {
+	reset_dut(0);
+	tbx.reset();
+	top->tb_mounted = 1;                          // HPS mounted the shared folder
+	for (int i = 0; i < 8; i++) tick();
+
+	// virtual shared folder: 14 entries -> LIST is 560 B (2 sectors)
+	tbx.files.clear();
+	for (int i = 0; i < 13; i++) {
+		char nm[32]; snprintf(nm, sizeof(nm), "file_%02d.bin", i);
+		tbx.files.push_back({ nm, std::vector<uint8_t>((size_t)(i * 37), (uint8_t)i) });
+	}
+	std::vector<uint8_t> big(9000);
+	for (size_t i = 0; i < big.size(); i++) big[i] = ramp(0x50000 + i);
+	tbx.files.push_back({ "big.bin", big });
+
+	int fails = 0;
+	uint8_t buf[8192];
+
+	// ---- 0xD2 COUNT FILES: 1 byte ----
+	{
+		uint8_t cdb[10] = { 0xD2, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf, 1, "COUNT");
+		if (st != 0x00) { printf("toolbox: COUNT status %02x\n", st); return 1; }
+		if (buf[0] != tbx.files.size()) {
+			printf("toolbox: COUNT = %u, want %zu\n", buf[0], tbx.files.size()); fails++;
+		}
+	}
+
+	// ---- 0xD0 LIST FILES: 14 x 40 = 560 bytes (crosses the 512-byte sector) ----
+	{
+		int want = (int)tbx.files.size() * 40;
+		uint8_t cdb[10] = { 0xD0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf, want, "LIST");
+		if (st != 0x00) { printf("toolbox: LIST status %02x\n", st); return 1; }
+		if ((int)tbx.resp.size() != want) {
+			printf("toolbox: LIST staged %zu bytes, want %d\n", tbx.resp.size(), want); fails++;
+		} else {
+			int bad = -1, nbad = 0;
+			for (int i = 0; i < want; i++) if (buf[i] != tbx.resp[i]) { if (bad < 0) bad = i; nbad++; }
+			if (bad >= 0) {
+				printf("toolbox: LIST %d/%d bytes wrong, first at %d\n", nbad, want, bad);
+				int w0 = bad > 8 ? bad - 8 : 0;
+				printf("   got :"); for (int i = w0; i < w0 + 24 && i < want; i++) printf(" %02x", buf[i]);
+				printf("\n   want:"); for (int i = w0; i < w0 + 24 && i < want; i++) printf(" %02x", tbx.resp[i]);
+				printf("\n");
+				fails++;
+			}
+		}
+	}
+
+	// ---- 0xD3/D4/D5 SEND FILE: 1408 bytes = 2 full blocks + a 384-byte tail ----
+	{
+		const int SRC = 1408;
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0x90000 + i);
+
+		uint8_t name[33] = {};
+		memcpy(name, "upload.bin", 10);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "SEND PREP");
+		if (st != 0x00) { printf("toolbox: SEND PREP status %02x\n", st); return 1; }
+
+		for (int blk = 0; blk * 512 < SRC; blk++) {
+			int valid = SRC - blk * 512; if (valid > 512) valid = 512;
+			uint8_t chunk[512];
+			memset(chunk, 0xFF, sizeof(chunk));            // client sends a full block
+			memcpy(chunk, &src[blk * 512], valid);
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			if (valid == 512) cdb[6] = 1;                   // block encoding
+			else { cdb[1] = (uint8_t)(valid >> 8); cdb[2] = (uint8_t)valid; }  // legacy count
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			char what[32]; snprintf(what, sizeof(what), "SEND DATA blk%d", blk);
+			st = tb_cmd(cdb, chunk, 512, nullptr, 0, what);
+			if (st != 0x00) { printf("toolbox: %s status %02x\n", what, st); return 1; }
+		}
+
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "SEND END");
+		if (st != 0x00) { printf("toolbox: SEND END status %02x\n", st); return 1; }
+
+		if (tbx.upload.size() != (size_t)SRC) {
+			printf("toolbox: uploaded %zu bytes, want %d (%+d)\n",
+			       tbx.upload.size(), SRC, (int)tbx.upload.size() - SRC);
+			fails++;
+		}
+		int bad = 0, first = -1;
+		for (size_t i = 0; i < src.size() && i < tbx.upload.size(); i++)
+			if (tbx.upload[i] != src[i]) { if (first < 0) first = (int)i; bad++; }
+		if (bad) {
+			printf("toolbox: upload %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+			       bad, SRC, first, tbx.upload[first], src[first]);
+			fails++;
+		}
+	}
+
+	// ---- SEND with LARGE (block-encoded) chunks: CAP_LARGE_SEND, stage 1.
+	// CDB[6] = block count, so one 0xD4 carries 4 KB in a single DataOut phase.
+	// The payload spans buffer bytes 16..4111 = sectors 0..8, so the core must
+	// ship EIGHT tail blocks (LBA 1..8) before the CDB block — a single-tail
+	// core drops everything past byte 527. Deliberately uses a size that is NOT
+	// a whole number of 4 KB chunks so the final short chunk is exercised too.
+	{
+		const int SRC = 4096 * 2 + 1536;           // 2 full 4 KB chunks + 3 blocks
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0xC5000 + i);
+
+		uint8_t name[33] = {};
+		memcpy(name, "large.bin", 9);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "LARGE PREP");
+		if (st != 0x00) { printf("toolbox: LARGE PREP status %02x\n", st); return 1; }
+
+		int blk = 0;
+		while (blk * 512 < SRC) {
+			int left   = SRC - blk * 512;
+			int blocks = (left + 511) / 512; if (blocks > 8) blocks = 8;
+			int bytes  = blocks * 512;
+			std::vector<uint8_t> chunk(bytes, 0xFF);        // client sends full blocks
+			int valid = (left < bytes) ? left : bytes;
+			memcpy(chunk.data(), &src[blk * 512], valid);
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			cdb[6] = (uint8_t)blocks;                        // block encoding
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			char what[40]; snprintf(what, sizeof(what), "LARGE DATA blk%d x%d", blk, blocks);
+			st = tb_cmd(cdb, chunk.data(), bytes, nullptr, 0, what);
+			if (st != 0x00) { printf("toolbox: %s status %02x\n", what, st); return 1; }
+			blk += blocks;
+		}
+
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "LARGE END");
+		if (st != 0x00) { printf("toolbox: LARGE END status %02x\n", st); return 1; }
+
+		if (tbx.upload.size() < (size_t)SRC) {
+			printf("toolbox: large upload %zu bytes, want >= %d\n", tbx.upload.size(), SRC);
+			fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < SRC; i++)
+				if (tbx.upload[i] != src[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: large upload %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, SRC, first, tbx.upload[first], src[first]);
+				fails++;
+			} else printf("toolbox: large-send %d bytes OK (4 KB chunks, 8 tail blocks)\n", SRC);
+		}
+	}
+
+	// ---- SEND at the OFFICIAL CLIENT's chunk size: CDB[6]=127 = 65024 bytes in
+	// ONE DataOut phase. This is the case the whole streaming rework exists for:
+	// 65024 bytes cannot be resident in an 8 KB buffer, so the core must ship
+	// each 512-byte sector to the HPS while the Mac is still filling the next.
+	// It wraps the 15-slot payload ring ~8 times per chunk, so a ring-wrap or
+	// back-pressure defect corrupts a whole sector rather than a byte or two.
+	// (HW 2026-07-31: the app really does send CDB[6]=127, JTAG CDB capture.)
+	{
+		const int CH  = 127 * 512;                 // 65024, the client's chunk
+		const int SRC = CH * 2 + 4096 + 300;       // 2 full chunks + a short tail
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0x2A000 + i * 7);
+
+		uint8_t name[33] = {};
+		memcpy(name, "huge.bin", 8);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "HUGE PREP");
+		if (st != 0x00) { printf("toolbox: HUGE PREP status %02x\n", st); return 1; }
+
+		int blk = 0;
+		while (blk * 512 < SRC) {
+			int left   = SRC - blk * 512;
+			int blocks = (left + 511) / 512; if (blocks > 127) blocks = 127;
+			int bytes  = blocks * 512;
+			std::vector<uint8_t> chunk(bytes, 0xFF);
+			int valid = (left < bytes) ? left : bytes;
+			memcpy(chunk.data(), &src[blk * 512], valid);
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			cdb[6] = (uint8_t)blocks;
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			char what[48]; snprintf(what, sizeof(what), "HUGE DATA blk%d x%d", blk, blocks);
+			st = tb_cmd(cdb, chunk.data(), bytes, nullptr, 0, what);
+			if (st != 0x00) { printf("toolbox: %s status %02x\n", what, st); return 1; }
+			blk += blocks;
+		}
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "HUGE END");
+		if (st != 0x00) { printf("toolbox: HUGE END status %02x\n", st); return 1; }
+
+		if (tbx.upload.size() < (size_t)SRC) {
+			printf("toolbox: HUGE upload %zu bytes, want >= %d\n", tbx.upload.size(), SRC);
+			fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < SRC; i++)
+				if (tbx.upload[i] != src[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: HUGE upload %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, SRC, first, tbx.upload[first], src[first]);
+				fails++;
+			} else printf("toolbox: streamed-send %d bytes OK (65024-B chunks, ring wraps)\n", SRC);
+		}
+	}
+
+	// ---- GET at the official client's request size: CDB[6]=16 = 65536 bytes.
+	// Two things under test. (1) The serve streams: the core must hand over
+	// bytes while later sectors are still being fetched, since 65536 does not
+	// fit the buffer. (2) The 17-bit length: 65536 has bytes 2..3 == 0 in the
+	// status block, so a core that reads only the BE16 field sees "no data" and
+	// skips the data phase entirely -- exactly the trap the HPS session found.
+	{
+		const int WANT = 65536;
+		tbx.files.push_back({ "big.get", {} });
+		auto &fdat = tbx.files.back().data;
+		fdat.resize(WANT);
+		for (int i = 0; i < WANT; i++) fdat[i] = ramp(0x71000 + i * 3);
+		int idx = (int)tbx.files.size() - 1;
+
+		std::vector<uint8_t> buf(WANT, 0);
+		uint8_t cdb[10] = { 0xD1, (uint8_t)idx, 0, 0, 0, 0, 16, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf.data(), WANT, "BIG GET");
+		if (st != 0x00) { printf("toolbox: BIG GET status %02x\n", st); return 1; }
+		if (tbx.resp.size() != (size_t)WANT) {
+			printf("toolbox: BIG GET staged %zu bytes, want %d\n", tbx.resp.size(), WANT);
+			fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < WANT; i++)
+				if (buf[i] != fdat[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: BIG GET %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, WANT, first, buf[first], fdat[first]);
+				fails++;
+			} else printf("toolbox: streamed-get %d bytes OK (17-bit len, ring refills)\n", WANT);
+		}
+	}
+
+	// ---- SEND with a SHORT final DataOut: the alternate client model, where the
+	// initiator transfers only the CDB's valid-byte count instead of a full
+	// block. The fixed 512-byte phase length would hang the bus without the
+	// inter-byte watchdog; check it closes the phase and the file still lands.
+	{
+		const int SRC = 700;                       // 1 full block + 188 bytes
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0xA1000 + i);
+
+		uint8_t name[33] = {};
+		memcpy(name, "short.bin", 9);
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "SHORT PREP");
+		if (st != 0x00) { printf("toolbox: SHORT PREP status %02x\n", st); return 1; }
+
+		for (int blk = 0; blk * 512 < SRC; blk++) {
+			int valid = SRC - blk * 512; if (valid > 512) valid = 512;
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+			if (valid == 512) cdb[6] = 1;
+			else { cdb[1] = (uint8_t)(valid >> 8); cdb[2] = (uint8_t)valid; }
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			if (!tb_select()) { printf("toolbox: SHORT blk%d select failed\n", blk); return 1; }
+			for (int i = 0; i < 10; i++)
+				if (!pio_put(cdb[i])) { printf("toolbox: SHORT blk%d CDB stalled %d\n", blk, i); return 1; }
+			for (int i = 0; i < valid; i++)
+				if (!pio_put(src[blk*512 + i])) { printf("toolbox: SHORT blk%d stalled at %d\n", blk, i); return 1; }
+			reg_write(WREG_ICR, 0);
+			// wait out the watchdog: phase flips to STATUS (IO=1) on its own
+			if (!wait_csr(CSR_IO, CSR_IO, 200000)) {
+				printf("toolbox: SHORT blk%d wedged in DataOut (watchdog did not fire)\n", blk);
+				return 1;
+			}
+			int s2 = pio_get(), m2 = pio_get();
+			if (s2 != 0x00 || m2 != 0x00) { printf("toolbox: SHORT blk%d status %02x msg %02x\n", blk, s2, m2); fails++; }
+		}
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "SHORT END");
+		if (st != 0x00) { printf("toolbox: SHORT END status %02x\n", st); fails++; }
+
+		if (tbx.upload.size() != (size_t)SRC || memcmp(tbx.upload.data(), src.data(), SRC)) {
+			printf("toolbox: short-send upload %zu bytes (want %d), content %s\n",
+			       tbx.upload.size(), SRC,
+			       (tbx.upload.size() == (size_t)SRC && !memcmp(tbx.upload.data(), src.data(), SRC))
+			         ? "ok" : "MISMATCH");
+			fails++;
+		}
+	}
+
+	// ---- 0xD1 GET FILE: one 4096-byte block out of big.bin (8 sectors) ----
+	{
+		uint8_t cdb[10] = { 0xD1, 13, 0, 0, 0, 0, 1, 0, 0, 0 };   // index 13 = big.bin, offset 0, 1 block
+		int st = tb_cmd(cdb, nullptr, 0, buf, 4096, "GET");
+		if (st != 0x00) { printf("toolbox: GET status %02x\n", st); return 1; }
+		if (tbx.resp.size() != 4096) {
+			printf("toolbox: GET staged %zu bytes, want 4096\n", tbx.resp.size()); fails++;
+		} else {
+			int bad = 0, first = -1;
+			for (int i = 0; i < 4096; i++)
+				if (buf[i] != tbx.resp[i]) { if (first < 0) first = i; bad++; }
+			if (bad) {
+				printf("toolbox: GET %d/4096 bytes wrong, first at %d (got %02x want %02x)\n",
+				       bad, first, buf[first], tbx.resp[first]);
+				fails++;
+			}
+		}
+	}
+
+	printf("toolbox: %s (tb reqs=%llu fills=%llu)\n", fails ? "FAIL" : "PASS",
+	       (unsigned long long)tbx.reqs, (unsigned long long)tbx.fills);
+	return fails ? 1 : 0;
+}
+
+// ---------------- DIFFERENTIAL probe: stale ack fall (toolboxwdog) -----------
+// The toolbox suite re-run with tb_ack held high past the core's ~8 ms watchdog,
+// so the force-latch completes each round trip and the ack fall arrives stale.
+//
+// THIS IS NOT A PASS/FAIL GATE. The silicon-proven pre-fix RTL (52715a7) fails
+// it too — TBS_DATA clears tb_rd_r on the stale ack, the fetch never issues, and
+// the status block gets served as LIST data. Since LIST works on real hardware,
+// the model is over-constrained: the ack fall must normally be caught there, and
+// the watchdog only covers occasional misses.
+//
+// Its value is DIFFERENTIAL — compare a candidate against 52715a7:
+//   52715a7 (good) : LIST corrupt at byte 1, SEND stalls at byte 23
+//   7ec4e2b (bad)  : dies on the FIRST command (COUNT) — the HW symptom, where
+//                    every Toolbox command returned CHECK and nothing listed
+//   d4c70e6 (fix)  : byte-for-byte identical to 52715a7 => no divergence
+//   2026-08-01 fetch-retry fix: fails strictly LATER — COUNT, LIST and the
+//                    64 KB GET now pass even under the held ack (the !tb_ack
+//                    issue guards wait it out instead of mis-consuming it);
+//                    remaining failures are confined to the SEND/ship path
+//                    (uploads capture 0 bytes, SHORT chunk wedges), which the
+//                    fix deliberately did not touch.
+// A candidate that fails EARLIER than the current reference has changed the
+// handshake and must not be deployed.
+static int run_toolbox_wdog() {
+	const int saved_patience = csr_patience;
+	hps.tb_ack_hold = 300000;    // > the 262144-cycle watchdog
+	csr_patience    = 3000000;   // the initiator must outwait the force-latch
+	printf("toolboxwdog: DIFFERENTIAL probe — tb_ack held %d cycles.\n"
+	       "toolboxwdog: known-good 52715a7 ALSO fails here; compare the failure\n"
+	       "toolboxwdog: SHAPE against it, do not read this as pass/fail.\n",
+	       hps.tb_ack_hold);
+	int rc = run_toolbox();
+	hps.tb_ack_hold = 0;
+	csr_patience    = saved_patience;
+	printf("toolboxwdog: probe complete (rc=%d — expected nonzero, see above)\n", rc);
+	return 0;   // differential probe: never gates
+}
+
+// ---------------- Toolbox transport under a stalling HPS (toolboxslow) -------
+// The HW failure this covers: a 2.7 MiB Mac->SD copy died ~1769 blocks in with
+// "the SD card refused the transfer", leaving a file of exactly 1769*512 bytes.
+// /media/fat is exFAT mounted sync,dirsync, so every SEND chunk is a synchronous
+// card write; when the card hits an erase cycle the handler does not answer
+// inside the core's ~8 ms watchdog. The core then looked at a buffer that still
+// held the CDB it wrote, found no 0xB5 signature, and reported CHECK CONDITION
+// as if no handler existed. One slow round trip in ~1770 is enough to abort a
+// whole copy, which is why small files always worked.
+static int run_toolbox_slow() {
+	reset_dut(0);
+	tbx.reset();
+	top->tb_mounted = 1;
+	for (int i = 0; i < 8; i++) tick();
+
+	tbx.files.clear();
+	tbx.files.push_back({ "seed.bin", std::vector<uint8_t>(16, 0x5A) });
+
+	// Stall every 3rd tb READ for ~3 watchdog periods (786432 > 3*262144), so
+	// the retry path has to survive several re-looks, not just one.
+	hps.tb_reads = 0;
+	hps.tb_slow_every = 3;
+	hps.tb_slow_latency = 786432;
+	const int saved_patience = csr_patience;
+	// A stalled card legitimately holds the target; a 4096-byte GET fetches 8
+	// data sectors, so several stalls can stack inside one command.
+	csr_patience = 3000000;
+
+	const int SRC = 512 * 6;
+	std::vector<uint8_t> src(SRC);
+	for (int i = 0; i < SRC; i++) src[i] = ramp(0xC0000 + i);
+
+	int fails = 0;
+	uint8_t name[33] = {};
+	memcpy(name, "stall.bin", 9);
+	uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	int st = tb_cmd(cdb_prep, name, 33, nullptr, 0, "SLOW PREP");
+	if (st != 0x00) { printf("toolboxslow: PREP status %02x (want 00)\n", st); fails++; }
+
+	for (int blk = 0; blk * 512 < SRC; blk++) {
+		uint8_t chunk[512];
+		memcpy(chunk, &src[blk * 512], 512);
+		uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, 1, 0, 0, 0 };
+		cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+		char what[32]; snprintf(what, sizeof(what), "SLOW DATA blk%d", blk);
+		st = tb_cmd(cdb, chunk, 512, nullptr, 0, what);
+		if (st != 0x00) {
+			printf("toolboxslow: %s status %02x (want 00) "
+			       "<-- the HW abort: a slow HPS read as CHECK CONDITION\n", what, st);
+			fails++;
+		}
+	}
+
+	uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	st = tb_cmd(cdb_end, nullptr, 0, nullptr, 0, "SLOW END");
+	if (st != 0x00) { printf("toolboxslow: END status %02x (want 00)\n", st); fails++; }
+
+	if (tbx.upload.size() != (size_t)SRC) {
+		printf("toolboxslow: uploaded %zu bytes, want %d (%+d)\n",
+		       tbx.upload.size(), SRC, (int)tbx.upload.size() - SRC);
+		fails++;
+	} else {
+		int bad = 0, first = -1;
+		for (int i = 0; i < SRC; i++)
+			if (tbx.upload[i] != src[i]) { if (first < 0) first = i; bad++; }
+		if (bad) {
+			printf("toolboxslow: upload %d/%d bytes wrong, first at %d\n", bad, SRC, first);
+			fails++;
+		}
+	}
+
+	// ---- stalled-fill GET (GATING since 2026-08-01) --------------------------
+	// A GET whose data blocks are stalled past the watchdog. This used to be the
+	// KNOWN GAP: TBS_DATA counted a timed-out fetch as resident and served the
+	// slot's previous occupant. The fetch watchdog is a bounded RETRY now (same
+	// TB_RETRY_MAX family as the status re-looks), so a stalled fill must
+	// round-trip byte-exact. This variant stalls AFTER the HPS latched the
+	// request (lba+data staged at issue, stream late); the deferred-latch
+	// variant — Main descheduled before it even polled, the HW corruption mode —
+	// is covered by --mode toolboxget.
+	int gap_bad = 0;
+	{
+		uint8_t buf[4096];
+		std::vector<uint8_t> big(4096);
+		for (size_t i = 0; i < big.size(); i++) big[i] = ramp(0xD0000 + i);
+		tbx.files.push_back({ "big.bin", big });
+		uint8_t cdb[10] = { 0xD1, 1, 0, 0, 0, 0, 1, 0, 0, 0 };
+		st = tb_cmd(cdb, nullptr, 0, buf, 4096, "SLOW GET");
+		if (st != 0x00 || tbx.resp.size() != 4096) gap_bad = -1;
+		else {
+			int first = -1;
+			for (int i = 0; i < 4096; i++)
+				if (buf[i] != tbx.resp[i]) { if (first < 0) first = i; gap_bad++; }
+			if (first >= 0)
+				printf("toolboxslow: SLOW GET first bad at %d (sector %d): got %02x want %02x\n",
+				       first, first / 512, buf[first], tbx.resp[first]);
+		}
+	}
+
+	if (gap_bad) {
+		printf("toolboxslow: GET under a stalled HPS corrupts %d/4096 bytes "
+		       "(stale-sector serve — the fetch watchdog completed instead of retrying)\n",
+		       gap_bad);
+		fails++;
+	}
+
+	hps.tb_slow_every = 0;
+	csr_patience = saved_patience;
+	printf("toolboxslow: %s (tb reads=%llu, %d stalled past the watchdog)\n",
+	       fails ? "FAIL" : "PASS", (unsigned long long)hps.tb_reads,
+	       (int)(hps.tb_reads / 3));
+	return fails ? 1 : 0;
+}
+
+// ---------------- multi-block GET streaming + stalled-HPS race (toolboxget) ----
+// Desk reproduction of the 2026-08-01 hardware corruption: TB_CAPS bit 0 let
+// MacAtrium issue 32 KB multi-block GETs; a 2 MB download corrupted exactly ONE
+// 512-byte sector, byte-identical to the sector 8192 bytes earlier — one full
+// ring cycle back (TB_ADDRW=12 => 16 slots). Mechanism: TBS_DATA / TBS_STREAM
+// treated the read watchdog (&tb_to) as a COMPLETION. A fill the HPS had not
+// even latched yet was counted resident (tb_sec_done++), the fetch advanced to
+// the next LBA, the late HPS then latched the ADVANCED lba — so the stalled
+// sector was never fetched at all and its ring slot served its previous
+// occupant.
+//
+// Part A — sustained cadence: back-to-back multi-block GETs against a prompt
+//   HPS. The ring wraps 4x per 32 KB chunk and slot state carries from chunk
+//   to chunk, which one big GET (run_toolbox's BIG GET) never exercises.
+// Part B — deferred-latch stalls: every 23rd tb READ sits unlatched for ~1.5
+//   watchdog periods (Hps::TBRDEFER — Main descheduled BEFORE its poll saw
+//   tb_rd). On watchdog-as-completion RTL each defer skips a sector and the
+//   byte-exact assertion fails with the served block one ring cycle stale, the
+//   exact HW signature. On fixed RTL the fetch retries the SAME lba and every
+//   byte round-trips.
+//
+// GATING on both parts: this is the bench case the RTL comment demanded before
+// any fix to the known TBS_DATA gap.
+static void tb_get_diag(const uint8_t* got, const std::vector<uint8_t>& ref,
+                        size_t base, int first_bad) {
+	// Field-style block map: whose bytes actually got served?
+	size_t boff = (size_t)(first_bad / 512) * 512;
+	const uint8_t* blk = got + boff;
+	printf("   first bad sector: chunk byte %zu (file byte %zu, ring slot %zu)\n",
+	       boff, base + boff, ((base + boff) / 512) % 16);
+	bool found = false;
+	for (size_t r = 0; r + 512 <= ref.size(); r += 512)
+		if (!memcmp(blk, &ref[r], 512)) {
+			long long delta = ((long long)r - (long long)(base + boff)) / 512;
+			printf("   served bytes match file sector at byte %zu: delta %+lld sectors%s\n",
+			       r, delta, delta == -16 ? "  <-- one full ring cycle stale (the HW signature)" : "");
+			found = true;
+		}
+	if (!found) printf("   served bytes match no 512-byte sector of the file\n");
+}
+
+static int run_toolbox_get() {
+	reset_dut(0);
+	tbx.reset();
+	top->tb_mounted = 1;
+	for (int i = 0; i < 8; i++) tick();
+
+	// One 256 KB file, position-unique content (ramp folds high offset bytes,
+	// so a serve displaced by ANY 512-multiple is detectable).
+	const size_t FSZ = 262144;
+	tbx.files.clear();
+	tbx.files.push_back({ "rt.bin", {} });
+	auto& fdat = tbx.files.back().data;
+	fdat.resize(FSZ);
+	for (size_t i = 0; i < FSZ; i++) fdat[i] = ramp(0x3B0000 + i);
+
+	const int saved_patience = csr_patience;
+	csr_patience = 1000000;            // a deferred fill legitimately holds REQ ~12.5 ms
+
+	int fails = 0;
+	std::vector<uint8_t> buf(65536);
+
+	// One chunked GET: offset/blocks in 4096-byte units (MacAtrium ae7a051 /
+	// official-client CDB form), byte-exact assertion against the file.
+	auto get_chunk = [&](int blocks4k, uint32_t off4k, const char* tag) -> bool {
+		size_t base = (size_t)off4k * 4096;
+		int want = blocks4k * 4096;
+		if (base + want > FSZ) want = (int)(FSZ - base);
+		uint8_t cdb[10] = { 0xD1, 0,
+		                    (uint8_t)(off4k >> 24), (uint8_t)(off4k >> 16),
+		                    (uint8_t)(off4k >> 8),  (uint8_t)off4k,
+		                    (uint8_t)blocks4k, 0, 0, 0 };
+		int st = tb_cmd(cdb, nullptr, 0, buf.data(), want, tag);
+		if (st != 0x00) { printf("toolboxget: %s status %02x (want 00)\n", tag, st); return false; }
+		int bad = 0, first = -1;
+		for (int i = 0; i < want; i++)
+			if (buf[i] != fdat[base + i]) { if (first < 0) first = i; bad++; }
+		if (bad) {
+			printf("toolboxget: %s %d/%d bytes wrong, first at chunk byte %d "
+			       "(got %02x want %02x)\n", tag, bad, want, first, buf[first], fdat[base + first]);
+			tb_get_diag(buf.data(), fdat, base, first);
+			return false;
+		}
+		return true;
+	};
+
+	// ---- Part A: sustained streaming, prompt HPS ----
+	{
+		char tag[32];
+		for (uint32_t k = 0; k < 6; k++) {          // 6 x 32 KB, back to back
+			snprintf(tag, sizeof(tag), "A32K#%u", k);
+			if (!get_chunk(8, k * 8, tag)) fails++;
+		}
+		if (!get_chunk(16, 48, "A64K")) fails++;     // final 64 KB (128 fills)
+		if (!fails) printf("toolboxget: part A sustained streaming OK (6x32K + 1x64K)\n");
+	}
+
+	// ---- Part B: deferred-latch stalls (the race) ----
+	{
+		hps.tb_reads = 0; hps.tb_defers = 0;
+		hps.tb_defer_every   = 23;                   // hits sectors <16 and >=16
+		hps.tb_defer_latency = 400000;               // ~1.53 watchdog periods
+		int bfails = 0;
+		char tag[32];
+		for (uint32_t k = 0; k < 4; k++) {          // 4 x 32 KB, stalls sprinkled in
+			snprintf(tag, sizeof(tag), "B32K#%u", k);
+			if (!get_chunk(8, k * 8, tag)) bfails++;
+		}
+		hps.tb_defer_every = 0;
+		printf("toolboxget: part B %s (%llu fills deferred past the watchdog)\n",
+		       bfails ? "FAIL — stalled fills served stale sectors"
+		              : "OK — stalled fills retried, byte-exact",
+		       (unsigned long long)hps.tb_defers);
+		if (hps.tb_defers < 5) {
+			printf("toolboxget: part B exercised only %llu defers (want >=5) — "
+			       "stall cadence broken, not a valid pass\n",
+			       (unsigned long long)hps.tb_defers);
+			bfails++;
+		}
+		fails += bfails;
+	}
+
+	csr_patience = saved_patience;
+	printf("toolboxget: %s (tb reqs=%llu fills=%llu)\n", fails ? "FAIL" : "PASS",
+	       (unsigned long long)tbx.reqs, (unsigned long long)tbx.fills);
+	return fails ? 1 : 0;
+}
+
+// ---------------- SEND under a deferred-latch HPS (toolboxsend) --------------
+// The upload counterpart of toolboxget, and the desk reproduction of the
+// 2026-08-01 HW failure: the official BlueSCSI SD Transfer app uploaded a 2 MB
+// file through 65024-byte chunks and 4594 bytes came back wrong, in 12 sectors,
+// every corrupt region holding data from exactly -127 sectors (-65024 B = ONE
+// CHUNK) earlier, with the first bad byte at offset%512 == 496 — the
+// CDB-block/tail-block split. Attribution was pinned on HW by re-uploading the
+// SAME guest file through MacAtrium byte-exact, so only the upload leg loses.
+//
+// Mechanism: Main's tb_tail[] is static and never cleared between chunks
+// (mac_toolbox.cpp), and tb_send_data memcpy's from it unconditionally. A tail
+// block that never arrives therefore contributes the PREVIOUS chunk's bytes at
+// that offset. The block goes missing because TBS_COLLW treated its ship
+// watchdog as a completion: it counted the sector shipped and retargeted, so a
+// briefly descheduled Main woke to a different lba and the stalled sector was
+// never re-sent.
+//
+// Part A proves the fast path is untouched; part B is the gate.
+static int run_toolbox_send() {
+	reset_dut(0);
+	tbx.reset();
+	top->tb_mounted = 1;
+	for (int i = 0; i < 8; i++) tick();
+	tbx.files.clear();
+
+	const int saved_patience = csr_patience;
+	csr_patience = 1000000;            // a deferred ship legitimately holds the phase
+
+	int fails = 0;
+
+	// One upload at the official client's chunk size, byte-compared at the end.
+	// CH = 127*512 is what the app really sends (JTAG CDB capture, 2026-07-31).
+	auto send_file = [&](const char* name, int SRC, const char* tag) -> bool {
+		std::vector<uint8_t> src(SRC);
+		for (int i = 0; i < SRC; i++) src[i] = ramp(0x4C0000 + (uint64_t)i);
+
+		uint8_t nm[33] = {};
+		memcpy(nm, name, strlen(name));
+		uint8_t cdb_prep[10] = { 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		if (tb_cmd(cdb_prep, nm, 33, nullptr, 0, tag) != 0x00) {
+			printf("toolboxsend: %s PREP failed\n", tag); return false;
+		}
+		int blk = 0;
+		while (blk * 512 < SRC) {
+			int left   = SRC - blk * 512;
+			int blocks = (left + 511) / 512; if (blocks > 127) blocks = 127;
+			int bytes  = blocks * 512;
+			std::vector<uint8_t> chunk(bytes, 0xFF);
+			int valid = (left < bytes) ? left : bytes;
+			memcpy(chunk.data(), &src[blk * 512], valid);
+			uint8_t cdb[10] = { 0xD4, 0, 0, 0, 0, 0, (uint8_t)blocks, 0, 0, 0 };
+			cdb[3] = (uint8_t)(blk >> 16); cdb[4] = (uint8_t)(blk >> 8); cdb[5] = (uint8_t)blk;
+			char what[48]; snprintf(what, sizeof(what), "%s blk%d x%d", tag, blk, blocks);
+			int cst = tb_cmd(cdb, chunk.data(), bytes, nullptr, 0, what);
+			if (tbx.last_missing >= 0)
+				printf("   %s: %d tail block(s) never reached the HPS, first LBA %d "
+				       "(payload byte %d)\n", what, tbx.last_missing_cnt,
+				       tbx.last_missing, 496 + (tbx.last_missing - 1) * 512);
+			if (cst != 0x00) {
+				printf("toolboxsend: %s status %02x (want 00)\n", what, cst); return false;
+			}
+			blk += blocks;
+		}
+		uint8_t cdb_end[10] = { 0xD5, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		if (tb_cmd(cdb_end, nullptr, 0, nullptr, 0, tag) != 0x00) {
+			printf("toolboxsend: %s END failed\n", tag); return false;
+		}
+
+		// A short final chunk still ships whole 512-blocks (CDB[6] is a block
+		// count), so the file is padded up to a block multiple — same convention
+		// as the HUGE case above: require >= SRC and compare the valid bytes.
+		if (tbx.upload.size() < (size_t)SRC) {
+			printf("toolboxsend: %s uploaded %zu bytes, want >= %d (%+d)\n",
+			       tag, tbx.upload.size(), SRC, (int)tbx.upload.size() - SRC);
+			return false;
+		}
+		int bad = 0, first = -1;
+		for (int i = 0; i < SRC; i++)
+			if (tbx.upload[i] != src[i]) { if (first < 0) first = i; bad++; }
+		if (bad) {
+			printf("toolboxsend: %s %d/%d bytes wrong, first at %d (got %02x want %02x)\n",
+			       tag, bad, SRC, first, tbx.upload[first], src[first]);
+			printf("   first bad byte is at offset%%512 = %d%s\n", first % 512,
+			       (first % 512) == 496 ? "  <-- the CDB/tail split (the HW signature)" : "");
+			// whose bytes landed there?
+			size_t boff = (size_t)(first / 512) * 512;
+			for (size_t r = 0; r + 512 <= src.size(); r += 512)
+				if (!memcmp(&tbx.upload[boff], &src[r], 512)) {
+					long long d = ((long long)r - (long long)boff) / 512;
+					printf("   landed bytes match source sector at %zu: delta %+lld sectors%s\n",
+					       r, d, d == -127 ? "  <-- one SEND chunk stale (the HW signature)" : "");
+				}
+			return false;
+		}
+		return true;
+	};
+
+	// ---- Part A: prompt HPS, the client's real chunk size ----
+	{
+		const int CH = 127 * 512;
+		if (!send_file("fast.bin", CH * 2 + 4096 + 300, "A-SEND")) fails++;
+		else printf("toolboxsend: part A sustained 65024-B chunks OK (prompt HPS)\n");
+	}
+
+	// ---- Part B: deferred-latch ship stalls (the race) ----
+	{
+		tbx.reset();
+		hps.tb_writes = 0; hps.tb_wdefers = 0; hps.tb_wlost = 0;
+		hps.tb_wdefer_every   = 29;                  // sprinkled across the tail blocks
+		hps.tb_wdefer_latency = 400000;              // ~1.53 watchdog periods
+		const int CH = 127 * 512;
+		int bfails = send_file("stall.bin", CH * 2 + 4096 + 300, "B-SEND") ? 0 : 1;
+		hps.tb_wdefer_every = 0;
+		printf("toolboxsend: part B %s (%llu ships deferred past the watchdog, "
+		       "%llu abandoned by the core)\n",
+		       bfails ? "FAIL — a stalled ship was counted as delivered"
+		              : "OK — stalled ships retried, byte-exact",
+		       (unsigned long long)hps.tb_wdefers, (unsigned long long)hps.tb_wlost);
+		if (hps.tb_wdefers < 5) {
+			printf("toolboxsend: part B exercised only %llu defers (want >=5) — "
+			       "stall cadence broken, not a valid pass\n",
+			       (unsigned long long)hps.tb_wdefers);
+			bfails++;
+		}
+		fails += bfails;
+	}
+
+	csr_patience = saved_patience;
+	printf("toolboxsend: %s (tb reqs=%llu fills=%llu)\n", fails ? "FAIL" : "PASS",
+	       (unsigned long long)tbx.reqs, (unsigned long long)tbx.fills);
+	return fails ? 1 : 0;
+}
+
 // ---------------- main ----------------
 int main(int argc, char** argv) {
 	Verilated::commandArgs(argc, argv);
@@ -917,6 +1988,46 @@ int main(int argc, char** argv) {
 
 	if (one_mode && !strcmp(one_mode, "gapcmds")) {
 		int rc = run_gapcmds();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolbox")) {
+		int rc = run_toolbox();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolboxwdog")) {
+		int rc = run_toolbox_wdog();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolboxslow")) {
+		int rc = run_toolbox_slow();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolboxget")) {
+		int rc = run_toolbox_get();
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return rc;
+	}
+
+	if (one_mode && !strcmp(one_mode, "toolboxsend")) {
+		int rc = run_toolbox_send();
 #if VM_TRACE
 		if (tfp) tfp->close();
 #endif

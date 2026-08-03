@@ -43,6 +43,14 @@ module scsi_bench_top
 	output [15:0] sd_buff_din_0,
 	output [15:0] sd_buff_din_1,
 
+	// ---- BlueSCSI Toolbox transport (target 0 only; C++ HPS model) ----
+	input         tb_mounted,
+	output [31:0] tb_lba,
+	output        tb_rd,
+	output        tb_wr,
+	input         tb_ack,
+	output [15:0] tb_buff_din,
+
 	// ---- observability ----
 	output [31:0] dbg_ncr,    // host-side pseudo-DMA state (see ncr5380.sv)
 	output [31:0] dbg_ncr2,   // IRQ/deferral machine + counters
@@ -97,6 +105,13 @@ ncr5380 #(.DEVS(2)) ncr
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
 	.sd_buff_wr(sd_buff_wr),
+
+	.tb_mounted(tb_mounted),
+	.tb_lba(tb_lba),
+	.tb_rd(tb_rd),
+	.tb_wr(tb_wr),
+	.tb_ack(tb_ack),
+	.tb_buff_din(tb_buff_din),
 
 	.dbg_scsi(),
 	.dbg_scsi2(),
