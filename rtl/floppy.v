@@ -92,6 +92,7 @@ module floppy
 	// every 16 us (HD) / 32 us (DD). Each delivery latches the encoder's output
 	// and strobes mfm_stb for one cep period (the SWIM samples it on cen).
 	input            ism_active, // SWIM is in ISM mode: the phase lines are ISM
+	input            ism_action, // ISM Mode b3 (ACTION): the read/write engine runs
 	                             // register traffic, not IWM drive commands
 	input            ism_sel,    // ISM has THIS drive selected with Mode b7
 	                             // (motor on) set — the ISM-mode motor command
@@ -321,8 +322,8 @@ module floppy
 `ifdef SIMULATION
 	// --- MFM/ISM protocol trace (diff against the MAME 0.264 runtime capture,
 	// scratch/mame_floppy_0702/decoded_1440k_v3.txt) ---
-	reg [9:0]  dbgsim_strobe_cnt = 0;
-	reg [7:0]  dbgsim_dlv_cnt = 0;
+	reg [13:0] dbgsim_strobe_cnt = 0;
+	reg [13:0] dbgsim_dlv_cnt = 0;
 	reg        dbgsim_spin_d = 0;
 	reg        dbgsim_idx_d = 0;
 	// Sense-register reads, run-length compressed on (addr,value): the driver
@@ -351,14 +352,14 @@ module floppy
 		end
 	end
 	always @(posedge clk) begin
-		if (cep && _enable == 1'b0 && lstrbEdge && dbgsim_strobe_cnt < 10'd400) begin
+		if (cep && _enable == 1'b0 && lstrbEdge && dbgsim_strobe_cnt < 14'd8000) begin
 			dbgsim_strobe_cnt <= dbgsim_strobe_cnt + 1'd1;
 			$display("FLOPPY %m strobe(fall) cmd=%x track=%0d mfm=%b motor(reg)=%b @%0t",
 			         {SEL, ca2, ca1, ca0}, driveTrack, m_mfm, driveRegs[`DRIVE_REG_MOTORON], $time);
 		end
 		// MAME latches the command on the LSTRB RISING edge; we act on falling.
 		// Log both so a mid-pulse SEL/phase change shows up as a cmd mismatch.
-		if (cep && _enable == 1'b0 && lstrb && !lstrbPrev && dbgsim_strobe_cnt < 10'd400)
+		if (cep && _enable == 1'b0 && lstrb && !lstrbPrev && dbgsim_strobe_cnt < 14'd8000)
 			$display("FLOPPY %m strobe(rise) cmd=%x track=%0d @%0t",
 			         {SEL, ca2, ca1, ca0}, driveTrack, $time);
 		if (cep) begin
@@ -369,10 +370,11 @@ module floppy
 			dbgsim_idx_d <= mfm_index;
 			if (mfm_spinning && mfm_index && !dbgsim_idx_d)
 				$display("FLOPPY %m index pulse trk=%0d side=%b @%0t", driveTrack, driveSide, $time);
-			if (mfm_stb && dbgsim_dlv_cnt < 8'd64) begin
+			if (mfm_stb && dbgsim_dlv_cnt < 14'd8000) begin
 				dbgsim_dlv_cnt <= dbgsim_dlv_cnt + 1'd1;
-				$display("FLOPPY %m mfm dlv %02x m=%b c0=%b trk=%0d side=%b @%0t",
-				         mfm_byte, mfm_mark, mfm_crc0, driveTrack, driveSide, $time);
+				$display("FLOPPY %m mfm dlv %02x m=%b c0=%b trk=%0d side=%b needs=%b addr=%0d latch=%02x @%0t",
+				         mfm_byte, mfm_mark, mfm_crc0, driveTrack, driveSide,
+				         mfm_needs_data, mfmReadAddr, dskReadDataLatch, $time);
 			end
 		end
 	end
@@ -443,13 +445,38 @@ module floppy
 				end
 			end
 
-			// switch drive sides if DRIVE_REG_RDDATA0 or DRIVE_REG_RDDATA1 are read
-			// TODO: we don't know if this is a true read, since we don't know if IWM is selected or 
-			// could be bad if we use this test to flush a cache of encoded disk data
-			if (driveReadAddr == `DRIVE_REG_RDDATA0 && lstrb == 1'b0)
-				driveSide <= 0;
-			if (driveReadAddr == `DRIVE_REG_RDDATA1 && lstrb == 1'b0)
-				driveSide <= 1;	
+			// Head (side) select — the RDDATA0/RDDATA1 sense address.
+			// IWM/GCR: latch continuously while the address is parked there
+			// (Plus Too lineage; the phase lines are dedicated to the sense
+			// address during GCR reads, so any parked value is authoritative).
+			// ISM: the SAME lines double as drive-command strobes and SEL
+			// doubles as the strobe-bank selector, so transient combinations
+			// lie about the head. The Welcome-time re-init raises SEL for the
+			// MFMModeOn strobe while the phases still park on F4 (RdData0)
+			// from the previous field — {F4,SEL=1} reads as RdData1 and
+			// silently flipped the head to side 1; every later read served
+			// wrong-side bytes and System 6.0.8's floppy boot looped at
+			// "Welcome to Macintosh" retrying forever (HW 2026-08-03; MAME
+			// F623 ground truth + tb_ism_reinit fetch trace addr 9368 =
+			// side 1 byte 152). In ISM, sample the head only while ACTION is
+			// set: the driver parks F4/SEL BEFORE arming and never touches
+			// them mid-read, so the armed window is the authoritative one.
+			if (ism_active ? ism_action : 1'b1) begin
+				if (driveReadAddr == `DRIVE_REG_RDDATA0 && lstrb == 1'b0) begin
+`ifdef SIMULATION
+					if (driveSide != 1'b0)
+						$display("FLOPPY %m driveSide 1->0 (ism=%b act=%b) @%0t", ism_active, ism_action, $time);
+`endif
+					driveSide <= 0;
+				end
+				if (driveReadAddr == `DRIVE_REG_RDDATA1 && lstrb == 1'b0) begin
+`ifdef SIMULATION
+					if (driveSide != 1'b1)
+						$display("FLOPPY %m driveSide 0->1 (ism=%b act=%b) @%0t", ism_active, ism_action, $time);
+`endif
+					driveSide <= 1;
+				end
+			end
 		end
 	end
 	end
@@ -592,11 +619,24 @@ module floppy
 					6634					$1A56 (6742)
 	*/
 	
-	reg [13:0] driveTachTimer; 
-	reg [13:0] driveTachPeriod;
-	
+	reg [14:0] driveTachTimer;
+	reg [14:0] driveTachPeriod;
+
 	always @(*) begin
-		case (driveTrack[6:4])
+		if (mfm_disk) begin
+			// SuperDrive MFM media (720K DD and 1.44MB HD) spin a CONSTANT
+			// 300 RPM regardless of track (500 kbit/s CAV — swim_ism_read
+			// reference §"MFM mode on"). The zoned table below is GCR-only.
+			// Scaled from the experimentally-calibrated track-0 row:
+			// 9996 clks @500 RPM -> x(500/300) = 16660 clks @300 RPM.
+			// Without this the Welcome-time Sony driver install measured the
+			// zoned GCR rate (500 RPM at track 0, 66% out of spec), failed
+			// its drive-speed check, and System 6.0.8's floppy boot looped
+			// at "Welcome to Macintosh" retrying the install (HW 2026-08-03;
+			// MAME F616 tach-poll window is exactly this measurement).
+			driveTachPeriod <= 15'd16660;
+		end
+		else case (driveTrack[6:4])
 			0: // tracks 0-15
 				driveTachPeriod <= 9996;
 			1: // tracks 16-31
@@ -606,7 +646,7 @@ module floppy
 			3: // tracks 48-63
 				driveTachPeriod <= 7463;
 			default: // tracks 64-79
-				driveTachPeriod <= 6634;	
+				driveTachPeriod <= 6634;
 		endcase
 	end
 	
