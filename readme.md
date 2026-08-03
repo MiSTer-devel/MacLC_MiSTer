@@ -176,20 +176,14 @@ MiSTer's main executable. The changes are **merged upstream**
 appeared in a released MiSTer binary yet, so `update_all` / the standard updater will
 not give you them. Until a release includes them, install the binary by hand:
 
-1. Back up the existing one: `mv /media/fat/MiSTer /media/fat/MiSTer.bak`
-2. Copy [`releases/MiSTer`](releases/) (md5 `dda65f18`) to `/media/fat/MiSTer`
-   and make it executable (`chmod +x /media/fat/MiSTer`).
+1. Back up the existing one: `cp /media/fat/MiSTer /media/fat/MiSTer.orig`
+2. cp `/media/fat/games/MacLC/MiSTer /media/fat/MiSTer` and make it executable (`chmod +x /media/fat/MiSTer`).
 3. Reboot the MiSTer.
 
 Note that the normal MiSTer updater will overwrite this file with the current official
 build, which silently removes both features — re-copy it after running an update, until
 a release ships with the merged support. Once one does, the updater is all you need and
 this step goes away.
-
-Prefer to build it yourself? Build from upstream
-[Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer) `master`, which now contains
-the support; it needs an `arm-none-linux-gnueabihf` cross-toolchain (the shipped binary
-is built against a glibc 2.x baseline the MiSTer's own image satisfies).
 
 ## Floppy disk support
 
