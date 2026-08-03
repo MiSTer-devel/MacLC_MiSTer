@@ -190,7 +190,10 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   read-ring words after the 11-word anchor proved insufficient on the
   post-floppy netlist) pins the SCSI capture + ring-serve cones; do
   not remove it (comment block explains), and gate every new fit in the
-  FINDER on colour icons (see the probes-off anchor comment in MacLC.sv).
+  FINDER on colour icons — `scripts/icon_gate.py` on frames captured with
+  `scripts/grab_fresh.sh` (stock grab.sh serves STALE frames when video is
+  dead), plus a >=2-boot Finder soak (see the probes-off anchor comment in
+  MacLC.sv).
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
 - CD-ROM (SCSI ID 3, OSD slot `SC4`): data, mixed-mode, and audio CDs.
