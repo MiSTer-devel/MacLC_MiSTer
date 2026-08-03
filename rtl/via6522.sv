@@ -143,6 +143,25 @@ module via6522 (
     wire [1:0] ca2_out_mode          = pcr[2:1];
     wire       ca1_edge_select       = pcr[0];
     reg [7:0] ira = 8'h00;
+
+    // Port A read value. Pins configured as OUTPUTS read back the output
+    // latch; input pins read the (optionally CA1-latched) pin level. This is
+    // what MAME's 6522 does (6522via.cpp input_pa(): the result always ORs in
+    // `m_out_a & m_ddr_a`) and what real hardware does, since an output pin's
+    // level IS the driven level.
+    //
+    // Returning `ira` for every bit -- as this did -- corrupts every
+    // read-modify-write instruction that touches Port A: the CPU reads the
+    // INPUT pattern, modifies one bit, and writes the result back over the
+    // output latch. On the Mac LC the Sony floppy driver toggles PA5/HDSEL
+    // with BSET #5 / BCLR #5 on ORA ($F01E00, ROM A6D432/A6D43A), and PA5 is
+    // the drive's SEL line: it picks the sense-register bank (regs 8-F, which
+    // carry the SuperDrive/HD identity) and, at an LSTRB strobe, forms the
+    // command {SEL,ca2,ca1,ca0}. A dropped PA5 turns the driver's $9
+    // "MFMModeOn" strobe into $1 "StepOn", so the head walks off track instead
+    // of entering MFM mode. Same hazard for PA6/vid_alt and PA0-2 (sound
+    // volume), which any unrelated Port A RMW would rewrite from `ira`.
+    wire [7:0] pra_read = (ira & ~pio_i_ddra) | (pio_i_pra & pio_i_ddra);
     reg [7:0] irb = 8'h00;
 
     reg write_t1c_l;
@@ -434,7 +453,7 @@ module via6522 (
 `endif
             end
             4'h1: begin // ORA
-                data_out <= ira;
+                data_out <= pra_read;
             end
             4'h2: begin // DDRB
                 data_out <= pio_i_ddrb;
@@ -482,7 +501,7 @@ module via6522 (
                 data_out <= {1'b1, irq_mask};
             end
             4'hF: begin // ORA
-                data_out <= ira;
+                data_out <= pra_read;
             end
             default: begin
             end
