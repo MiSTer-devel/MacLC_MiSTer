@@ -302,6 +302,21 @@ module swim
 `ifdef SIMULATION
 	reg [7:0]  dbg_arm_cnt = 0;
 	reg [15:0] dbg_pop_cnt = 0;
+	reg [15:0] dbg_hs_cnt = 0;
+	reg [7:0]  dbg_hs_last = 0;
+	reg [15:0] dbg_hs_rpt = 0;
+	reg [15:0] dbg_mode_cnt = 0;
+	reg [7:0]  dbg_err_cnt = 0;
+	// live Handshake value (same expression as the read mux)
+	wire [7:0] dbg_hs_now = {
+		ism_mode_reg[4] ? (ism_fifo_pos <= 1) : (ism_fifo_pos != 0),
+		ism_mode_reg[4] ? (ism_fifo_pos == 0) : (ism_fifo_pos == 2),
+		(ism_error != 0),
+		1'b0,
+		ism_sense,
+		1'b0,
+		(ism_fifo_pos != 0) && ~ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_CRC0],
+		(ism_fifo_pos != 0) &&  ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_MARK]};
 `endif
 
 	reg [4:0] iwmMode;
@@ -390,9 +405,10 @@ module swim
 			case (ism_reg_addr)
 				// Data ($0) / Mark ($1): head of the real 2-entry FIFO. The pop
 				// side-effect commits at access end (acc_end), so the value is
-				// stable for the whole CPU access.
+				// stable for the whole CPU access. Empty pop floats FF (Snow
+				// ism.rs; the underrun error is raised in the pop transaction).
 				3'h0, 3'h1:
-					dataOutLo = (ism_fifo_pos == 0) ? 8'h00 : ism_fifo[0][7:0];
+					dataOutLo = (ism_fifo_pos == 0) ? 8'hFF : ism_fifo[0][7:0];
 				3'h2: // Error register
 					dataOutLo = ism_error;
 				3'h3: // Param[idx]
@@ -549,7 +565,10 @@ module swim
 					ism_fifo[ism_fifo_pos[0]] <= ism_gen_word;
 					ism_fifo_pos <= ism_fifo_pos + 2'd1;
 				end else
-					ism_error[2] <= 1'b1;          // overrun: delivered byte lost
+					ism_error[0] <= 1'b1;          // overrun: delivered byte lost
+					                               // (MAME swim1 read-side push-full
+					                               // = error 0x01, byte dropped;
+					                               // CPU-side push-full stays 0x04)
 			end
 			else if (ism_pop_req) begin
 				if (ism_fifo_pos != 0) begin
@@ -670,20 +689,53 @@ module swim
 			end
 
 `ifdef SIMULATION
-			if (ism_arm && !ism_arm_d && dbg_arm_cnt < 8'd40) begin
+			if (ism_arm && !ism_arm_d && dbg_arm_cnt < 8'd80) begin
 				dbg_arm_cnt <= dbg_arm_cnt + 1'd1;
 				$display("SWIM-ISM: read ARM mode=%02x setup=%02x dev={e%b,i%b} @%0t",
 				         ism_mode_reg, ism_setup, ism_devsel_ext, ism_devsel_int, $time);
 			end
-			if (ism_read_active && mfm_stb_sel && !mfm_synced && mfm_mark_sel && dbg_arm_cnt < 8'd40)
+			if (ism_read_active && mfm_stb_sel && !mfm_synced && mfm_mark_sel && dbg_arm_cnt < 8'd80)
 				$display("SWIM-ISM: mark-sync @%0t", $time);
-			if (ism_pop_req && ism_fifo_pos != 0 && dbg_pop_cnt < 16'd400) begin
+			if (ism_pop_req && ism_fifo_pos != 0 && dbg_pop_cnt < 16'd4000) begin
 				dbg_pop_cnt <= dbg_pop_cnt + 1'd1;
 				$display("SWIM-ISM: pop %02x m=%b c0=%b pos=%0d",
 				         ism_fifo[0][7:0], ism_fifo[0][FIFO_B_MARK], ism_fifo[0][FIFO_B_CRC0], ism_fifo_pos);
 			end
+			if (ism_pop_req && ism_fifo_pos == 0 && dbg_err_cnt < 8'd60) begin
+				dbg_err_cnt <= dbg_err_cnt + 1'd1;
+				$display("SWIM-ISM: POP-EMPTY (underrun) @%0t", $time);
+			end
 			if (acc_end && ism_mode && acc_rw_l && acc_addr_l[2:0] == 3'h4)
 				$display("SWIM-ISM: phases rd -> %02x", {ism_phase_oe, lstrb, ca2, ca1, ca0});
+			// Handshake reads, run-length compressed (the hunt loop polls ~2000x
+			// per sector gap; log transitions + a repeat count, hard-capped).
+			if (acc_end && ism_mode && acc_rw_l && acc_addr_l[2:0] == 3'h7) begin
+				if (dbg_hs_now != dbg_hs_last) begin
+					if (dbg_hs_cnt < 16'd20000) begin
+						dbg_hs_cnt <= dbg_hs_cnt + 1'd1;
+						$display("SWIM-ISM: HS %02x (x%0d) -> %02x pos=%0d @%0t",
+						         dbg_hs_last, dbg_hs_rpt, dbg_hs_now, ism_fifo_pos, $time);
+					end
+					dbg_hs_last <= dbg_hs_now;
+					dbg_hs_rpt  <= 16'd1;
+				end else if (dbg_hs_rpt != 16'hFFFF)
+					dbg_hs_rpt <= dbg_hs_rpt + 1'd1;
+			end
+			// Mode register writes (set/clear) — the per-sector re-arm fingerprint
+			if (acc_end && ism_mode && !acc_rw_l &&
+			    (acc_addr_l[2:0] == 3'h6 || acc_addr_l[2:0] == 3'h7) && dbg_mode_cnt < 16'd1200) begin
+				dbg_mode_cnt <= dbg_mode_cnt + 1'd1;
+				$display("SWIM-ISM: Mode%s %02x -> mode=%02x @%0t",
+				         (acc_addr_l[2:0] == 3'h6) ? "Clr" : "Set", acc_data_l,
+				         (acc_addr_l[2:0] == 3'h6) ? (ism_mode_reg & ~acc_data_l)
+				                                   : (ism_mode_reg | acc_data_l), $time);
+			end
+			if (acc_end && ism_mode && !acc_rw_l && acc_addr_l[2:0] == 3'h5)
+				$display("SWIM-ISM: Setup <= %02x @%0t", acc_data_l, $time);
+			if (acc_end && ism_mode && acc_rw_l && acc_addr_l[2:0] == 3'h2 && ism_error != 0 && dbg_err_cnt < 8'd60) begin
+				dbg_err_cnt <= dbg_err_cnt + 1'd1;
+				$display("SWIM-ISM: Error rd -> %02x (cleared) @%0t", ism_error, $time);
+			end
 `endif
 		end
 	end

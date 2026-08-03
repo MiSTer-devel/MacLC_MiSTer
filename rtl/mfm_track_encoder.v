@@ -14,7 +14,16 @@
  sector layout (logical 512-byte sectors, in order) is confirmed by the DC42
  container (rusty-backup src/rbformats/dc42.rs).
 
- Per-sector decoded layout (MAME upd765_dsk get_desc_mfm + pc_dsk 1.44M tuple):
+ Track layout (MAME pc_dsk 1.44M tuple; gaps {gap4a=80, gap1=50, gap2=22, gap3=108}):
+
+ Track preamble, once per revolution (the index pulse rides on it — see oindex):
+   4E x80  (gap 4a)
+   00 x12  (sync)
+   C2 C2 C2 FC  (IAM — delivered as PLAIN bytes: SWIM1/Snow sync only on the
+                 A1/0x4489 pattern, so C2 must NOT carry the mark flag)
+   4E x50  (gap 1)
+
+ Per sector (x18 HD / x9 DD), from MAME upd765_dsk get_desc_mfm:
    00 x12  (sync)
    A1 A1 A1   <- delivered as MARK bytes (omark=1)
    FE         (ID address mark)
@@ -27,7 +36,9 @@
    <512 data bytes>
    CRChi CRClo   (CRC over [A1 A1 A1 FB <512>], seed 0xCDB4 + FB + data)
    4E x108 (gap 3)
- = 682 bytes/sector. x18 = 12276 bytes/track; at 16us/byte ~= 196ms ~= 300 RPM.
+ = 682 bytes/sector. 18*682+146 = 12422 bytes/track; at 16us/byte ~= 198.8ms
+ ~= 302 RPM (the driver verifies drive speed via the index period, so the
+ preamble length is load-bearing, not cosmetic).
 
  Sector image address (logical, no interleave): the data fork stores sectors in
  (cyl, head, sector) order, so
@@ -57,9 +68,12 @@ module mfm_track_encoder
 	output reg [7:0]  odata,   // current decoded MFM byte
 	output reg        omark,   // current byte is an address-mark (A1) -> ISM M_MARK
 	output reg        ocrc0,   // current byte completes a valid CRC field -> ISM M_CRC0
-	output            oneeds   // current byte is sector payload (odata = idata):
+	output            oneeds,  // current byte is sector payload (odata = idata):
 	                           // the consumer must not deliver it until the SDRAM
 	                           // fetch for `addr` has landed in idata
+	output            oindex   // physical index "hole": high during gap 4a (80
+	                           // bytes = 1.28ms low pulse on the !idx sense =
+	                           // 0.64% duty, vs 0.70% in the MAME 0.264 capture)
 );
 
 	// ---- sector geometry ----------------------------------------------------
@@ -93,22 +107,27 @@ module mfm_track_encoder
 	localparam [15:0] CRC_SEED = 16'hCDB4;
 
 	// ---- track byte-emission state machine ----------------------------------
-	localparam S_ID_SYNC = 4'd0;   // 12 x 00
-	localparam S_ID_A1   = 4'd1;   // 3  x A1 (mark)
-	localparam S_ID_AM   = 4'd2;   // 1  x FE
-	localparam S_ID_CHRN = 4'd3;   // 4  : C H R N
-	localparam S_ID_CRC  = 4'd4;   // 2  : CRC hi/lo
-	localparam S_GAP2    = 4'd5;   // 22 x 4E
-	localparam S_DA_SYNC = 4'd6;   // 12 x 00
-	localparam S_DA_A1   = 4'd7;   // 3  x A1 (mark)
-	localparam S_DA_AM   = 4'd8;   // 1  x FB
-	localparam S_DATA    = 4'd9;   // 512: payload
-	localparam S_DA_CRC  = 4'd10;  // 2  : CRC hi/lo
-	localparam S_GAP3    = 4'd11;  // 108 x 4E
+	localparam S_PRE_GAP  = 4'd0;   // 80 x 4E (gap 4a) — once per revolution
+	localparam S_PRE_SYNC = 4'd1;   // 12 x 00
+	localparam S_PRE_IAM  = 4'd2;   // 4  : C2 C2 C2 FC (plain bytes, no mark)
+	localparam S_PRE_GAP1 = 4'd3;   // 50 x 4E (gap 1)
+	localparam S_ID_SYNC  = 4'd4;   // 12 x 00
+	localparam S_ID_A1    = 4'd5;   // 3  x A1 (mark)
+	localparam S_ID_AM    = 4'd6;   // 1  x FE
+	localparam S_ID_CHRN  = 4'd7;   // 4  : C H R N
+	localparam S_ID_CRC   = 4'd8;   // 2  : CRC hi/lo
+	localparam S_GAP2     = 4'd9;   // 22 x 4E
+	localparam S_DA_SYNC  = 4'd10;  // 12 x 00
+	localparam S_DA_A1    = 4'd11;  // 3  x A1 (mark)
+	localparam S_DA_AM    = 4'd12;  // 1  x FB
+	localparam S_DATA     = 4'd13;  // 512: payload
+	localparam S_DA_CRC   = 4'd14;  // 2  : CRC hi/lo
+	localparam S_GAP3     = 4'd15;  // 108 x 4E
 
 	reg [3:0] state;
 	reg [9:0] cnt;          // byte index within the current state (max 511)
 	assign oneeds = (state == S_DATA);
+	assign oindex = (state == S_PRE_GAP);
 	reg [4:0] sector;       // current sector index (0..spt_max)
 	reg [8:0] src_offset;   // byte within the current sector's data (0..511)
 	reg [15:0] crc;
@@ -117,18 +136,22 @@ module mfm_track_encoder
 	reg [9:0] state_len_m1;
 	always @(*) begin
 		case (state)
-			S_ID_SYNC: state_len_m1 = 10'd11;   // 12
-			S_ID_A1:   state_len_m1 = 10'd2;    // 3
-			S_ID_AM:   state_len_m1 = 10'd0;    // 1
-			S_ID_CHRN: state_len_m1 = 10'd3;    // 4
-			S_ID_CRC:  state_len_m1 = 10'd1;    // 2
-			S_GAP2:    state_len_m1 = 10'd21;   // 22
-			S_DA_SYNC: state_len_m1 = 10'd11;   // 12
-			S_DA_A1:   state_len_m1 = 10'd2;    // 3
-			S_DA_AM:   state_len_m1 = 10'd0;    // 1
-			S_DATA:    state_len_m1 = 10'd511;  // 512
-			S_DA_CRC:  state_len_m1 = 10'd1;    // 2
-			default:   state_len_m1 = 10'd107;  // S_GAP3: 108
+			S_PRE_GAP:  state_len_m1 = 10'd79;   // 80
+			S_PRE_SYNC: state_len_m1 = 10'd11;   // 12
+			S_PRE_IAM:  state_len_m1 = 10'd3;    // 4
+			S_PRE_GAP1: state_len_m1 = 10'd49;   // 50
+			S_ID_SYNC:  state_len_m1 = 10'd11;   // 12
+			S_ID_A1:    state_len_m1 = 10'd2;    // 3
+			S_ID_AM:    state_len_m1 = 10'd0;    // 1
+			S_ID_CHRN:  state_len_m1 = 10'd3;    // 4
+			S_ID_CRC:   state_len_m1 = 10'd1;    // 2
+			S_GAP2:     state_len_m1 = 10'd21;   // 22
+			S_DA_SYNC:  state_len_m1 = 10'd11;   // 12
+			S_DA_A1:    state_len_m1 = 10'd2;    // 3
+			S_DA_AM:    state_len_m1 = 10'd0;    // 1
+			S_DATA:     state_len_m1 = 10'd511;  // 512
+			S_DA_CRC:   state_len_m1 = 10'd1;    // 2
+			default:    state_len_m1 = 10'd107;  // S_GAP3: 108
 		endcase
 	end
 
@@ -148,8 +171,11 @@ module mfm_track_encoder
 		omark = 1'b0;
 		ocrc0 = 1'b0;
 		case (state)
+			S_PRE_SYNC,
 			S_ID_SYNC, S_DA_SYNC: odata = 8'h00;
+			S_PRE_GAP, S_PRE_GAP1,
 			S_GAP2, S_GAP3:       odata = 8'h4E;
+			S_PRE_IAM:            odata = (cnt == 10'd3) ? 8'hFC : 8'hC2;
 			S_ID_A1, S_DA_A1: begin odata = 8'hA1; omark = 1'b1; end
 			S_ID_AM:              odata = 8'hFE;
 			S_DA_AM:              odata = 8'hFB;
@@ -166,7 +192,7 @@ module mfm_track_encoder
 	// advance on each `ready` pull; update CRC over the byte just consumed
 	always @(posedge clk or posedge rst) begin
 		if (rst) begin
-			state      <= S_ID_SYNC;
+			state      <= S_PRE_GAP;
 			cnt        <= 10'd0;
 			sector     <= 5'd0;
 			src_offset <= 9'd0;
@@ -189,8 +215,13 @@ module mfm_track_encoder
 			if (cnt == state_len_m1) begin
 				cnt <= 10'd0;
 				if (state == S_GAP3) begin
-					state  <= S_ID_SYNC;
-					sector <= (sector == spt_max) ? 5'd0 : (sector + 5'd1);
+					if (sector == spt_max) begin
+						sector <= 5'd0;
+						state  <= S_PRE_GAP;   // revolution wrap: emit the track preamble
+					end else begin
+						sector <= sector + 5'd1;
+						state  <= S_ID_SYNC;
+					end
 				end else begin
 					state <= state + 4'd1;
 				end

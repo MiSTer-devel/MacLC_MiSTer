@@ -238,7 +238,7 @@ module floppy
 	// rate below; shares the same SDRAM fetch latch (dskReadDataLatch) and head
 	// position (driveTrack/driveSide) as the GCR path.
 	wire [7:0] mfm_odata;
-	wire       mfm_omark, mfm_ocrc0, mfm_needs_data;
+	wire       mfm_omark, mfm_ocrc0, mfm_needs_data, mfm_index;
 	reg        mfm_ready_pulse;
 
 	mfm_track_encoder menc
@@ -254,7 +254,8 @@ module floppy
 		.odata  ( mfm_odata ),
 		.omark  ( mfm_omark ),
 		.ocrc0  ( mfm_ocrc0 ),
-		.oneeds ( mfm_needs_data )
+		.oneeds ( mfm_needs_data ),
+		.oindex ( mfm_index )
 	);
 
 	// ---- MFM byte-cell delivery timer -----------------------------------
@@ -317,8 +318,78 @@ module floppy
 		end
 	end
 
+`ifdef SIMULATION
+	// --- MFM/ISM protocol trace (diff against the MAME 0.264 runtime capture,
+	// scratch/mame_floppy_0702/decoded_1440k_v3.txt) ---
+	reg [9:0]  dbgsim_strobe_cnt = 0;
+	reg [7:0]  dbgsim_dlv_cnt = 0;
+	reg        dbgsim_spin_d = 0;
+	reg        dbgsim_idx_d = 0;
+	// Sense-register reads, run-length compressed on (addr,value): the driver
+	// polls one register thousands of times (e.g. NoReady until 0), so only
+	// transitions are interesting. Compare with the MAME capture's SENSE TRUTH
+	// TABLE. Our index is {ca2,ca1,ca0,SEL}; MAME's is {ss,ca2,ca1,ca0}.
+	reg [3:0]  dbgsim_sns_addr = 4'hF;
+	reg        dbgsim_sns_val = 1'b1;
+	reg [15:0] dbgsim_sns_rpt = 0;
+	reg [11:0] dbgsim_sns_cnt = 0;
+	wire       dbgsim_sns_now = readData[7];
+	always @(posedge clk) begin
+		if (cep && _enable == 1'b0) begin
+			if (driveReadAddr != dbgsim_sns_addr || dbgsim_sns_now != dbgsim_sns_val) begin
+				if (dbgsim_sns_cnt < 12'd800) begin
+					dbgsim_sns_cnt <= dbgsim_sns_cnt + 1'd1;
+					$display("FLOPPY %m sense[%x]=%b (prev[%x]=%b x%0d) SEL=%b @%0t",
+					         driveReadAddr, dbgsim_sns_now, dbgsim_sns_addr,
+					         dbgsim_sns_val, dbgsim_sns_rpt, SEL, $time);
+				end
+				dbgsim_sns_addr <= driveReadAddr;
+				dbgsim_sns_val  <= dbgsim_sns_now;
+				dbgsim_sns_rpt  <= 16'd1;
+			end else if (dbgsim_sns_rpt != 16'hFFFF)
+				dbgsim_sns_rpt <= dbgsim_sns_rpt + 1'd1;
+		end
+	end
+	always @(posedge clk) begin
+		if (cep && _enable == 1'b0 && lstrbEdge && dbgsim_strobe_cnt < 10'd400) begin
+			dbgsim_strobe_cnt <= dbgsim_strobe_cnt + 1'd1;
+			$display("FLOPPY %m strobe(fall) cmd=%x track=%0d mfm=%b motor(reg)=%b @%0t",
+			         {SEL, ca2, ca1, ca0}, driveTrack, m_mfm, driveRegs[`DRIVE_REG_MOTORON], $time);
+		end
+		// MAME latches the command on the LSTRB RISING edge; we act on falling.
+		// Log both so a mid-pulse SEL/phase change shows up as a cmd mismatch.
+		if (cep && _enable == 1'b0 && lstrb && !lstrbPrev && dbgsim_strobe_cnt < 10'd400)
+			$display("FLOPPY %m strobe(rise) cmd=%x track=%0d @%0t",
+			         {SEL, ca2, ca1, ca0}, driveTrack, $time);
+		if (cep) begin
+			dbgsim_spin_d <= mfm_spinning;
+			if (mfm_spinning != dbgsim_spin_d)
+				$display("FLOPPY %m mfm_spinning -> %b (motor=%b ism_sel=%b cstin=%b) trk=%0d side=%b @%0t",
+				         mfm_spinning, motor, ism_sel, driveRegs[`DRIVE_REG_CSTIN], driveTrack, driveSide, $time);
+			dbgsim_idx_d <= mfm_index;
+			if (mfm_spinning && mfm_index && !dbgsim_idx_d)
+				$display("FLOPPY %m index pulse trk=%0d side=%b @%0t", driveTrack, driveSide, $time);
+			if (mfm_stb && dbgsim_dlv_cnt < 8'd64) begin
+				dbgsim_dlv_cnt <= dbgsim_dlv_cnt + 1'd1;
+				$display("FLOPPY %m mfm dlv %02x m=%b c0=%b trk=%0d side=%b @%0t",
+				         mfm_byte, mfm_mark, mfm_crc0, driveTrack, driveSide, $time);
+			end
+		end
+	end
+`endif
+
 	// SDRAM fetch address: the MFM generator for MFM disks, else the GCR encoder.
 	assign dskReadAddr = mfm_disk ? mfmReadAddr : gcrReadAddr;
+
+	// MFM index sense. On a SuperDrive with an MFM disk, sense regs 0x4/0xC
+	// (RdData0/1) read the index: 1 with motor off / no disk, else !idx (MAME
+	// mac_floppy wpt_r). The MAME 0.264 runtime capture shows the Sony driver
+	// polling this 7M times during the MFM session (through ISM Handshake bit3
+	// with phases parked on RdData) with 0.70% of reads low — the once-per-rev
+	// index pulse that bounds its sector searches. The GCR byte-stream register
+	// must NOT appear here for MFM disks (its GCR alphabet is MSB-set, which
+	// reads as a permanent "no index" 1).
+	wire mfm_idx_sense = mfm_spinning ? ~mfm_index : 1'b1;
 	
 	// TODO: auto-detect doubleSidedDisk from image file size
 	wire doubleSidedDisk = diskSides;
@@ -418,7 +489,8 @@ module floppy
 	wire lstrbEdge = lstrb == 1'b0 && lstrbPrev == 1'b1;
 
 	assign readData = _enable ? 8'hFF :
-	                  (driveReadAddr == `DRIVE_REG_RDDATA0 || driveReadAddr == `DRIVE_REG_RDDATA1) ? diskDataIn :
+	                  (driveReadAddr == `DRIVE_REG_RDDATA0 || driveReadAddr == `DRIVE_REG_RDDATA1) ?
+	                      (mfm_disk ? {mfm_idx_sense, 7'h00} : diskDataIn) :
 							{ driveRegsAsRead[driveReadAddr], 7'h00 };
 		
 	// write drive registers
