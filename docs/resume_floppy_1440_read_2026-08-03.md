@@ -7,31 +7,26 @@ commits `7e127ef`, `6c8438f`, `0280cfc`.
 
 ---
 
-## 0. TL;DR — ★ MISSION NOT CLOSED (mounted once, did not reproduce)
+## 0. TL;DR — 1.44MB floppy READ WORKS; screen corruption is the open item
 
-**A 1.44MB disk mounted and read correctly, exactly once.** Build `ccb82d32`
-mounted `OS-6.0.8 disk 1 of 2.dsk` as volume **"System Startup"** and the Finder
-listed its 7 real items (System Folder, Installer, Installer Script, Apple HD SC
-Setup, Disk First Aid, TeachText, Read Me — 1.1 MB used, 189K free), where the
-previous build gave *"This disk is improperly formatted for use in this drive."*
-Screenshot evidence: `scratch/hw_hidden.png`, `scratch/hw_corruption.png`.
+**The 1.44MB MFM/ISM floppy read works, confirmed by the user on build
+`ccb82d32`.** `OS-6.0.8 disk 1 of 2.dsk` mounts as volume **"System Startup"**
+and the Finder lists its 7 real items (System Folder, Installer, Installer
+Script, Apple HD SC Setup, Disk First Aid, TeachText, Read Me — 1.1 MB used,
+189K free), where every earlier build gave *"This disk is improperly formatted
+for use in this drive."* Evidence: `scratch/hw_hidden.png`.
 
-**★★ BUT THE USER COULD NOT REPRODUCE IT.** Immediately afterwards they rebooted
-the core themselves (to clear the screen corruption), mounted the disk by hand,
-and **got the same "improperly formatted" error as before.** So the mount is
-intermittent, configuration-dependent, or my one success differed from their
-attempt in some way not yet identified. **Treat the mission as OPEN.** One boot
-is never a verdict — this is precisely the trap recorded in
-`[[validate-the-gate-before-the-build]]`, and I fell into the mirror image of it
-by declaring success on a single observation.
+**Root cause was the missing INDEX pulse, not the data** (§1). The read datapath
+was already byte-exact; the driver never saw the once-per-revolution index it
+uses to bound its sector searches.
 
-**What IS solid** (proven in simulation, independent of the hardware question):
-the ISM read datapath is byte-exact (1400/1400 popped bytes vs the expected
-track), the sense/identity table matches MAME, and the two RTL bugs in §1 were
-real. What is NOT established is that fixing them is *sufficient* on hardware.
+**One scare, already root-caused:** an intermediate report that the mount "did
+not reproduce" turned out to be a **stale core pick** — `_Unstable` held 19
+`MacLC_*.rbf` files and a manual OSD selection landed on a July build. Resolved
+by the deploy discipline in §3a; not an RTL problem.
 
-**Two open issues, in priority order:** §3a (mount does not reproduce) then
-§4 (screen corruption — also unattributed).
+**★ THE OPEN ITEM: screen corruption from boot** (§4). Known state, present on
+this core, **not diagnosed and not attributed**. This is the mission now.
 
 ---
 
@@ -149,42 +144,45 @@ the menu bar) ▸ Hide MacAtrium** instead. That worked cleanly.
 
 ---
 
-## 3a. ★★ OPEN ISSUE #1 — the mount does not reproduce
+## 3a. ★★ DEPLOY DISCIPLINE — one core name, prune first, commit per build
 
-I saw one clean mount; the user, reloading the core themselves and mounting the
-disk by hand right afterwards, got the **same "improperly formatted" dialog**.
-Establish *what differed* before touching any RTL. Discriminators, cheapest and
-most likely first:
+**Standing rules (user, 2026-08-03).** A "the fix doesn't reproduce" scare cost
+part of a session and was purely a stale-core pick: `_Unstable` had accumulated
+**19** `MacLC_*.rbf` files, and a manual OSD selection landed on a July build.
 
-1. **★ Which RBF actually loaded?** There are **8+ `MacLC*.rbf` files** in
-   `/media/fat/_Unstable/` (`MacLC_RELEASE_20260727_f6ad562e`, `MacLC_REL_20260728`,
-   `MacLC_UAFIX_…`, `MacLC_Unstable_20260707_e322926s3`, `MacLC_WRFIX…` ×2,
-   `MacLCii…` ×2, plus `MacLC_ccb82d32`). Selecting a core by hand in the OSD
-   makes it very easy to land on a **stale** one — the documented off-by-one
-   trap in `[[scsi-fit-stabilization-mission]]` ("keep ONE launchable,
-   hash-named"). **A manual reload that picked any other RBF would reproduce the
-   old failure perfectly.** Check `coreRunning` / the launch log, or prune
-   `_Unstable` down to the one core under test.
-2. **★ Which OSD row was used?** Row 0 = *Mount Pri Floppy* = the **internal**
-   drive, which is the drive the ISM session selects (Mode bits 2:1 = `01`). My
-   successful mount used **row 0**. The older handoffs (and habit) say **row 1**,
-   which is the secondary/external drive — the ISM session would not read it, and
-   the guest would report exactly "improperly formatted". This alone could explain
-   the whole discrepancy.
-3. **Cold vs warm / timing.** My success was on a freshly booted guest, mounting
-   once shortly after MacAtrium came up. If the failure only appears on a warm or
-   long-idle guest, suspect motor/index state: `mfm_spinning` gates the encoder,
-   and the index only advances while it is true.
-4. **Per-fit marginality.** Same RTL, different SEED has flipped hardware
-   behaviour on this core before (`[[cdchanger-tb-transport-mission]]`, morning
-   handoff builds 1 vs 2). If 1-3 come back clean, re-roll SEED and re-gate.
+1. **ALWAYS deploy under the canonical name `MacLC.rbf`.** No hash-suffixed
+   names on the box — that is what creates the off-by-one/mis-pick trap
+   (`[[scsi-fit-stabilization-mission]]`). `scripts/local.env` already sets
+   `RBF_NAME="MacLC.rbf"`, so the deploy tool's default is correct; just don't
+   override it:
+   ```bash
+   python tools/misterdeploy/launch_unstable_core.py --host 192.168.99.143 \
+     --ssh-key ~/.ssh/mister_only --push output_files/MacLC.rbf --core MacLC.rbf
+   ```
+2. **Clear out older MacLC cores before proceeding.** Done 2026-08-03: 19 old
+   RBFs moved to `/media/fat/backups/maclc_rbf_20260803/`, leaving `_Unstable`
+   with exactly `MacLC.rbf` (md5 `ccb82d3284a97d571fe2eb13584c32c3`) plus
+   `MacLCii.rbf` / `MacLCii_0921_backup.rbf`, which are **a different machine —
+   do not touch them.** Re-prune whenever strays reappear.
+3. **Backups only periodically**, not per build. Real provenance lives in the
+   repo (`releases/` for release-quality artifacts) and in git.
+4. **★ Commit between every build**, so each fit maps to exactly one commit and
+   rollback is a `git checkout` away. Record the RBF md5 in the commit or the
+   handoff — Quartus is deterministic (same netlist + seed ⇒ same md5,
+   `[[validate-the-gate-before-the-build]]`), so the hash is a free provenance
+   proof tying a binary to a tree.
 
-**Do this before RTL work:** prune `_Unstable` to a single hash-named RBF,
-boot it, and run the row-0 mount twice and the row-1 mount twice, capturing the
-filename oracle and a screenshot each time. That 4-cell table settles items 1-2
-in one pass.
+**Verify what actually booted** before trusting any hardware result: the deploy
+tool prints `coreRunning`, and `md5sum /media/fat/_Unstable/MacLC.rbf` on the box
+should match the local `output_files/MacLC.rbf`.
 
-## 4. ★ OPEN ISSUE #2 — screen corruption
+**Mount to row 0** (`kbd:confirm` with no `kbd:down`) = *Mount Pri Floppy* = the
+**internal** drive, which is the one the ISM session selects (Mode bits 2:1 =
+`01`). Row 1 is the secondary/external drive; ISM never reads it, so a row-1
+mount produces exactly the "improperly formatted" dialog and looks like a
+regression.
+
+## 4. ★★ THE OPEN ISSUE — screen corruption (present from boot)
 
 Observed on build `ccb82d32` after the floppy mounted
 (`scratch/hw_corruption.png`): in the **background** BlueSCSI Toolbox window,
@@ -192,21 +190,24 @@ the icons for `g-cdchangercrash.txt` and `MacsBug` render as **coloured pixel
 noise**, and `ChangeLog`/`README` look blank. The foreground "System Startup"
 window's icons are clean.
 
-**Not diagnosed. Not attributed.** Be disciplined here — the morning session's
-own lesson (and `[[validate-the-gate-before-the-build]]`) is that a symptom seen
-once on one build is not a verdict.
+**User reports it is present from boot** and persists across a core reload, so
+it is a stable, reproducible state — not a one-off. It is still **not diagnosed
+and not attributed**; do not assume it came from these commits until an A/B says
+so.
 
 Candidates, cheapest discriminator first:
 
-1. **Damaged Desktop DB from the Finder bomb.** The guest bombed (error 41) and
-   rebooted during this session; corrupted icon resources in one window is the
-   classic signature. **Discriminator: rebuild the Desktop (boot holding
-   Cmd-Option) and re-look.** Do this FIRST — it is free and would explain
-   everything.
-2. **Pre-existing / recurring.** The user described it as happening "again",
-   so it may predate these commits. **Discriminator: load the previous build
-   `2a45c1a3` (or `releases/MacLC_20260802.rbf`) with the same guest state and
-   compare the same window.**
+1. **Pre-existing / recurring.** The user described it as happening "again".
+   **Discriminator: load a known-good older core and compare the same window.**
+   The July builds are archived at `/media/fat/backups/maclc_rbf_20260803/`, and
+   `releases/MacLC_20260802.rbf` is in the repo — copy one back in as
+   `MacLC.rbf` (or push it under that name), look, then restore. If the
+   corruption is there too, these commits are exonerated and this becomes a
+   separate, older bug.
+2. **Damaged Desktop DB.** The guest bombed (Finder error 41) during this
+   session; corrupted icon resources are the classic signature.
+   **Discriminator: rebuild the Desktop (boot holding Cmd-Option) and re-look.**
+   Free, and would explain garbage icons specifically.
 3. **A regression from these commits.** Least likely on current evidence but not
    excluded. Note the obvious suspect has already been **eliminated**: the VIA
    ORA fix cannot corrupt video through `vid_alt` (PA6), because `vid_alt` is
