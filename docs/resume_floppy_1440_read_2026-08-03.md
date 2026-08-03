@@ -7,22 +7,31 @@ commits `7e127ef`, `6c8438f`, `0280cfc`.
 
 ---
 
-## 0. TL;DR
+## 0. TL;DR — ★ MISSION NOT CLOSED (mounted once, did not reproduce)
 
-**The 1.44MB floppy read is DONE and hardware-validated.** Build `ccb82d32`
-mounts `OS-6.0.8 disk 1 of 2.dsk` as volume **"System Startup"** and the Finder
-lists its 7 real items (System Folder, Installer, Installer Script, Apple HD SC
-Setup, Disk First Aid, TeachText, Read Me — 1.1 MB used, 189K free). The
-previous build showed *"This disk is improperly formatted for use in this
-drive."*
+**A 1.44MB disk mounted and read correctly, exactly once.** Build `ccb82d32`
+mounted `OS-6.0.8 disk 1 of 2.dsk` as volume **"System Startup"** and the Finder
+listed its 7 real items (System Folder, Installer, Installer Script, Apple HD SC
+Setup, Disk First Aid, TeachText, Read Me — 1.1 MB used, 189K free), where the
+previous build gave *"This disk is improperly formatted for use in this drive."*
+Screenshot evidence: `scratch/hw_hidden.png`, `scratch/hw_corruption.png`.
 
-**Root cause was the missing INDEX pulse, not the data.** The read datapath was
-already byte-exact; the driver simply never saw the once-per-revolution index it
-uses to bound its sector searches.
+**★★ BUT THE USER COULD NOT REPRODUCE IT.** Immediately afterwards they rebooted
+the core themselves (to clear the screen corruption), mounted the disk by hand,
+and **got the same "improperly formatted" error as before.** So the mount is
+intermittent, configuration-dependent, or my one success differed from their
+attempt in some way not yet identified. **Treat the mission as OPEN.** One boot
+is never a verdict — this is precisely the trap recorded in
+`[[validate-the-gate-before-the-build]]`, and I fell into the mirror image of it
+by declaring success on a single observation.
 
-**NEW OPEN ISSUE (the reason this doc exists): screen corruption.** See §4. It
-is NOT diagnosed and NOT attributed — do not assume it is a regression from
-these commits until the discriminator in §4 is run.
+**What IS solid** (proven in simulation, independent of the hardware question):
+the ISM read datapath is byte-exact (1400/1400 popped bytes vs the expected
+track), the sense/identity table matches MAME, and the two RTL bugs in §1 were
+real. What is NOT established is that fixing them is *sufficient* on hardware.
+
+**Two open issues, in priority order:** §3a (mount does not reproduce) then
+§4 (screen corruption — also unattributed).
 
 ---
 
@@ -140,7 +149,42 @@ the menu bar) ▸ Hide MacAtrium** instead. That worked cleanly.
 
 ---
 
-## 4. ★ THE OPEN ISSUE — screen corruption
+## 3a. ★★ OPEN ISSUE #1 — the mount does not reproduce
+
+I saw one clean mount; the user, reloading the core themselves and mounting the
+disk by hand right afterwards, got the **same "improperly formatted" dialog**.
+Establish *what differed* before touching any RTL. Discriminators, cheapest and
+most likely first:
+
+1. **★ Which RBF actually loaded?** There are **8+ `MacLC*.rbf` files** in
+   `/media/fat/_Unstable/` (`MacLC_RELEASE_20260727_f6ad562e`, `MacLC_REL_20260728`,
+   `MacLC_UAFIX_…`, `MacLC_Unstable_20260707_e322926s3`, `MacLC_WRFIX…` ×2,
+   `MacLCii…` ×2, plus `MacLC_ccb82d32`). Selecting a core by hand in the OSD
+   makes it very easy to land on a **stale** one — the documented off-by-one
+   trap in `[[scsi-fit-stabilization-mission]]` ("keep ONE launchable,
+   hash-named"). **A manual reload that picked any other RBF would reproduce the
+   old failure perfectly.** Check `coreRunning` / the launch log, or prune
+   `_Unstable` down to the one core under test.
+2. **★ Which OSD row was used?** Row 0 = *Mount Pri Floppy* = the **internal**
+   drive, which is the drive the ISM session selects (Mode bits 2:1 = `01`). My
+   successful mount used **row 0**. The older handoffs (and habit) say **row 1**,
+   which is the secondary/external drive — the ISM session would not read it, and
+   the guest would report exactly "improperly formatted". This alone could explain
+   the whole discrepancy.
+3. **Cold vs warm / timing.** My success was on a freshly booted guest, mounting
+   once shortly after MacAtrium came up. If the failure only appears on a warm or
+   long-idle guest, suspect motor/index state: `mfm_spinning` gates the encoder,
+   and the index only advances while it is true.
+4. **Per-fit marginality.** Same RTL, different SEED has flipped hardware
+   behaviour on this core before (`[[cdchanger-tb-transport-mission]]`, morning
+   handoff builds 1 vs 2). If 1-3 come back clean, re-roll SEED and re-gate.
+
+**Do this before RTL work:** prune `_Unstable` to a single hash-named RBF,
+boot it, and run the row-0 mount twice and the row-1 mount twice, capturing the
+filename oracle and a screenshot each time. That 4-cell table settles items 1-2
+in one pass.
+
+## 4. ★ OPEN ISSUE #2 — screen corruption
 
 Observed on build `ccb82d32` after the floppy mounted
 (`scratch/hw_corruption.png`): in the **background** BlueSCSI Toolbox window,
