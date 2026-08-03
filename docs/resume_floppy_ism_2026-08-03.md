@@ -9,21 +9,24 @@ to be WRONG — see §3). Branch `fix-quicktime`, commit `a5ef2ac` (+ uncommitte
 
 ## 0. TL;DR — where we are
 
-Build 2 of the ISM engine **boots clean and the OS now takes the MFM/ISM path for
-a 1.44MB disk** — a real advance over July, where 1.44M disks were routed to GCR
-and never touched ISM at all. The disk still does not mount: the guest reports
-**"This disk is improperly formatted for use in this drive."**
+The ISM engine **boots clean and the OS now takes the MFM/ISM path for a 1.44MB
+disk** — a real advance over July, where 1.44M disks were routed to GCR and never
+touched ISM at all. The disk does not yet mount: the guest reports **"This disk is
+improperly formatted for use in this drive."** (versus the GCR path's "unreadable"
++ One-Sided/Two-Sided, so the two paths are now clearly distinguishable).
 
-Two distinct open problems, in priority order:
+**RESOLVED this session — the primary drive going dead was MY regression, and it
+is fixed (build 3, HW-confirmed).** Root cause: the ISM Phases register drives the
+same `ca0-2/LSTRB` lines as the IWM soft switches, and the phase walks pass
+through `$FF` = `{LSTRB,ca2,ca1,ca0}=1111`, which `floppy.v` decodes as
+`driveWriteAddr 6 (EJECT)` + `ca2=1`. Every per-mount ISM probe ejected the image
+it had just inserted. Only the ISM-selected drive was hit, which is why the
+*external* drive still worked and the failure looked like a routing/SDRAM-region
+bug. Proven by A/B: pre-ISM release reacts on row 0, build `833c327b` does not;
+after the fix (`2a45c1a3`) row 0 reacts again. **Both drives now behave
+identically.**
 
-1. **★ OSD row asymmetry (BLOCKING, probably the bigger fish).** Mounting a disk
-   via OSD **row 0** produces *no guest reaction at all* (neither 800K nor
-   1.44M). Mounting via **row 1** always produces a reaction. Per `CONF_STR`
-   order (`F1` = Mount Pri Floppy, then `F2` = Mount Sec Floppy) row 0 should be
-   the *internal* drive — the one that matters. Unresolved whether this is a
-   regression from the ISM commit or predates it; the A/B against the pre-ISM
-   release was in flight when the session ended (§3).
-2. **The ISM read itself returns data the OS rejects** (§4).
+Remaining problem: **the ISM read returns a payload the OS rejects** (§4).
 
 ---
 
@@ -53,7 +56,13 @@ phases walk → `ModeClr F8` exit).
 | # | RBF md5 | SEED | STA | HARDWARE |
 |---|---|---|---|---|
 | 1 | `85912c51` | 5 | met +0.247 ns | **FAILED** — boot 1 wedged (Finder menu bar, no icons, dead to input); boot 2 **"Finder — bad F-Line instruction"** |
-| 2 | `833c327b` | 7 | met +0.247 ns | **CLEAN** — full MacAtrium desktop, colour icons, responsive |
+| 2 | `833c327b` | 7 | met +0.247 ns | **CLEAN** — full MacAtrium desktop, colour icons, responsive. Row 0 dead (the eject regression). |
+| 3 | `2a45c1a3` | 7 | met +0.243 ns | **CLEAN** — boots to MacAtrium; **row 0 restored** (800K → "unreadable"; 1.44M → "improperly formatted", same as row 1). Commit `e522736`. |
+| — | **not built** | — | — | Commit `586ed77`, the ISM **motor** fix, is **committed but NEVER BUILT, DEPLOYED OR TESTED** — the fit was cancelled. `mfm_spinning` was keyed on the IWM `MOTORON` register only, but an ISM session spins the drive with **Mode bit 7** (`swim_ism_read_reference.md` §B) and need never touch `MOTORON`, so the byte engine could stay parked for the entire MFM session. Now `motor \|\| ism_sel`. **This is a reasoned fix, not a verified one — gate it first.** |
+
+**Budget: 3 of 10 builds used.** `MacLC.qsf` SEED is committed as 7.
+`.143` is left running build 3 (`2a45c1a3`) with the 1.44M image mounted and an
+"improperly formatted" dialog on screen — harmless, eject any time.
 
 **Same RTL, different SEED — the failure was a marginal fit, not a logic bug.**
 This is the documented per-fit marginality class (identical signature to the July
@@ -90,25 +99,19 @@ Both rows *do* mount a file (proven: the MiSTer screenshot filename tracks the
 mounted image — a free mount oracle, use it). So both are file-mount rows, and
 the guest only ever reads the drive fed by row 1.
 
-**★ UNRESOLVED and the first thing to settle next session:** is row 0 dead
-because of the ISM commit, or was it always dead? The A/B (deploy
-`releases/MacLC_20260802.rbf`, already on the box, mount 800K to row 0) was
-launched but **its result was never read**. Evidence pointing at *pre-existing*:
-July's ring — wired to `floppyInt` — captured 138 kB of internal-drive GCR reads,
-so the internal drive was alive pre-ISM. Evidence pointing at *my change*: the
-only edit to `floppyInt._enable` is the ISM mux
-(`ism_mode ? ~ism_devsel_int : ~(diskEnableInt & driveSel)`), which differs only
-when `ism_mode`=1.
+**RESOLVED — it was the ISM eject regression (§0), fixed in build 3.** On build
+`2a45c1a3` row 0 reacts again and both drives behave identically. The table above
+is the *symptom* record; the row-1 recipe remains the one to use because it is
+what these results were gathered with, but row 0 is no longer dead.
 
-Candidate mechanisms worth checking (cheap, code-only):
-- `rtl/floppy.v` eject: `ejectIndicatorTimer` **never decrements while
-  `insertDisk` is high** (the `else if (insertDisk)` branch shadows the decrement).
-  One EJECT strobe while a disk is mounted latches `diskEject` high, which wipes
-  `dsk_int_*` in `MacLC.sv` — a disk that can never stay inserted.
-- `driveSel = via_pa_o[4]` (`dataController_top.sv:508`) gates **only** the
-  internal drive. On Mac II-family VIAs PA4 is the ROM-overlay bit, not a drive
-  select; if the OS drives it low, the internal drive is permanently disabled.
-  MAME's LC wires head-select from PA5 only (`v8.cpp:258`) and nothing to PA4.
+Two theories considered and **discarded** (don't spend time on them again):
+- `ejectIndicatorTimer` "never decrements while `insertDisk` is high" — it does
+  self-resolve: `diskEject` is combinational, so `MacLC.sv` clears `dsk_int_*`
+  within a cycle, `insertDisk` drops, and the timer then counts down.
+- `driveSel = via_pa_o[4]` gating only the internal drive — plausible (PA4 is the
+  overlay bit on Mac II-family VIAs, and MAME's LC wires nothing to PA4), but it
+  cannot be the cause: row 0 works on the pre-ISM build with the same gate.
+  Still worth revisiting on its own merits some day.
 
 ---
 
@@ -132,15 +135,36 @@ x=0 → MFM/ISM mount"). The comment block at `rtl/floppy.v:139-145` is **stale 
 source-reading text that contradicts the code** and claims HD ⇒ `1011`; it nearly
 caused a wrong "fix" this session. Delete/correct it.
 
-Next suspects for the bad payload, in order:
-1. **Region vs. drive mismatch** — whichever drive the OS actually reads must be
-   the one whose SDRAM region got the image (`index 1 → $600000 → floppyInt`,
-   `index 2 → $700000 → floppyExt`; download and read bases verified matching in
-   `MacLC.sv:1768-1769` and `addrController_top.v:210-211`). If the OS reads the
-   internal drive while the user mounts "Pri", this is *also* the July
-   "SDRAM region ≠ image" finding — same bug, not a new one.
-2. Sector→image byte mapping / side ordering in `mfm_track_encoder.v`.
-3. FIFO/Handshake shape (`swim.v:411-420`) and the mark-sync hunt.
+### Ruled out (do NOT re-audit)
+
+- **Region/plumbing symmetry.** Download and read bases match:
+  `index 1 → $600000 → floppyInt`, `index 2 → $700000 → floppyExt`
+  (`MacLC.sv:1768-1769`, `addrController_top.v:210-211`). No swap.
+- **Guest RAM cannot reach the floppy region.** `ram_sdram_word`
+  (`addrController_top.v:177-180`) is bounded — motherboard mirror wraps to 20
+  bits, SIMM caps at `$4FFFFF`, ROM `$500000`, VRAM `$580000`. Nothing the CPU
+  does can scribble on `$600000+`.
+- **★ July's "SDRAM region ≠ image" verdict is very likely an ARTIFACT.** That
+  capture mounted with `kbd:down` (→ index 2 → `$700000`) while the ring watched
+  `floppyInt` reading `$600000` — a region that never received that image. Its
+  "138 bytes of garbage found in no image" is exactly what an untouched region
+  looks like. Do not resume the download-doesn't-land hunt on that evidence.
+- **Sector→image address math** in `mfm_track_encoder.v:65-76`:
+  `((track*2+side)*SPT + sector)*512 + offset`, shift-add decomposition verified
+  correct (`block_hd = ts*16 + ts*2 = ts*18`), max = 1,474,559 ✓.
+- **Drive-ID polarity** (§4 above) — correct as written.
+
+### Next suspects for the bad payload, in order
+
+1. **The ISM motor gate** — build 4, described in §2. Best current candidate: if
+   the driver only ever commands the motor via ISM Mode b7, the old gate meant
+   *zero* bytes were delivered for the whole session.
+2. **Handshake b2/b3.** `swim_ism_read_reference.md` §C says SWIM1 sets **both**
+   0x04 and 0x08 from wprot/sense; `swim.v:411-420` sets b3 only and hardcodes
+   b2=0, citing a "0.264 correction". These two sources contradict each other —
+   settle it against MAME before trusting either.
+3. Mark-sync hunt / FIFO shape (`swim.v:293`, `571`), and whether the driver
+   needs bytes delivered during gaps as well as fields.
 
 ---
 
@@ -170,16 +194,22 @@ Next suspects for the bad payload, in order:
 
 ## 6. Recommended next steps
 
-1. **Finish the row-0 A/B** (§3) — deploy `releases/MacLC_20260802.rbf`, mount
-   800K to row 0, and see whether the guest reacts. This decides whether to spend
-   the next build on an internal-drive fix or on the ISM payload.
-2. Fold into **build 3** (batch them — builds are ~17-20 min and the budget is 8):
-   - the `ejectIndicatorTimer` starvation fix (§3),
-   - dropping/【re-deriving】the `& driveSel` gate on the internal drive (§3),
-   - the stale `floppy.v:139-145` comment (§4).
-3. Only then chase the payload (§4) — and prefer a **targeted unit testbench**
-   over a full-boot sim: a full System boot in Verilator takes hours, whereas the
-   ISM protocol can be driven directly against `swim`+`floppy`+
-   `mfm_track_encoder` in seconds with complete byte visibility.
-4. Keep the per-fit gate: every new fit must reach a populated Finder desktop
-   before any floppy verdict is trusted. STA does not predict it.
+1. **Gate build 4** (the ISM motor fix) — mount the 1.44M image to row 1 and see
+   whether the dialog changes or the volume mounts.
+2. **★ If build 4 does not mount it, stop guessing and buy VISIBILITY.** Every
+   build so far has been a 1-bit experiment against a blind read path, and the
+   budget is finite. Two good options:
+   - **A targeted unit testbench** (preferred): drive the ISM register protocol
+     directly against `swim` + `floppy` + `mfm_track_encoder` with a small RAM
+     model standing in for the image. Runs in seconds, shows every delivered
+     byte, Handshake value and FIFO transition. A *full System boot* in Verilator
+     is the thing to avoid (hours); a unit TB is not.
+   - **A 1-bit hardware oracle** if the TB is impractical: gate `CSTIN` on a
+     readback of the image's first word (both test images start `4C 4B` = "LK")
+     so the guest's "disk appears / does not appear" answers *"does the region
+     the drive reads actually hold the mounted image?"* with no JTAG. Three
+     distinguishable outcomes: no disk = fetch/region wrong; disk + mounts =
+     fixed; disk + "improperly formatted" = region fine, framing wrong.
+3. Keep the per-fit gate: every new fit must reach a populated Finder desktop
+   before any floppy verdict is trusted. STA does not predict it (build 1).
+4. Restore the CD boot config when the mission ends (§5).
