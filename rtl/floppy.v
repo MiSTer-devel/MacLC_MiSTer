@@ -93,6 +93,8 @@ module floppy
 	// and strobes mfm_stb for one cep period (the SWIM samples it on cen).
 	input            ism_active, // SWIM is in ISM mode: the phase lines are ISM
 	                             // register traffic, not IWM drive commands
+	input            ism_sel,    // ISM has THIS drive selected with Mode b7
+	                             // (motor on) set — the ISM-mode motor command
 	input            mfm_disk,   // this disk is MFM (use the MFM generator for fetch+bytes)
 	input            mfm_hd,     // 1.44MB HD (18 spt) vs 720K DD (9 spt)
 	output reg [7:0] mfm_byte,   // delivered decoded MFM byte
@@ -262,7 +264,14 @@ module floppy
 	// skipped after each advance so an in-flight pre-advance ack can't hand us
 	// the previous byte's data. The internal-drive extra slot acks every ~2 us,
 	// so a stall only stretches the odd byte (the driver is poll-driven).
-	wire       mfm_spinning = mfm_disk && motor && ~driveRegs[`DRIVE_REG_CSTIN];
+	// The motor runs if EITHER path commanded it. In IWM mode that is the
+	// MOTORON drive register (an LSTRB strobe); in ISM mode the driver spins the
+	// drive with **Mode register bit 7 = motor on** (swim_ism_read_reference.md
+	// §B) and need never touch MOTORON — so keying spinning on MOTORON alone
+	// left the byte engine parked for the whole MFM session, the FIFO never
+	// filled, Handshake b7 never set, and the driver saw an empty disk.
+	wire       mfm_spinning = mfm_disk && (motor || ism_sel) &&
+	                          ~driveRegs[`DRIVE_REG_CSTIN];
 	wire [8:0] mfm_period   = mfm_hd ? 9'd129 : 9'd259;
 	reg  [8:0] mfm_timer;
 	reg        mfm_fresh;
