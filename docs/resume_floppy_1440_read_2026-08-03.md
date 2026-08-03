@@ -95,6 +95,19 @@ python tools/misterdeploy/ws_send.py --host 192.168.99.143 \
 - **USER REQUIREMENT (stated 2026-08-03):** always quit the guest via
   **Finder ▸ Special ▸ Shut Down** before loading a core, to avoid hard-disk
   corruption. Hard-reloading a running guest is not acceptable.
+- **⚠ VERIFIED ONLY IN PART.** Mouse move + click is proven (it selected
+  "Hide MacAtrium" successfully). A full Special ▸ Shut Down was **not**
+  completed: after keyboard use the cursor stopped responding to moves and the
+  screenshot API stopped producing new frames. Suspects, in order: the known
+  ADB single-device autopoll limitation ([[adb-mouse-needs-wire-srq]] — the
+  mouse needs wire-level SRQ to break in once the keyboard is the polled
+  device), and HPS churn from heavy screenshot/ws polling
+  ([[shared-mister-hps-exhaustion]]). **Next session: verify this path
+  end-to-end on a freshly booted guest, mouse-only, before relying on it.**
+  Classic Mac menus track mouse-DOWN, so use
+  `POST /api/controls/mouse/left_down`, move onto the item, then `left_up` —
+  a fast `mouseBtn:left` click will not hold a menu open. Mouse deltas are
+  accelerated, so step in small increments (~8 px), not one big jump.
 
 ### ★ Do NOT Cmd-Q MacAtrium
 Quitting it (`Cmd-Q` → Quit) bombed the Finder with **"error type 41"** and
