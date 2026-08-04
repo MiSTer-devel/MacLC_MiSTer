@@ -1239,7 +1239,7 @@ module emu
 	// match no deck — see b9b5f5d), so the FLPA-E probes can't be read.
 	// This renders the same forensics as PIXELS: 8 rows of 32 cells at the
 	// top-left corner, each cell 8px wide x 8 lines tall, MSB first,
-	// white=1 / black=0. Read from a screenshot (scratch/parse_hud.py);
+	// white=1 / black=0. Read from a screenshot (scripts/parse_hud.py);
 	// row 0 is a constant marker for geometry/polarity self-calibration.
 	//   row 0  32'hA5C3F00F                          marker
 	//   row 1  {byte_cnt[15:0], miss_cnt[15:0]}      delivered / starved

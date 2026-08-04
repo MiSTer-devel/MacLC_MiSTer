@@ -101,10 +101,10 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 
 # DEBUG (screen): on-screen floppy HUD — renders the FLPA-E forensics as a
 # binary pixel strip in the top-left corner (8 rows x 32 cells, layout in
-# MacLC.sv USE_DBG_HUD block; parse screenshots with scratch/parse_hud.py).
+# MacLC.sv USE_DBG_HUD block; parse screenshots with scripts/parse_hud.py).
 # Built 2026-08-04 because this board's JTAG hub name table is corrupt and
 # the ISSP probes can't be read. Needs NO JTAG. Keep COMMENTED for release.
-# set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
+set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"
