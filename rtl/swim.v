@@ -116,6 +116,17 @@ module swim
 	reg [3:0]  ism_param_idx;      // Auto-incrementing param index
 	reg [15:0] ism_fifo[0:1];      // 2-entry FIFO (data + mark/CRC flags)
 	reg [1:0]  ism_fifo_pos;       // FIFO fill level (0=empty, 1=one, 2=full)
+	// Generator-side staging ring (2026-08-04, the deterministic floppy copy
+	// error): the CPU-visible FIFO stays 2 entries — the ROM self-test and
+	// every handshake/error readback keep their exact semantics — but MFM
+	// deliveries land here first and drain into the FIFO as the CPU makes
+	// room. The old ceiling was one dropped byte (read overrun, error 0x01,
+	// garbled field -> Finder "disk error") whenever the poll loop stalled
+	// >~49us (2 entries x 16.25us); tb_ism_gaptest reproduces that at 60us.
+	// 16 staged entries raise the ceiling to ~290us of CPU stall.
+	(* ramstyle = "MLAB" *) reg [15:0] ism_stage[0:15];
+	reg [3:0]  ism_stage_rd, ism_stage_wr;
+	reg [4:0]  ism_stage_cnt;
 	reg [1:0]  iwm_to_ism_counter; // Mode switch sequence detector
 
 	// ISM FIFO entry layout: [7:0] data byte, [8] MARK (A1 sync), [9] CRC token
@@ -314,6 +325,10 @@ module swim
 	wire ism_gen_push = ism_read_active && mfm_stb_sel &&
 	                    (mfm_synced || mfm_mark_sel);
 	wire [15:0] ism_gen_word = {5'b0, mfm_crc0_sel, 1'b0, mfm_mark_sel, mfm_byte_sel};
+	// staging flow control: push on delivery (unless full), drain into the
+	// 2-entry FIFO on quiet cycles (CPU FIFO events only fire at acc_end)
+	wire stage_push  = ism_gen_push && (ism_stage_cnt != 5'd16);
+	wire stage_drain = (ism_stage_cnt != 5'd0) && (ism_fifo_pos < 2'd2) && !acc_end;
 	wire [15:0] ism_cpu_word = (acc_addr_l[2:0] == 3'h2) ? 16'h0200 :
 	                           (acc_addr_l[2:0] == 3'h1) ? {7'b0, 1'b1, acc_data_l} :
 	                                                       {8'b0, acc_data_l};
@@ -491,6 +506,7 @@ module swim
 			ism_error <= 0;
 			ism_param_idx <= 0;
 			ism_fifo_pos <= 0;
+			ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
 			iwm_to_ism_counter <= 0;
 			ism_fifo[0] <= 0;
 			ism_fifo[1] <= 0;
@@ -559,37 +575,34 @@ module swim
 			end
 
 			// ============================================================
-			// Unified ISM FIFO transaction: generator push (MFM delivery)
-			// vs CPU pop (reg0/1 read, at acc_end) vs CPU push (write side).
-			// A reg0 pop of a MARK byte flags Error b1 (mark-into-data);
-			// pop-empty and push-full flag Error b2 (under/overrun).
+			// ISM FIFO transactions. Generator deliveries land in the
+			// staging ring; the drain refills the 2-entry CPU FIFO on
+			// cycles without CPU FIFO events (those only fire at acc_end),
+			// so every CPU-visible semantic (pop order, handshake bits,
+			// self-test full-at-2) is unchanged. A reg0 pop of a MARK byte
+			// flags Error b1; pop-empty / cpu-push-full flag Error b2;
+			// a delivery with the STAGE full drops the byte and flags
+			// Error b0 (read overrun) exactly as the 2-deep design did —
+			// the threshold just moved from ~49us of poll stall to ~290us.
 			// ============================================================
-			if (ism_gen_push && ism_pop_req) begin
-				// simultaneous delivery + pop: head leaves, new byte appends
-				if (ism_fifo_pos == 2'd2) begin
-					ism_fifo[0] <= ism_fifo[1];
-					ism_fifo[1] <= ism_gen_word;
-					if (acc_addr_l[2:0] == 3'h0 && ism_fifo[0][FIFO_B_MARK]) ism_error[1] <= 1'b1;
-				end else if (ism_fifo_pos == 2'd1) begin
-					ism_fifo[0] <= ism_gen_word;
-					if (acc_addr_l[2:0] == 3'h0 && ism_fifo[0][FIFO_B_MARK]) ism_error[1] <= 1'b1;
-				end else begin
-					ism_fifo[0]  <= ism_gen_word;  // pop of empty: underrun + push
-					ism_fifo_pos <= 2'd1;
-					ism_error[2] <= 1'b1;
-				end
+			// stage_cnt arithmetic first: any FIFO-clear later in this
+			// block overrides it (last nonblocking write wins).
+			ism_stage_cnt <= ism_stage_cnt + {4'd0, stage_push} - {4'd0, stage_drain};
+			if (stage_push) begin
+				ism_stage[ism_stage_wr] <= ism_gen_word;
+				ism_stage_wr <= ism_stage_wr + 4'd1;
 			end
-			else if (ism_gen_push) begin
-				if (ism_fifo_pos < 2'd2) begin
-					ism_fifo[ism_fifo_pos[0]] <= ism_gen_word;
-					ism_fifo_pos <= ism_fifo_pos + 2'd1;
-				end else
-					ism_error[0] <= 1'b1;          // overrun: delivered byte lost
-					                               // (MAME swim1 read-side push-full
-					                               // = error 0x01, byte dropped;
-					                               // CPU-side push-full stays 0x04)
+			if (ism_gen_push && ism_stage_cnt == 5'd16)
+				ism_error[0] <= 1'b1;          // overrun: delivered byte lost
+				                               // (MAME swim1 read-side push-full
+				                               // = error 0x01, byte dropped;
+				                               // CPU-side push-full stays 0x04)
+			if (stage_drain) begin
+				ism_fifo[ism_fifo_pos[0]] <= ism_stage[ism_stage_rd];
+				ism_fifo_pos <= ism_fifo_pos + 2'd1;
+				ism_stage_rd <= ism_stage_rd + 4'd1;
 			end
-			else if (ism_pop_req) begin
+			if (ism_pop_req) begin
 				if (ism_fifo_pos != 0) begin
 					ism_fifo[0]  <= ism_fifo[1];
 					ism_fifo_pos <= ism_fifo_pos - 2'd1;
@@ -644,13 +657,17 @@ module swim
 								$display("SWIM: ISM -> IWM (ModeClr %02x) @%0t", acc_data_l, $time);
 `endif
 							end
-							if ((ism_mode_reg & ~acc_data_l) & 8'h01)
+							if ((ism_mode_reg & ~acc_data_l) & 8'h01) begin
 								ism_fifo_pos <= 0;
+								ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
+							end
 						end
 						3'h7: begin // Mode set (OR data)
 							ism_mode_reg <= ism_mode_reg | acc_data_l;
-							if ((ism_mode_reg | acc_data_l) & 8'h01)
+							if ((ism_mode_reg | acc_data_l) & 8'h01) begin
 								ism_fifo_pos <= 0;
+								ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
+							end
 						end
 						default: ;
 					endcase
@@ -705,6 +722,7 @@ module swim
 			if (ism_arm && !ism_arm_d) begin
 				mfm_synced   <= 1'b0;
 				ism_fifo_pos <= 0;
+				ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
 			end
 
 `ifdef SIMULATION

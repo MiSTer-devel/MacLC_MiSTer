@@ -96,7 +96,7 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # release RBFs ship without the probe deck. Flips are working-tree-only.
 #   USE_DBG_PROBES   = 11 top-level probes (CDA0-4/CDUR, PSDT/PSDS/PSD2/PSD3, WRFB)
 #   USE_DBG_OBSERVER = the dbg_probes SCSI/CPU/video deck (PADR..PVID)
-set_global_assignment -name VERILOG_MACRO "USE_DBG_PROBES=1"
+# set_global_assignment -name VERILOG_MACRO "USE_DBG_PROBES=1"
 # set_global_assignment -name VERILOG_MACRO "USE_DBG_OBSERVER=1"
 
 source sys/sys.tcl
