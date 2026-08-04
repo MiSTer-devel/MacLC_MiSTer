@@ -179,19 +179,19 @@ wire       resp_we_e = resp_we && !resp_wa[0];
 wire       resp_we_o = resp_we &&  resp_wa[0];
 wire [8:0] tb0_e = (tb0 + {8'd0, tb0[0]}) >> 1;
 wire [8:0] tb2_e = (tb2 + {8'd0, tb2[0]}) >> 1;
-cd_sdp #(.DW(8), .AW(8)) resp_e0 (
+cd_sdp_mlab #(.DW(8), .AW(8)) resp_e0 (
 	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_e),
 	.raddr(tb0_e[7:0]), .q(re_q0)
 );
-cd_sdp #(.DW(8), .AW(8)) resp_e1 (
+cd_sdp_mlab #(.DW(8), .AW(8)) resp_e1 (
 	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_e),
 	.raddr(tb2_e[7:0]), .q(re_q1)
 );
-cd_sdp #(.DW(8), .AW(8)) resp_o0 (
+cd_sdp_mlab #(.DW(8), .AW(8)) resp_o0 (
 	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_o),
 	.raddr(tb0[8:1]), .q(ro_q0)
 );
-cd_sdp #(.DW(8), .AW(8)) resp_o1 (
+cd_sdp_mlab #(.DW(8), .AW(8)) resp_o1 (
 	.clock(clk), .waddr(resp_wa[8:1]), .wdata(resp_wd), .wr(resp_we_o),
 	.raddr(tb2[8:1]), .q(ro_q1)
 );
@@ -208,19 +208,19 @@ wire       t43_we_e = t43_we && !t43_wa[0];
 wire       t43_we_o = t43_we &&  t43_wa[0];
 wire [8:0] t43b0_e = (t43b0 + {8'd0, t43b0[0]}) >> 1;
 wire [8:0] t43b2_e = (t43b2 + {8'd0, t43b2[0]}) >> 1;
-cd_sdp #(.DW(8), .AW(8)) t43_e0 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t43_e0 (
 	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_e),
 	.raddr(t43b0_e[7:0]), .q(t43e_q0)
 );
-cd_sdp #(.DW(8), .AW(8)) t43_e1 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t43_e1 (
 	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_e),
 	.raddr(t43b2_e[7:0]), .q(t43e_q1)
 );
-cd_sdp #(.DW(8), .AW(8)) t43_o0 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t43_o0 (
 	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_o),
 	.raddr(t43b0[8:1]), .q(t43o_q0)
 );
-cd_sdp #(.DW(8), .AW(8)) t43_o1 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t43_o1 (
 	.clock(clk), .waddr(t43_wa[8:1]), .wdata(t43_wd), .wr(t43_we_o),
 	.raddr(t43b2[8:1]), .q(t43o_q1)
 );
@@ -240,19 +240,19 @@ wire       t2_we_e = t2_we && !t2_wa[0];
 wire       t2_we_o = t2_we &&  t2_wa[0];
 wire [8:0] t2b0_e = (t2b0 + {8'd0, t2b0[0]}) >> 1;
 wire [8:0] t2b2_e = (t2b2 + {8'd0, t2b2[0]}) >> 1;
-cd_sdp #(.DW(8), .AW(8)) t2_e0 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t2_e0 (
 	.clock(clk), .waddr(t2_wa[8:1]), .wdata(t2_wd), .wr(t2_we_e),
 	.raddr(t2b0_e[7:0]), .q(t2e_q0)
 );
-cd_sdp #(.DW(8), .AW(8)) t2_e1 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t2_e1 (
 	.clock(clk), .waddr(t2_wa[8:1]), .wdata(t2_wd), .wr(t2_we_e),
 	.raddr(t2b2_e[7:0]), .q(t2e_q1)
 );
-cd_sdp #(.DW(8), .AW(8)) t2_o0 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t2_o0 (
 	.clock(clk), .waddr(t2_wa[8:1]), .wdata(t2_wd), .wr(t2_we_o),
 	.raddr(t2b0[8:1]), .q(t2o_q0)
 );
-cd_sdp #(.DW(8), .AW(8)) t2_o1 (
+cd_sdp_mlab #(.DW(8), .AW(8)) t2_o1 (
 	.clock(clk), .waddr(t2_wa[8:1]), .wdata(t2_wd), .wr(t2_we_o),
 	.raddr(t2b2[8:1]), .q(t2o_q1)
 );
@@ -1388,6 +1388,29 @@ module cd_sdp #(parameter DW = 16, AW = 12)
 // 2 Kbit response planes into ~2000 registers each — fit attempts #1-#3 of
 // this file) + no_rw_check, with write and read in SEPARATE always blocks.
 (* ramstyle = "M10K,no_rw_check" *) reg [DW-1:0] ram [0:(1<<AW)-1];
+always @(posedge clock) if (wr) ram[waddr] <= wdata;
+always @(posedge clock) q <= ram[raddr];
+endmodule
+
+// MLAB variant for the small (2 Kbit) planes. Same contract as cd_sdp; the
+// forced-M10K recipe above exists because AUTO turned these into ~2000
+// registers each — MLAB is the third option that recipe predates: ALM-based
+// distributed RAM, zero M10K blocks. Motivation (2026-08-03): the device is
+// at 513/553 M10K blocks (93%) while only 71% of memory BITS are used —
+// M10K placement pressure is the per-seed fit-marginality driver, and the
+// twelve 256x8 planes burned 12 whole blocks at 20% fill. Their ping-pong
+// usage never reads a plane being written (write one half, read the other),
+// so MLAB read-during-write semantics are safe with no_rw_check.
+module cd_sdp_mlab #(parameter DW = 16, AW = 12)
+(
+	input           clock,
+	input  [AW-1:0] waddr,
+	input  [DW-1:0] wdata,
+	input           wr,
+	input  [AW-1:0] raddr,
+	output reg [DW-1:0] q
+);
+(* ramstyle = "MLAB,no_rw_check" *) reg [DW-1:0] ram [0:(1<<AW)-1];
 always @(posedge clock) if (wr) ram[waddr] <= wdata;
 always @(posedge clock) q <= ram[raddr];
 endmodule
