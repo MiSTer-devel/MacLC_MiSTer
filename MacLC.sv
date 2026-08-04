@@ -1317,6 +1317,30 @@ module emu
 	// Recover from git history if either resurfaces. The trim also frees the
 	// ring's M10K and returns the JTAG deck below the ~20-node hub ceiling
 	// whose name table read back corrupted at ~40 nodes.)
+	// Floppy copy-error deck (2026-08-04). The copy dies bit-identically at
+	// 44% of the file on every fit AND with the staging ring, while the TB
+	// (perfect SDRAM model) serves the whole geometry byte-exact + CRC-clean.
+	// These three discriminate what the TB abstracts away:
+	//   FLPA {side, track, step_cnt, last raw fetched byte} — head POSITION
+	//        (a lost/doubled step = driver can't find its sector = disk error)
+	//   FLPB {byte_cnt, miss_cnt} — miss_cnt counts byte slots that expired
+	//        with nothing to deliver = SDRAM refill STARVATION
+	//   FLPC live dskReadAddrInt — is the fetch address sane at the failure?
+	altsource_probe #(
+		.instance_id ("FLPA"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpa (.probe({dbg_flp_side, dbg_flp_track[6:0], dbg_flp_step_cnt[15:0], dbg_flp_raw[7:0]}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("FLPB"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpb (.probe({dbg_flp_byte_cnt, dbg_flp_miss_cnt}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("FLPC"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpc (.probe({10'b0, dskReadAddrInt}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
 	// FLPE: floppy ISM error forensics (2026-08-04 copy-error hunt) —
 	// [7:0]=underrun/CPU-side cnt [15:8]=read-overrun cnt [23:16]=arm cnt
 	// [26:24]=live ism_error
