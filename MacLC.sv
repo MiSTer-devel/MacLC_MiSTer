@@ -1193,6 +1193,17 @@ module emu
 	// target (scsi.v dbg_ring; comparator nets shared with io_busy by
 	// construction). Same law as above: never remove, ifdef, or fold.
 	(* preserve, noprune *) reg [31:0] anchor_ring0, anchor_ring1;
+	// (2026-08-04) Floppy-cone extension. Build 9cd6c878 (SEED 4) passed the
+	// SCSI icon gate + soak yet failed a sustained floppy file copy mid-file
+	// ("disk error") — while the copy-pattern TB (tb_ism_copytest) proves the
+	// RTL serves the identical region byte-exact (756/756 sectors, cyls
+	// 15-35, both heads, real image data). Same per-fit marginality class,
+	// different cone: the icon gate only exercises the SCSI path, and the
+	// floppy fetch cone (SDRAM slot -> dskReadDataLatch -> MFM engine) had
+	// never been pinned. These words load the fetch latch, delivery/starve
+	// counters, head position, and the live fetch address. Same law: never
+	// remove, ifdef, or fold.
+	(* preserve, noprune *) reg [31:0] anchor_flp0, anchor_flp1, anchor_flp2;
 	always @(posedge clk_sys) begin
 		anchor_cda0 <= dbg_cda0_w;
 		anchor_cda1 <= dbg_cda1_w;
@@ -1207,6 +1218,10 @@ module emu
 		anchor_wrfb <= dbg_wrfb_w;
 		anchor_ring0 <= dbg_ring0_w;
 		anchor_ring1 <= dbg_ring1_w;
+		anchor_flp0  <= {dbg_flp_byte_cnt, dbg_flp_miss_cnt};
+		anchor_flp1  <= {dbg_flp_step_cnt, dbg_iwm_latch, dbg_flp_raw};
+		anchor_flp2  <= {dbg_flp_byte_stb, dbg_flp_side, dbg_flp_track[6:0],
+		                 1'b0, dskReadAddrInt[21:0]};
 	end
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
