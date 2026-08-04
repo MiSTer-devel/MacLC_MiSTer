@@ -120,7 +120,19 @@ module floppy
 	                                         // (diskImageData is handed over AND
 	                                         // cleared on this edge — sample it now)
 	output wire [7:0]  dbg_raw_byte,         // pre-encoder SDRAM fetch latch (idata)
-	output wire [21:0] dbg_gcr_addr          // live GCR encoder fetch address
+	output wire [21:0] dbg_gcr_addr,         // live GCR encoder fetch address
+	// Phase-strobe forensics (2026-08-04): dbg_step_cnt reading 0 on hardware
+	// during a whole ISM/MFM session cannot distinguish "the driver never
+	// strobed a step" from "our decode rejected the strobe" — both leave the
+	// counter at 0. These record EVERY lstrb falling edge unconditionally,
+	// with the address pattern presented at that edge, so the two cases
+	// separate: strb_cnt==0 => the driver never strobes; strb_cnt>0 with
+	// step_cnt==0 => we are rejecting the pattern it does send (and
+	// strb_last shows exactly which qualifier fails).
+	output reg  [15:0] dbg_strb_cnt,         // ALL lstrb falling edges seen
+	output reg  [15:0] dbg_strb_en_cnt,      // ...of those, with _enable low
+	output reg  [23:0] dbg_strb_last         // last 4 edges, 6 bits each, newest low:
+	                                         // {_enable, ca2, ca1, ca0, SEL, ism_active}
 );
 	assign dbg_disk_image_data = diskImageData;
 	assign dbg_drive_track     = driveTrack;
@@ -514,6 +526,23 @@ module floppy
 	always @(posedge clk) if(cep) lstrbPrev <= lstrb;
 
 	wire lstrbEdge = lstrb == 1'b0 && lstrbPrev == 1'b1;
+
+	// Unconditional strobe recorder — see the dbg_strb_* port comments. Note
+	// this samples the SAME lstrbEdge the register writes use, so a zero count
+	// here also exonerates the edge detector itself.
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			dbg_strb_cnt    <= 16'd0;
+			dbg_strb_en_cnt <= 16'd0;
+			dbg_strb_last   <= 24'd0;
+		end else if (cep && lstrbEdge) begin
+			if (dbg_strb_cnt != 16'hFFFF) dbg_strb_cnt <= dbg_strb_cnt + 16'd1;
+			if (_enable == 1'b0 && dbg_strb_en_cnt != 16'hFFFF)
+				dbg_strb_en_cnt <= dbg_strb_en_cnt + 16'd1;
+			dbg_strb_last <= {dbg_strb_last[17:0],
+			                  _enable, ca2, ca1, ca0, SEL, ism_active};
+		end
+	end
 
 	assign readData = _enable ? 8'hFF :
 	                  (driveReadAddr == `DRIVE_REG_RDDATA0 || driveReadAddr == `DRIVE_REG_RDDATA1) ?

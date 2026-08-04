@@ -1172,6 +1172,9 @@ module emu
 	wire        dbg_flp_byte_stb;
 	wire [7:0]  dbg_flp_raw;
 	wire [21:0] dbg_flp_gcr_addr;
+	wire [15:0] dbg_flp_strb_cnt;
+	wire [15:0] dbg_flp_strb_en_cnt;
+	wire [23:0] dbg_flp_strb_last;
 
 	// ── Always-on marginality anchor (2026-07-29) ───────────────────────────
 	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
@@ -1248,8 +1251,13 @@ module emu
 	//   row 4  {err_onset_cnt[7:0], arm_cnt[7:0], ovr_cnt[7:0], unr_cnt[7:0]}
 	//   row 5  latch @ last error onset: {side, track[6:0], 2'b0, addr[21:0]}
 	//   row 6  latch @ last error onset: {byte_cnt[15:0], step_cnt[15:0]}
-	//   row 7  {10'b0, dbg_flp_gcr_addr[21:0]}       floppy-side fetch addr
-	// Rows 3 vs 7 cross-check the two ends of the fetch-address path.
+	//   row 7  {strb_cnt[15:0], strb_en_cnt[15:0]}   ALL lstrb falls / enabled
+	//   row 8  {8'b0, strb_last[23:0]}  last 4 edges, 6b each, newest LOW:
+	//                                   {_enable,ca2,ca1,ca0,SEL,ism_active}
+	// Rows 7/8 separate "the driver never strobes a step" (strb_cnt==0) from
+	// "we reject the strobe it does send" (strb_cnt>0 while step_cnt==0):
+	// dbg_step_cnt alone reads 0 in BOTH cases, which is exactly the ambiguity
+	// the first HUD build hit. strb_last then names the failing qualifier.
 	// CDC note: rows are sampled from clk_sys into clk_vid once per frame
 	// with no handshake — acceptable for a HUD (the values of interest are
 	// static once the Finder error dialog is up, floppy quiesced).
@@ -1280,8 +1288,9 @@ module emu
 	reg [9:0] hud_x = 10'd0, hud_y = 10'd0;
 	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
-	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0;
+	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0;
 	wire [31:0] hud_wmux =
+		(hud_y[6:3] == 4'd8) ? hud_w8 :
 		(hud_y[5:3] == 3'd0) ? 32'hA5C3F00F :
 		(hud_y[5:3] == 3'd1) ? hud_w1 :
 		(hud_y[5:3] == 3'd2) ? hud_w2 :
@@ -1304,9 +1313,10 @@ module emu
 			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
 			hud_w5 <= hud_lat_pos;
 			hud_w6 <= hud_lat_cnt;
-			hud_w7 <= {10'b0, dbg_flp_gcr_addr[21:0]};
+			hud_w7 <= {dbg_flp_strb_cnt, dbg_flp_strb_en_cnt};
+			hud_w8 <= {8'b0, dbg_flp_strb_last};
 		end
-		hud_on_q    <= (hud_y < 10'd64) && (hud_x < 10'd256) && v8_de;
+		hud_on_q    <= (hud_y < 10'd72) && (hud_x < 10'd256) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[7:3]];
 	end
 `endif // USE_DBG_HUD
@@ -1799,7 +1809,10 @@ module emu
 		.dbg_iwm_latch(dbg_iwm_latch),
 		.dbg_flp_byte_stb(dbg_flp_byte_stb),
 		.dbg_flp_raw(dbg_flp_raw),
-		.dbg_flp_gcr_addr(dbg_flp_gcr_addr)
+		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
+		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
+		.dbg_flp_strb_last(dbg_flp_strb_last)
 	);
 
 	reg disk_act;

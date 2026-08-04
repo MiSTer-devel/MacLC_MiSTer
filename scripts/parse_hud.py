@@ -21,13 +21,14 @@ import numpy as np
 from PIL import Image
 
 MARKER = 0xA5C3F00F
+NROWS = 9
 
 def find_and_decode(img):
     g = np.array(img.convert('L')) > 128
     H, W = g.shape
     for s in (1, 2, 3, 4):          # integer scale
         cw = 8 * s                   # cell width/height in screenshot px
-        for y0 in range(0, min(40, H - 8 * cw)):
+        for y0 in range(0, min(40, H - NROWS * cw)):
             yc = y0 + cw // 2        # sample line of row 0
             for x0 in range(0, min(3 * s + 4, W - 32 * cw)):
                 val = 0
@@ -39,9 +40,9 @@ def find_and_decode(img):
                     val = (val << 1) | (1 if v >= 2 else 0)
                 if val != MARKER:
                     continue
-                # locked: decode all 8 rows at (x0, y0, s)
+                # locked: decode all rows at (x0, y0, s)
                 words = []
-                for r in range(8):
+                for r in range(NROWS):
                     yr = y0 + r * cw + cw // 2
                     w = 0
                     for i in range(32):
@@ -69,9 +70,22 @@ def decode(words):
     print(f"  w5 LATCH side={w[5] >> 31} track={(w[5] >> 24) & 0x7F:3d} "
           f"addr {w[5] & 0x3FFFFF:#08x} = {sec_geom(w[5] & 0x3FFFFF)}")
     print(f"  w6 LATCH byte_cnt={w[6] >> 16:5d} step_cnt={w[6] & 0xFFFF:5d}")
-    print(f"  w7 floppy-side addr {w[7] & 0x3FFFFF:#08x} = {sec_geom(w[7] & 0x3FFFFF)}")
-    if (w[3] & 0x3FFFFF) != (w[7] & 0x3FFFFF):
-        print(f"  !! w3/w7 fetch-address MISMATCH (SDRAM-slot vs floppy side)")
+    print(f"  w7 lstrb falling edges: total={w[7] >> 16:5d}  with _enable low={w[7] & 0xFFFF:5d}")
+    if len(w) > 8:
+        last = w[8] & 0xFFFFFF
+        print("  w8 last 4 strobes (newest first):")
+        for i in range(4):
+            f = (last >> (6 * i)) & 0x3F
+            print(f"       _enable={f >> 5} ca2={(f >> 4) & 1} ca1={(f >> 3) & 1} "
+                  f"ca0={(f >> 2) & 1} SEL={(f >> 1) & 1} ism_active={f & 1}"
+                  f"   -> writeAddr {{ca1,ca0,SEL}}={((f >> 3) & 1) * 4 + ((f >> 2) & 1) * 2 + ((f >> 1) & 1)}")
+    tot = w[7] >> 16
+    step = (w[2] >> 8) & 0xFFFF
+    if tot == 0:
+        print("  ==> VERDICT: the driver NEVER strobes lstrb — no step is ever commanded")
+    elif step == 0:
+        print("  ==> VERDICT: strobes ARRIVE but none decode as STEP "
+              "(need {ca1,ca0,SEL}=2, ca2=0, _enable=0) — our decode rejects them")
 
 for path in sys.argv[1:]:
     geom, words = find_and_decode(Image.open(path))
