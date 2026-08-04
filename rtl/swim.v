@@ -172,6 +172,23 @@ module swim
 	wire ism_devsel_int = ism_mode && ism_mode_reg[7] && (ism_mode_reg[2:1] == 2'b01);
 	wire ism_devsel_ext = ism_mode && ism_mode_reg[7] && (ism_mode_reg[2:1] == 2'b10);
 
+	// Drive-register ENABLE is drive SELECT ONLY — motor-on must not gate it.
+	// (2026-08-04 root cause of the floppy copy "disk error".) The devsel wires
+	// above AND in ism_mode_reg[7] = motor on, and they used to drive floppy.v's
+	// _enable, which qualifies every drive-register write. A seek issued while
+	// the motor bit was clear was therefore dropped on the floor: the head never
+	// left cylinder 0, the MFM encoder kept serving cylinder 0 (it takes
+	// .track(driveTrack)), and every read past cyl 0 failed while the volume
+	// still mounted and listed perfectly (MDB + the catalog nodes the Finder
+	// needs all live on cyl 0). Hardware HUD capture: 67 lstrb falling edges,
+	// only 4 with _enable low, and among the rejected ones a perfectly formed
+	// STEP ({ca1,ca0,SEL}=2, ca2=0). Reproduced byte-exactly by tb_ism_step
+	// phase 5. On real hardware /ENBL follows drive select; motor-on only spins
+	// the media. The devsel wires keep the motor term because the DATA path
+	// (mfm_spinning via .ism_sel, sense/byte muxing) genuinely wants it.
+	wire ism_selonly_int = ism_mode && (ism_mode_reg[2:1] == 2'b01);
+	wire ism_selonly_ext = ism_mode && (ism_mode_reg[2:1] == 2'b10);
+
 	// One CPU bus access = one ISM action. The 68k holds UDS across many cen
 	// ticks, so ISM register semantics (param auto-increment, FIFO pop/push,
 	// the IWM->ISM switch counter) must fire ONCE per access: latch the access
@@ -217,7 +234,7 @@ module swim
 		.ca2(ca2),
 		.SEL(effSEL),
 		.lstrb(lstrb),
-		._enable(ism_mode ? ~ism_devsel_int : ~(diskEnableInt & driveSel)),
+		._enable(ism_mode ? ~ism_selonly_int : ~(diskEnableInt & driveSel)),
 		.writeData(writeData),
 		.readData(readDataInt),
 		.advanceDriveHead(advanceDriveHead),
@@ -268,7 +285,7 @@ module swim
 		.ca2(ca2),
 		.SEL(effSEL),
 		.lstrb(lstrb),
-		._enable(ism_mode ? ~ism_devsel_ext : ~diskEnableExt),
+		._enable(ism_mode ? ~ism_selonly_ext : ~diskEnableExt),
 		.writeData(writeData),
 		.readData(readDataExt),
 		.advanceDriveHead(advanceDriveHead),

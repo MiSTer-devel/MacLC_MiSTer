@@ -187,6 +187,28 @@ module tb_ism_step;
 		$display("ISM  mode (oe=0): track %0d -> %0d   strb=%0d (en=%0d)",
 		         t_before, dbg_track, dbg_strb_cnt, dbg_strb_en_cnt);
 
+		// ------- Phase 5: ISM step with the MOTOR OFF (the hardware case) -------
+		// The 2026-08-04 HUD capture on hardware recorded 67 lstrb falling
+		// edges of which only 4 had _enable low, and among the rejected ones a
+		// PERFECTLY FORMED step ({ca1,ca0,SEL} = 2 with ca2 = 0). The drive was
+		// simply not enabled at the time. _enable comes from ism_devsel_int,
+		// which ANDs in ism_mode_reg[7] = MOTOR ON — so a seek issued while the
+		// motor bit is clear is silently dropped, the head stays on cylinder 0,
+		// and every read past cyl 0 fails. Real hardware gates the drive
+		// register path on drive SELECT; motor-on only spins the media.
+		swim_wr(4'h6, 8'h80);            // Mode CLEAR bit7 -> motor off
+		repeat (200) @(posedge clk);
+		t_before = dbg_track; s_before = dbg_step_cnt;
+		for (i = 0; i < 4; i = i + 1) ism_step(4'hF);
+		$display("ISM  mode MOTOR OFF: track %0d -> %0d   step_cnt %0d -> %0d   strb=%0d (en=%0d)",
+		         t_before, dbg_track, s_before, dbg_step_cnt,
+		         dbg_strb_cnt, dbg_strb_en_cnt);
+		if (dbg_track == t_before) begin
+			$display("  ** MOTOR-OFF STEP DROPPED — reproduces the hardware defect");
+			fails = fails + 1;
+		end else
+			$display("  OK: seeks land with the motor off (drive-select gating)");
+
 		$display("last 4 strobe patterns (newest first), {_enable,ca2,ca1,ca0,SEL,ism}:");
 		for (i = 0; i < 4; i = i + 1)
 			$display("   %06b", (dbg_strb_last >> (6*i)) & 6'h3F);
