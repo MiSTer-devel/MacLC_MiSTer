@@ -625,10 +625,20 @@ module floppy
 		end
 		else if(cep && _enable == 1'b0 && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_STEP && ca2 == 1'b0) begin
 			dbg_step_cnt <= dbg_step_cnt + 16'd1;  // PFLP: seek activity meter
-			if (driveRegs[`DRIVE_REG_DIRTN] == 1'b0 && driveTrack != 7'h4F) begin
+			// DIRTN polarity (2026-08-04): 0 = toward track 0, 1 = toward track 79.
+			// This is INVERTED from the register table at the top of this file, which
+			// is empirically wrong. Once seeks actually reached the drive (swim.v
+			// internal-drive routing fix) the boot ROM's very first act was a blind
+			// full-stroke retract-to-track-0 — the standard drive init — and the old
+			// polarity drove the head OUTWARD: exactly 79 steps ending pinned at
+			// track 79 (dbg_step_cnt = driveTrack = 79), after which the driver
+			// stopped strobing (dbg_strb_cnt frozen at 93) and read boot blocks it
+			// believed were under the head, getting underruns. A retract must land
+			// on track 0; nothing at boot has any reason to seek to 79.
+			if (driveRegs[`DRIVE_REG_DIRTN] == 1'b1 && driveTrack != 7'h4F) begin
 				driveTrack <= driveTrack + 1'b1;
 			end
-			if (driveRegs[`DRIVE_REG_DIRTN] == 1'b1 && driveTrack != 0) begin
+			if (driveRegs[`DRIVE_REG_DIRTN] == 1'b0 && driveTrack != 0) begin
 				driveTrack <= driveTrack - 1'b1;
 			end
 		end
