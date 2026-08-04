@@ -173,11 +173,29 @@ module swim
 	wire mfm_stb_int, mfm_stb_ext;
 
 	// F6: in ISM mode the drive select/enable comes from the ISM Mode register
-	// (bit7 gate + bits2:1 code, 01=INT 10=EXT) — MAME swim1.cpp devsel — NOT
-	// from the IWM soft-switch enables (which the driver turns OFF before the
-	// MFM session; without this the whole session talks to a disabled drive).
-	wire ism_devsel_int = ism_mode && ism_mode_reg[7] && (ism_mode_reg[2:1] == 2'b01);
-	wire ism_devsel_ext = ism_mode && ism_mode_reg[7] && (ism_mode_reg[2:1] == 2'b10);
+	// (bit7 gate + the bits2:1 code) — MAME swim1.cpp devsel — NOT from the IWM
+	// soft-switch enables (which the driver turns OFF before the MFM session;
+	// without this the whole session talks to a disabled drive).
+	//
+	// ★ THE MAC LC HAS NO EXTERNAL FLOPPY DRIVE, so every ISM drive-select code
+	// addresses the one internal drive. This used to decode 01=INT / 10=EXT, and
+	// the real driver programs 10 — which routed the whole MFM session to the
+	// absent external drive (2026-08-04 root cause of the floppy copy "disk
+	// error"). Two failures followed, and BOTH match the hardware capture:
+	//   - the internal drive's _enable never asserted, so every drive-register
+	//     write was dropped. dbg_rej_step counted 5 well-formed STEPs discarded;
+	//     driveTrack stayed 0, and since mfm_track_encoder takes .track(driveTrack)
+	//     the engine served cylinder 0 forever while the driver read files
+	//     further out. The volume still mounted and listed perfectly because the
+	//     MDB and the catalog nodes the Finder needs all live on cyl 0.
+	//   - mfm_byte_sel/ism_sense muxed off the EXTERNAL drive, which has no disk
+	//     and so never strobes a byte: ism_error = UNDERRUN with ovr = 0 and the
+	//     internal drive's byte_cnt frozen — exactly what the HUD showed.
+	// Any non-zero code therefore selects the internal drive; 00 still means
+	// "deselected", so an explicit release is still honoured.
+	wire ism_drive_sel  = (ism_mode_reg[2:1] != 2'b00);
+	wire ism_devsel_int = ism_mode && ism_mode_reg[7] && ism_drive_sel;
+	wire ism_devsel_ext = 1'b0;   // no external drive on the LC
 
 	// Drive-register ENABLE is drive SELECT ONLY — motor-on must not gate it.
 	// (2026-08-04 root cause of the floppy copy "disk error".) The devsel wires
@@ -193,8 +211,8 @@ module swim
 	// phase 5. On real hardware /ENBL follows drive select; motor-on only spins
 	// the media. The devsel wires keep the motor term because the DATA path
 	// (mfm_spinning via .ism_sel, sense/byte muxing) genuinely wants it.
-	wire ism_selonly_int = ism_mode && (ism_mode_reg[2:1] == 2'b01);
-	wire ism_selonly_ext = ism_mode && (ism_mode_reg[2:1] == 2'b10);
+	wire ism_selonly_int = ism_mode && ism_drive_sel;
+	wire ism_selonly_ext = 1'b0;
 
 	// One CPU bus access = one ISM action. The 68k holds UDS across many cen
 	// ticks, so ISM register semantics (param auto-increment, FIFO pop/push,

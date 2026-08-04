@@ -209,6 +209,39 @@ module tb_ism_step;
 		end else
 			$display("  OK: seeks land with the motor off (drive-select gating)");
 
+		// ---- Phase 6: the REAL driver's drive-select code (2'b10) ----
+		// Hardware HUD row 9 shows the Sony driver programs drvsel = 2'b10 for
+		// the LC's one internal drive. The old 01=INT/10=EXT decode routed that
+		// to the absent external drive: internal _enable never asserted (5
+		// well-formed STEPs rejected) and the byte/sense mux fed off a drive
+		// with no disk (underrun, ovr=0, byte_cnt frozen). The LC has no
+		// external drive, so any non-zero code must select the internal one.
+		swim_wr(4'h6, 8'h06);            // Mode CLEAR bits 2:1 (deselect)
+		swim_wr(4'h7, 8'h04);            // Mode SET drvsel = 2'b10
+		swim_wr(4'h7, 8'h80);            // motor on
+		repeat (200) @(posedge clk);
+		t_before = dbg_track; s_before = dbg_step_cnt;
+		for (i = 0; i < 4; i = i + 1) ism_step(4'hF);
+		$display("ISM  drvsel=10 (real driver): track %0d -> %0d   step_cnt %0d -> %0d",
+		         t_before, dbg_track, s_before, dbg_step_cnt);
+		if (dbg_track == t_before) begin
+			$display("  ** drvsel=10 STEP DROPPED — the LC's internal drive is not selected");
+			fails = fails + 1;
+		end else
+			$display("  OK: drvsel=10 reaches the internal drive");
+
+		// ---- Phase 7: explicit deselect (00) must still be honoured ----
+		swim_wr(4'h6, 8'h06);            // Mode CLEAR bits 2:1 -> no drive
+		repeat (200) @(posedge clk);
+		t_before = dbg_track;
+		for (i = 0; i < 4; i = i + 1) ism_step(4'hF);
+		$display("ISM  drvsel=00 (deselected): track %0d -> %0d", t_before, dbg_track);
+		if (dbg_track != t_before) begin
+			$display("  ** DESELECTED DRIVE STILL STEPPED — select gating is gone");
+			fails = fails + 1;
+		end else
+			$display("  OK: a deselected drive ignores steps");
+
 		$display("last 4 strobe patterns (newest first), {_enable,ca2,ca1,ca0,SEL,ism}:");
 		for (i = 0; i < 4; i = i + 1)
 			$display("   %06b", (dbg_strb_last >> (6*i)) & 6'h3F);
