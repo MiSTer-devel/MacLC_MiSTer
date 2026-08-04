@@ -29,10 +29,13 @@ the Egret (HC05) system controller, and the LC's other peripherals.
   and clear
 - **SCC serial** is wired in and "usable" but not yet doing anything useful
 
+- **Floppy disks (read-only):** 1.44 MB disks in raw or DiskCopy 4.2 format —
+  see [Floppy disk support](#floppy-disk-support)
+
 ### Not working yet
 
 - **QuickTime video playback**
-- **Floppy disks**
+- **Floppy writes** (disks mount locked/write-protected)
 
 ## Usage
 
@@ -187,17 +190,23 @@ this step goes away.
 
 ## Floppy disk support
 
-**Not currently working.** The OSD exposes two floppy slots ("Mount Pri/Sec Floppy") and the
-core accepts raw disk images (`.dsk` / `.img`), but floppy boot/read is not functional at this
-time. Use a SCSI hard-disk image instead.
+**1.44 MB floppy reading works** (verified on hardware, August 2026). Mount images through
+the OSD's "Mount Pri Floppy" slot — the Pri slot is the Mac's internal SuperDrive. Disks are
+**read-only** for now: they mount write-protected, exactly like a locked physical floppy.
 
-When floppy support is restored, raw (DiskDup) format is expected: 400k single-sided images
-must be exactly 409,600 bytes and 800k double-sided images exactly 819,200 bytes. Disk Copy 4.2
-(`.image` / `.dc42`) files are not supported directly and must be converted to raw format first.
-[**rusty-backup**](https://github.com/danifunker/rusty-backup) can handle DC42 conversion;
-other options include this
-[converter](https://www.bigmessowires.com/2013/12/16/macintosh-diskcopy-4-2-floppy-image-converter/)
-and the helper script at [releases/bin2dsk.sh](releases/bin2dsk.sh).
+Both common image formats are auto-detected — no conversion needed:
+
+- **Raw** (`.dsk` / `.img`): 1,474,560 bytes for 1.44 MB, 737,280 bytes for 720K
+- **DiskCopy 4.2** (`.dsk` / `.image` / `.dc42`): the 84-byte DC42 header is parsed and
+  skipped automatically; the disk geometry comes from the header's format byte
+
+400K/800K GCR images (409,600 / 819,200 bytes, raw or DC42) are recognized and mount, but
+GCR reading still has known issues and is under repair — prefer 1.44 MB images.
+
+Booting from a floppy is supported in the current development builds (a long-standing
+"Welcome to Macintosh" boot loop was fixed in August 2026); final verification is in
+progress. To boot from floppy, mount the image and reset the machine via the OSD's
+"Reset & Apply" entry so the ROM sees the disk at startup.
 
 ## PRAM / NVRAM
 
