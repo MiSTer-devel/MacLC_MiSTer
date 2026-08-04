@@ -484,9 +484,17 @@ module emu
 	assign CE_PIXEL  = v8_ce_pix;   // constant 1 now (pix_ce tied high below)
 
 	// Video Output — straight V8 video, no overlays.
+`ifdef USE_DBG_HUD
+	// Debug HUD (see the USE_DBG_HUD block near the probe deck): binary
+	// pixel-strip overlay, top-left corner, video-only (input untouched).
+	assign VGA_R  = hud_on_q ? hud_px : v8_vga_r;
+	assign VGA_G  = hud_on_q ? hud_px : v8_vga_g;
+	assign VGA_B  = hud_on_q ? hud_px : v8_vga_b;
+`else
 	assign VGA_R  = v8_vga_r;
 	assign VGA_G  = v8_vga_g;
 	assign VGA_B  = v8_vga_b;
+`endif
 	assign VGA_DE = v8_de;
 	assign VGA_VS = v8_vsync;
 	assign VGA_HS = v8_hsync;
@@ -1224,6 +1232,84 @@ module emu
 		anchor_flp2  <= {dbg_flp_byte_stb, dbg_flp_side, dbg_flp_track[6:0],
 		                 1'b0, dskReadAddrInt[21:0]};
 	end
+
+`ifdef USE_DBG_HUD
+	// ── On-screen floppy debug HUD (2026-08-04 copy-error hunt) ─────────────
+	// The JTAG hub's name table is corrupt on this board (21 nodes, names
+	// match no deck — see b9b5f5d), so the FLPA-E probes can't be read.
+	// This renders the same forensics as PIXELS: 8 rows of 32 cells at the
+	// top-left corner, each cell 8px wide x 8 lines tall, MSB first,
+	// white=1 / black=0. Read from a screenshot (scratch/parse_hud.py);
+	// row 0 is a constant marker for geometry/polarity self-calibration.
+	//   row 0  32'hA5C3F00F                          marker
+	//   row 1  {byte_cnt[15:0], miss_cnt[15:0]}      delivered / starved
+	//   row 2  {side, track[6:0], step_cnt[15:0], 5'b0, ism_error[2:0]}
+	//   row 3  {10'b0, dskReadAddrInt[21:0]}         live fetch address
+	//   row 4  {err_onset_cnt[7:0], arm_cnt[7:0], ovr_cnt[7:0], unr_cnt[7:0]}
+	//   row 5  latch @ last error onset: {side, track[6:0], 2'b0, addr[21:0]}
+	//   row 6  latch @ last error onset: {byte_cnt[15:0], step_cnt[15:0]}
+	//   row 7  {10'b0, dbg_flp_gcr_addr[21:0]}       floppy-side fetch addr
+	// Rows 3 vs 7 cross-check the two ends of the fetch-address path.
+	// CDC note: rows are sampled from clk_sys into clk_vid once per frame
+	// with no handshake — acceptable for a HUD (the values of interest are
+	// static once the Finder error dialog is up, floppy quiesced).
+	// Video-only overlay: input/choreography pixels underneath still work.
+
+	// clk_sys side: latch position/counters at each ism_error 0->nonzero
+	// onset. ism_error is CLEARED ON READ by the driver's own error
+	// handling, so the live value (row 2) usually reads 0 by dialog time —
+	// these latches plus the saturating FLPE counters are the persistent
+	// record. Re-latching every onset leaves the LAST (fatal) context: the
+	// driver's final retries all target the sector it gave up on.
+	wire [2:0] hud_err_live = dbg_ism_flpe_w[26:24];
+	reg  [2:0] hud_err_d = 3'd0;
+	reg  [7:0] hud_onset_cnt = 8'd0;
+	reg [31:0] hud_lat_pos = 32'd0, hud_lat_cnt = 32'd0;
+	always @(posedge clk_sys) begin
+		hud_err_d <= hud_err_live;
+		if ((hud_err_d == 3'd0) && (hud_err_live != 3'd0)) begin
+			if (hud_onset_cnt != 8'hFF) hud_onset_cnt <= hud_onset_cnt + 1'd1;
+			hud_lat_pos <= {dbg_flp_side, dbg_flp_track[6:0], 2'b00, dskReadAddrInt[21:0]};
+			hud_lat_cnt <= {dbg_flp_byte_cnt, dbg_flp_step_cnt};
+		end
+	end
+
+	// clk_vid side: pixel position from DE/VBlank, per-frame word snapshot,
+	// registered 2:1 pixel mux (one pipeline stage keeps the VGA cone short;
+	// the 1px right-shift is absorbed by the marker calibration).
+	reg [9:0] hud_x = 10'd0, hud_y = 10'd0;
+	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
+	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
+	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0;
+	wire [31:0] hud_wmux =
+		(hud_y[5:3] == 3'd0) ? 32'hA5C3F00F :
+		(hud_y[5:3] == 3'd1) ? hud_w1 :
+		(hud_y[5:3] == 3'd2) ? hud_w2 :
+		(hud_y[5:3] == 3'd3) ? hud_w3 :
+		(hud_y[5:3] == 3'd4) ? hud_w4 :
+		(hud_y[5:3] == 3'd5) ? hud_w5 :
+		(hud_y[5:3] == 3'd6) ? hud_w6 : hud_w7;
+	reg hud_on_q = 1'b0, hud_white_q = 1'b0;
+	wire [7:0] hud_px = hud_white_q ? 8'hFF : 8'h00;
+	always @(posedge clk_vid) begin
+		hud_de_d  <= v8_de;
+		hud_vbl_d <= v8_vblank;
+		if (v8_de) hud_x <= hud_x + 1'd1; else hud_x <= 10'd0;
+		if (hud_de_d & ~v8_de) hud_y <= hud_y + 1'd1;
+		if (~hud_vbl_d & v8_vblank) begin
+			hud_y <= 10'd0;
+			hud_w1 <= {dbg_flp_byte_cnt, dbg_flp_miss_cnt};
+			hud_w2 <= {dbg_flp_side, dbg_flp_track[6:0], dbg_flp_step_cnt, 5'b0, hud_err_live};
+			hud_w3 <= {10'b0, dskReadAddrInt[21:0]};
+			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
+			hud_w5 <= hud_lat_pos;
+			hud_w6 <= hud_lat_cnt;
+			hud_w7 <= {10'b0, dbg_flp_gcr_addr[21:0]};
+		end
+		hud_on_q    <= (hud_y < 10'd64) && (hud_x < 10'd256) && v8_de;
+		hud_white_q <= hud_wmux[5'd31 - hud_x[7:3]];
+	end
+`endif // USE_DBG_HUD
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
