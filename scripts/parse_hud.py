@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 
 MARKER = 0xA5C3F00F
-NROWS = 9
+NROWS = 10
 
 def find_and_decode(img):
     g = np.array(img.convert('L')) > 128
@@ -79,6 +79,18 @@ def decode(words):
             print(f"       _enable={f >> 5} ca2={(f >> 4) & 1} ca1={(f >> 3) & 1} "
                   f"ca0={(f >> 2) & 1} SEL={(f >> 1) & 1} ism_active={f & 1}"
                   f"   -> writeAddr {{ca1,ca0,SEL}}={((f >> 3) & 1) * 4 + ((f >> 2) & 1) * 2 + ((f >> 1) & 1)}")
+    if len(w) > 9:
+        m = w[9]
+        mode, setup = m >> 24, (m >> 16) & 0xFF
+        rej = m & 0x1FF
+        print(f"  w9 MODE={mode:#04x} [motor={mode >> 7} ism={(mode >> 6) & 1} "
+              f"hdsel={(mode >> 5) & 1} write={(mode >> 4) & 1} action={(mode >> 3) & 1} "
+              f"drvsel={(mode >> 1) & 3:02b} clrfifo={mode & 1}]  SETUP={setup:#04x}")
+        if rej & 0x100:
+            print(f"     ** REJECTED STEPS: {rej & 0xFF} "
+                  f"(well-formed STEP dropped because _enable was high)")
+        else:
+            print("     no rejected steps recorded")
     tot = w[7] >> 16
     step = (w[2] >> 8) & 0xFFFF
     if tot == 0:

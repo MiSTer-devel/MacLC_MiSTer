@@ -1172,9 +1172,11 @@ module emu
 	wire        dbg_flp_byte_stb;
 	wire [7:0]  dbg_flp_raw;
 	wire [21:0] dbg_flp_gcr_addr;
+	wire [31:0] dbg_ism_state;
 	wire [15:0] dbg_flp_strb_cnt;
 	wire [15:0] dbg_flp_strb_en_cnt;
 	wire [23:0] dbg_flp_strb_last;
+	wire [8:0]  dbg_flp_rej_step;
 
 	// ── Always-on marginality anchor (2026-07-29) ───────────────────────────
 	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
@@ -1252,6 +1254,9 @@ module emu
 	//   row 5  latch @ last error onset: {side, track[6:0], 2'b0, addr[21:0]}
 	//   row 6  latch @ last error onset: {byte_cnt[15:0], step_cnt[15:0]}
 	//   row 7  {strb_cnt[15:0], strb_en_cnt[15:0]}   ALL lstrb falls / enabled
+	//   row 9  {ism_mode_reg[7:0], ism_setup[7:0], 8'b0, diskEnableInt,
+	//           driveSel, devsel_int, devsel_ext, selonly_int, ism_mode,
+	//           diskEnableExt, 0} — what the driver PROGRAMMED
 	//   row 8  {8'b0, strb_last[23:0]}  last 4 edges, 6b each, newest LOW:
 	//                                   {_enable,ca2,ca1,ca0,SEL,ism_active}
 	// Rows 7/8 separate "the driver never strobes a step" (strb_cnt==0) from
@@ -1288,8 +1293,10 @@ module emu
 	reg [9:0] hud_x = 10'd0, hud_y = 10'd0;
 	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
-	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0;
+	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
+	           hud_w9 = 32'd0;
 	wire [31:0] hud_wmux =
+		(hud_y[6:3] == 4'd9) ? hud_w9 :
 		(hud_y[6:3] == 4'd8) ? hud_w8 :
 		(hud_y[5:3] == 3'd0) ? 32'hA5C3F00F :
 		(hud_y[5:3] == 3'd1) ? hud_w1 :
@@ -1315,8 +1322,9 @@ module emu
 			hud_w6 <= hud_lat_cnt;
 			hud_w7 <= {dbg_flp_strb_cnt, dbg_flp_strb_en_cnt};
 			hud_w8 <= {8'b0, dbg_flp_strb_last};
+			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 		end
-		hud_on_q    <= (hud_y < 10'd72) && (hud_x < 10'd256) && v8_de;
+		hud_on_q    <= (hud_y < 10'd80) && (hud_x < 10'd256) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[7:3]];
 	end
 `endif // USE_DBG_HUD
@@ -1810,9 +1818,11 @@ module emu
 		.dbg_flp_byte_stb(dbg_flp_byte_stb),
 		.dbg_flp_raw(dbg_flp_raw),
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
-		.dbg_flp_strb_last(dbg_flp_strb_last)
+		.dbg_flp_strb_last(dbg_flp_strb_last),
+		.dbg_flp_rej_step(dbg_flp_rej_step)
 	);
 
 	reg disk_act;

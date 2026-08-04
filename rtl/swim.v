@@ -96,9 +96,16 @@ module swim
 	output [7:0]  dbg_iwm_latch,     // live IWM read-data latch
 	output        dbg_flp_byte_stb,  // 1-clk delivered-byte strobe (capture ring)
 	output [7:0]  dbg_flp_raw,      // pre-encoder SDRAM fetch latch (internal drive)
+	// {ism_mode_reg, ism_setup, 8'b0, diskEnableInt, driveSel, devsel_int,
+	//  devsel_ext, selonly_int, ism_mode, motor_reg, 1'b0} — what the driver
+	// actually PROGRAMMED. Needed because the 08-04 capture showed _enable
+	// still high after keying it on the ISM drive-select code, i.e. that code
+	// is not what we assume (reference doc says bits 2:1, gated by b7).
+	output [31:0] dbg_ism_state,
 	output [15:0] dbg_flp_strb_cnt,
 	output [15:0] dbg_flp_strb_en_cnt,
 	output [23:0] dbg_flp_strb_last,
+	output [8:0]  dbg_flp_rej_step,
 	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
 );
 
@@ -270,7 +277,8 @@ module swim
 		.dbg_gcr_addr(dbg_flp_gcr_addr),
 		.dbg_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_strb_en_cnt(dbg_flp_strb_en_cnt),
-		.dbg_strb_last(dbg_flp_strb_last)
+		.dbg_strb_last(dbg_flp_strb_last),
+		.dbg_rej_step(dbg_flp_rej_step)
 	);
 
 	floppy floppyExt
@@ -336,6 +344,9 @@ module swim
 		if (~dbg_ra_d  & ism_read_active & (dbg_flpe_arm != 8'hFF)) dbg_flpe_arm <= dbg_flpe_arm + 1'd1;
 	end
 	assign dbg_ism_flpe = {5'b0, ism_error, dbg_flpe_arm, dbg_flpe_ovr, dbg_flpe_unr};
+	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
+	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
+	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};
 
 	// ISM FIFO transaction requests (consumed in the clocked block below).
 	// CPU pop/push commit at acc_end; the generator pushes on the delivery

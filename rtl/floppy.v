@@ -131,8 +131,15 @@ module floppy
 	// strb_last shows exactly which qualifier fails).
 	output reg  [15:0] dbg_strb_cnt,         // ALL lstrb falling edges seen
 	output reg  [15:0] dbg_strb_en_cnt,      // ...of those, with _enable low
-	output reg  [23:0] dbg_strb_last         // last 4 edges, 6 bits each, newest low:
+	output reg  [23:0] dbg_strb_last,        // last 4 edges, 6 bits each, newest low:
 	                                         // {_enable, ca2, ca1, ca0, SEL, ism_active}
+	// Latched when a PERFECTLY FORMED step is REJECTED (step pattern present
+	// but _enable high). dbg_strb_last keeps only the last 4 edges, which on a
+	// one-floppy machine are usually the driver idly polling the empty external
+	// drive — so the mode register sampled 'now' need not be the mode in force
+	// when a seek was actually dropped. This flags THAT instant.
+	// [7:0] = rejected-step count (saturating), [8] = ever happened.
+	output reg  [8:0]  dbg_rej_step
 );
 	assign dbg_disk_image_data = diskImageData;
 	assign dbg_drive_track     = driveTrack;
@@ -535,7 +542,14 @@ module floppy
 			dbg_strb_cnt    <= 16'd0;
 			dbg_strb_en_cnt <= 16'd0;
 			dbg_strb_last   <= 24'd0;
+			dbg_rej_step    <= 9'd0;
 		end else if (cep && lstrbEdge) begin
+			if (_enable == 1'b1 && ca2 == 1'b0 &&
+			    {ca1, ca0, SEL} == `DRIVE_REG_STEP) begin
+				dbg_rej_step[8] <= 1'b1;
+				if (dbg_rej_step[7:0] != 8'hFF)
+					dbg_rej_step[7:0] <= dbg_rej_step[7:0] + 8'd1;
+			end
 			if (dbg_strb_cnt != 16'hFFFF) dbg_strb_cnt <= dbg_strb_cnt + 16'd1;
 			if (_enable == 1'b0 && dbg_strb_en_cnt != 16'hFFFF)
 				dbg_strb_en_cnt <= dbg_strb_en_cnt + 16'd1;
