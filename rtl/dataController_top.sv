@@ -46,6 +46,7 @@ module dataController_top(
 	output [31:0] dbg_ncr2,   // req_deferred/req_bus + IRQ machine + counters
 	output [31:0] dbg_wr,     // write-stall snapshot (DATA_IN target)
 	output [31:0] dbg_wrfb,   // write first-beat forensics (JTAG WRFB)
+	output [31:0] dbg_ism_flpe, // swim ISM error/overrun counters (JTAG FLPE)
 	output [31:0] dbg_ring0,  // disk-0 read-ring bookkeeping (anchor feed)
 	output [31:0] dbg_ring1,  // disk-1 read-ring bookkeeping (anchor feed)
 	input selectSCC,
@@ -1055,6 +1056,7 @@ module dataController_top(
 		.dskReadAckExt(dskReadAckExt),
 		.dskReadData(memoryDataIn[7:0]),
 
+		.dbg_ism_flpe(dbg_ism_flpe),
 		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
 		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),
 		.dbg_flp_disk_data(dbg_flp_disk_data),

@@ -701,7 +701,8 @@ module emu
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w, dbg_wrfb_w;
-	wire [31:0] dbg_ring0_w, dbg_ring1_w;  // read-ring bookkeeping (anchor-only)
+	wire [31:0] dbg_ring0_w, dbg_ring1_w;
+	wire [31:0] dbg_ism_flpe_w;  // read-ring bookkeeping (anchor-only)
 	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
 	wire [31:0] dbg_cdur_w;
 	wire [23:0] overlay_trigger_addr;
@@ -1316,6 +1317,13 @@ module emu
 	// Recover from git history if either resurfaces. The trim also frees the
 	// ring's M10K and returns the JTAG deck below the ~20-node hub ceiling
 	// whose name table read back corrupted at ~40 nodes.)
+	// FLPE: floppy ISM error forensics (2026-08-04 copy-error hunt) —
+	// [7:0]=underrun/CPU-side cnt [15:8]=read-overrun cnt [23:16]=arm cnt
+	// [26:24]=live ism_error
+	altsource_probe #(
+		.instance_id ("FLPE"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpe (.probe(dbg_ism_flpe_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 `endif // USE_DBG_PROBES
 
 `ifdef USE_DBG_OBSERVER
@@ -1570,6 +1578,7 @@ module emu
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
 		.dbg_wrfb(dbg_wrfb_w),
+		.dbg_ism_flpe(dbg_ism_flpe_w),
 		.dbg_ring0(dbg_ring0_w),
 		.dbg_ring1(dbg_ring1_w),
 		.selectSCC(selectSCC),

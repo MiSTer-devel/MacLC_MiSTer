@@ -86,6 +86,7 @@ module swim
 	input [7:0] dskReadData,
 
 	// --- diagnostic passthroughs (PFLP probes; internal drive only) ---
+	output [31:0] dbg_ism_flpe,  // {5'b0, ism_error, arm_cnt, ovr_cnt, unr_cnt} — JTAG FLPE
 	output [15:0] dbg_flp_byte_cnt,
 	output [15:0] dbg_flp_miss_cnt,
 	output [7:0]  dbg_flp_disk_data,
@@ -170,6 +171,13 @@ module swim
 	wire       acc_end = swim_acc_d && !swim_acc;
 
 	reg  [3:0] ism_phase_oe;   // Phases reg high nibble (output enables) — F2
+	// FLPE probe counters (2026-08-04, the deterministic floppy copy error):
+	// count read-side overruns (error[0]: generator pushed into a full FIFO =
+	// the CPU polled too slowly), underrun/CPU-side faults (error[2]), and
+	// read-arms. Plain always block of its own — Quartus single-driver law.
+	reg [2:0] dbg_err_d = 0;
+	reg       dbg_ra_d = 0;
+	reg [7:0] dbg_flpe_ovr = 0, dbg_flpe_unr = 0, dbg_flpe_arm = 0;
 	reg        mfm_synced;     // mark-hunt state: deliver to FIFO only once an
 	                           // A1 mark has been seen since the last read-arm
 	reg        ism_arm_d;      // for the ACTION-rising (read-arm) edge — F8
@@ -285,6 +293,15 @@ module swim
 	// MFM delivery additionally requires the MFM read datapath (Setup bit2=0
 	// selects MFM vs GCR on the READ side — swim1.cpp:377).
 	wire ism_read_active = ism_arm && !ism_setup[2];
+
+	always @(posedge clk) begin
+		dbg_err_d <= ism_error;
+		dbg_ra_d  <= ism_read_active;
+		if (~dbg_err_d[0] & ism_error[0] & (dbg_flpe_ovr != 8'hFF)) dbg_flpe_ovr <= dbg_flpe_ovr + 1'd1;
+		if (~dbg_err_d[2] & ism_error[2] & (dbg_flpe_unr != 8'hFF)) dbg_flpe_unr <= dbg_flpe_unr + 1'd1;
+		if (~dbg_ra_d  & ism_read_active & (dbg_flpe_arm != 8'hFF)) dbg_flpe_arm <= dbg_flpe_arm + 1'd1;
+	end
+	assign dbg_ism_flpe = {5'b0, ism_error, dbg_flpe_arm, dbg_flpe_ovr, dbg_flpe_unr};
 
 	// ISM FIFO transaction requests (consumed in the clocked block below).
 	// CPU pop/push commit at acc_end; the generator pushes on the delivery
