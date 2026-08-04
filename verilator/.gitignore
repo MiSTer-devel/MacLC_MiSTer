@@ -19,3 +19,6 @@ Musashi/
 *.vcxproj
 *.vcxproj.*
 *.sln
+floppy_all.hex
+track0.hex
+tb_pops.txt
