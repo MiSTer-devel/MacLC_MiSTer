@@ -388,12 +388,20 @@ module swim
 	// state for a whole field, which would make the poisoning persistent
 	// across the ROM's retries exactly as observed).
 	wire hs_read_now = acc_end && ism_mode && acc_rw_l && (acc_addr_l[2:0] == 3'h7);
-	wire hs_b1_now = (ism_fifo_pos != 0) &&
-	                 ~ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_CRC0];
+	// ★ POISONED sample, detected exactly: the byte the CPU is about to pop is
+	// a CRC byte (crc0 set, so the field IS good) while the FIFO also holds a
+	// NEWER byte whose running CRC is nonzero — the newer one is what b1
+	// reports, so the ROM reads "CRC bad" for a field it read perfectly.
+	// (Counting raw b1-hot reads is useless: b1 is legitimately hot for every
+	// byte except a field's last CRC byte, so it saturates in seconds —
+	// measured 65535 during a mount on build c150e907.)
+	wire hs_poison_now = (ism_fifo_pos == 2'd2) &&
+	                      ism_fifo[0][FIFO_B_CRC0] &&
+	                     ~ism_fifo[1][FIFO_B_CRC0];
 	reg [15:0] dbg_hs_b1 = 0, dbg_hs_b5 = 0, dbg_pop2 = 0;
 	always @(posedge clk) begin
 		if (cen) begin
-			if (hs_read_now && hs_b1_now && dbg_hs_b1 != 16'hFFFF)
+			if (hs_read_now && hs_poison_now && dbg_hs_b1 != 16'hFFFF)
 				dbg_hs_b1 <= dbg_hs_b1 + 1'd1;
 			if (hs_read_now && (ism_error != 0) && dbg_hs_b5 != 16'hFFFF)
 				dbg_hs_b5 <= dbg_hs_b5 + 1'd1;

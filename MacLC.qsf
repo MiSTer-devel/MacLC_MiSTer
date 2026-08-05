@@ -48,7 +48,7 @@ set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
-set_global_assignment -name SEED 5
+set_global_assignment -name SEED 2
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -104,7 +104,7 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # MacLC.sv USE_DBG_HUD block; parse screenshots with scripts/parse_hud.py).
 # Built 2026-08-04 because this board's JTAG hub name table is corrupt and
 # the ISSP probes can't be read. Needs NO JTAG. Keep COMMENTED for release.
-# set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
+set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"

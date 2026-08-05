@@ -97,8 +97,9 @@ def decode(words):
     print(f"     $142 LAST  err = {sony_err(w[5] & 0xFFFF)}")
     print(f"  w6 $142 error completions={w[6] >> 16:5d}  ALL completions={w[6] & 0xFFFF:5d}")
     b1, b5 = w[7] >> 16, w[7] & 0xFFFF
-    print(f"  w7 VERDICT bits on handshake reads: b1(CRC-bad-on-newest)={b1:5d}  "
-          f"b5(error-pending)={b5:5d}")
+    print(f"  w7 POISONED handshake samples={b1:5d}  (good CRC byte at the FIFO "
+          f"head, newer byte reports CRC-bad)")
+    print(f"     b5(error-pending) on handshake reads={b5:5d}")
     if len(w) > 8:
         pop2, strb = w[8] >> 16, w[8] & 0xFFFF
         print(f"  w8 pops with FIFO at 2 entries={pop2:5d}   lstrb falling edges={strb:5d}")
@@ -132,10 +133,13 @@ def decode(words):
         elif ie and not ii:
             print("      ** image landed in the EXTERNAL slot (unreachable in ISM mode)")
     nz, unr = w[6] >> 16, w[4] & 0xFF
-    if b1 or b5:
-        print(f"  ==> VERDICT-BIT: the ROM's `d5 & 0x22` sample was hot "
-              f"{b1 + b5} time(s) — b1={b1}, b5={b5}. Each one rejects a field "
-              "whose data may have been read perfectly.")
+    if b1:
+        print(f"  ==> POISONING CONFIRMED: {b1} handshake sample(s) reported "
+              "CRC-bad for a field whose CRC byte was correct — good sectors "
+              "rejected. Restore true 2-deep FIFO semantics.")
+    if b5:
+        print(f"  ==> {b5} handshake read(s) saw error-pending (b5); if one "
+              "lands on the ROM's CRC-byte sample it rejects that field too.")
     if nz:
         print(f"  ==> VERDICT: driver posted {nz} error completion(s); "
               f"first {sony_err(w[5] >> 16)}, last {sony_err(w[5] & 0xFFFF)}")
