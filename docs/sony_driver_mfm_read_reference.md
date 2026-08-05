@@ -246,6 +246,20 @@ because 7.5 ms + dispatch still lands inside the ~10.9 ms slot — only the 2×
 stretch pushed it over, and the crystal-locked zero-wobble rotation made the
 resulting phase lock permanent instead of self-healing.
 
+### ★★★ HARDWARE VALIDATED (build `78a46cf2` = `33ebdd1`, SEED 2, STA +0.196)
+
+| | pre-fix `ae5bbd47` | post-fix `78a46cf2` run 1 | run 2 |
+|---|---|---|---|
+| Finder error dialogs | **5** | **0** | **0** |
+| `-81` posts (`e81`) | 5 | **0** | **0** |
+| `$142` nonzero | 27 (all `-65` polling + 5 `-81`) | 14 (**all `-65`**) | 18 (**all `-65`**) |
+| whole-disk copy time | ~2 min | **~51 s** | **~58 s** |
+| `stall_us`/`stall_cnt` | 0/0 | 0/0 | 0/0 |
+
+Same disk, same choreography, same session. The copy also got ~2.3× faster,
+which is the same defect seen from the other side: every `-81` retry pass was
+spending whole revolutions re-scanning. Icon gate PASS on the fix boot.
+
 Expected side effects of the fix (VIA-timer clients, all previously 2×): any
 Time-Manager-paced delay, T2 delay loops (TattleTech CPU reports read 2× the
 true speed while the bug lived), TimeDBRA-calibrated spinwaits.

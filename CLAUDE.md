@@ -189,18 +189,21 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 ## Known Limitations
 
 - Floppy disks are read-only
-- **1.44 MB MFM read works; the Finder COPY still fails on ~6-8 files per
-  whole-disk copy, non-deterministically.** Before touching this, read
-  **`docs/sony_driver_mfm_read_reference.md`** — it maps the ROM Sony driver's
-  read path, decodes what each error code means (`-81` = the wanted sector never
-  appeared before the give-up budget expired, spent **per unwanted sector ID**;
-  `-65` is benign polling of the absent second drive), and lists **six theories
-  already tested and refuted** with their evidence. Three of them were built and
-  demolished for want of that page. The residual defect is a **timing** fault in
-  rare late arms: payloads are byte-exact, no error bit is set, cylinder/head are
-  provably correct, and `tb_ism_sony` passes 145/145 — so it is hardware-only.
-  Instruments: `USE_DBG_HUD` + `scripts/parse_hud.py`, `verilator/tb_mfm_idcensus.v`
-  (full-disk ID census), `tb_ism_sony +postgap=N` (scan efficiency).
+- **1.44 MB MFM read works, and the Finder whole-disk COPY was FIXED
+  2026-08-05** (`33ebdd1`): the real defect was **`rtl/via6522.sv` counting
+  T1/T2 at half rate** — a `/2` prescaler stacked on enables that were already
+  at VIA phi2 rate (`E_div=1'b1`), so every guest VIA-timer interval ran 2.0×
+  long since June. That doubled the Sony driver's Time-Manager sleep between
+  read attempts and phase-locked its re-arm one sector late (stride-2 over 18
+  sectors ⇒ a closed 9-sector cycle ⇒ `-81 sectNFErr`). HW: 5 dialogs → **0,
+  twice**, copy ~2 min → ~55 s. Full write-up + the SCAN-WITNESS evidence in
+  **`docs/sony_driver_mfm_read_reference.md`** — read it before any floppy or
+  VIA-timer work; it also decodes every Sony error code (`-65` is benign
+  polling of the absent second drive) and lists **seven theories tested and
+  refuted**, several of which were built before that page existed.
+  Instruments: `USE_DBG_HUD` + `scripts/parse_hud.py` (rows 7/8 = SCAN-WITNESS),
+  `verilator/mame/floppy/sonyvars_watch.lua` (driver retry budgets from MAME),
+  `verilator/tb_mfm_idcensus.v` (full-disk ID census), `tb_ism_sony +postgap=N`.
   ★ `USE_DBG_HUD=1` is committed ON in `MacLC.qsf` — turn it OFF for release fits.
 - SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
