@@ -12,8 +12,9 @@ white=1 / black=0.
   row 4  {err_onset_cnt[7:0], arm[7:0], ovr[7:0], unr[7:0]}
   row 5  {e142_first[15:0], e142_last[15:0]}   Sony driver result codes
   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]}
-  row 7  ID-WITNESS {C,H,R,N} of the last ID field DELIVERED to the CPU
-  row 8  {ID fields served[15:0], DATA fields served[15:0]} — the scan ratio
+  row 7  SCAN-WITNESS latched at the LAST -81 post:
+         {run[7:0], hunt_ms[7:0], par[1:0], gap_us[13:0]}
+  row 8  LIVE {mfm stall_us[15:0], stall_cnt[7:0], e81_cnt[7:0]}
   row 10 latch @ first nonzero $142 {side, track[6:0], 2'b0, addr[21:0]}
 
 The $142 watcher (2026-08-05): the ROM Sony driver posts every MFM read
@@ -97,40 +98,30 @@ def decode(words):
     print(f"  w5 $142 FIRST err = {sony_err(w[5] >> 16)}")
     print(f"     $142 LAST  err = {sony_err(w[5] & 0xFFFF)}")
     print(f"  w6 $142 error completions={w[6] >> 16:5d}  ALL completions={w[6] & 0xFFFF:5d}")
-    idC, idH, idR, idN = (w[7] >> 24) & 0xFF, (w[7] >> 16) & 0xFF, \
-                         (w[7] >> 8) & 0xFF, w[7] & 0xFF
-    live_side, live_trk = w[2] >> 31, (w[2] >> 24) & 0x7F
-    print(f"  w7 LAST ID SERVED: C={idC} H={idH} R={idR} N={idN}"
-          f"   (live: track={live_trk} side={live_side})")
-    if w[7]:
-        if idH != live_side:
-            print(f"     ** WRONG HEAD: served H={idH} while the drive says "
-                  f"side={live_side} — CRC-good fields that can never match")
-        if idC != live_trk:
-            print(f"     ** WRONG CYLINDER: served C={idC} while the drive says "
-                  f"track={live_trk}")
-        if idN != 2:
-            print(f"     ** BAD SIZE CODE N={idN} (want 2 = 512 B)")
-        if idH == live_side and idC == live_trk and idN == 2:
-            print("     position agrees with the drive (C/H/N all correct)")
+    run7 = (w[7] >> 24) & 0xFF
+    hunt7 = (w[7] >> 16) & 0xFF
+    par7 = (w[7] >> 14) & 0x3
+    gap7 = w[7] & 0x3FFF
+    e81 = w[8] & 0xFF if len(w) > 8 else 0
+    par_s = {0: "none", 1: "EVEN only", 2: "ODD only", 3: "both"}[par7]
+    if e81:
+        print(f"  w7 AT LAST -81: run={run7} IDs since last consumed data, "
+              f"R-parity seen: {par_s}, last armed window {hunt7} ms, "
+              f"last synced delivery gap {gap7} us")
+    else:
+        print(f"  w7 (no -81 posted yet) run={run7} hunt_ms={hunt7} "
+              f"par={par_s} gap_us={gap7}")
     if len(w) > 8:
-        ids, datas = w[8] >> 16, w[8] & 0xFFFF
-        print(f"  w8 fields SERVED: ID={ids}  DATA={datas}", end="")
-        if datas:
-            r = ids / datas
-            print(f"   ratio={r:.2f} ID per DATA")
-            if r >= 8:
-                print(f"     ** SCAN OVER THE CLIFF (~{r:.0f} IDs per data field = "
-                      "about a full revolution per sector): the driver burns one "
-                      "retry per unwanted sector and dies at -81 within ~2 sectors")
-            elif r >= 3:
-                print("     ** scan is wasteful (>3 IDs per data field) — losing "
-                      "the target and going part-way round")
-            else:
-                print("     scan efficiency healthy (1:1 direct, ~2:1 = one "
-                      "interleave step per read)")
-        else:
-            print("   (no data fields served yet)")
+        stall_us, stall_cnt = w[8] >> 16, (w[8] >> 8) & 0xFF
+        print(f"  w8 LIVE mfm stalls: worst {stall_us} us, {stall_cnt} stalled "
+              f"deliveries, e81 posts latched: {e81}")
+        if stall_us >= 1000:
+            print(f"     ** MFM DELIVERY STALLED ms-scale ({stall_us} us): the "
+                  "SDRAM fetch starved the byte engine — the rotation stretched. "
+                  "SDRAM-contention suspect REVIVED.")
+        elif stall_us <= 8:
+            print("     fetch path healthy (worst stall within one byte cell) — "
+                  "SDRAM contention excluded at this scale")
     if len(w) > 9:
         m = w[9]
         mode, setup = m >> 24, (m >> 16) & 0xFF
@@ -159,20 +150,37 @@ def decode(words):
         elif ie and not ii:
             print("      ** image landed in the EXTERNAL slot (unreachable in ISM mode)")
     nz, unr = w[6] >> 16, w[4] & 0xFF
-    if b1:
-        print(f"  ==> POISONING CONFIRMED: {b1} handshake sample(s) reported "
-              "CRC-bad for a field whose CRC byte was correct — good sectors "
-              "rejected. Restore true 2-deep FIFO semantics.")
-    if b5:
-        print(f"  ==> {b5} handshake read(s) saw error-pending (b5); if one "
-              "lands on the ROM's CRC-byte sample it rejects that field too.")
+    if e81:
+        # Interpretation grid (ground truth: budget seed 64, MAME max healthy
+        # scan 17, -67/-69 own the outage/CRC-bad classes — so -81 = the scan
+        # consumed ~64 CRC-good unwanted IDs).
+        if run7 >= 40:
+            print(f"  ==> -81 MODEL CONFIRMED: {run7} consecutive IDs consumed "
+                  "(budget seed is 64; one revolution is 18) — the target was "
+                  "skipped on 3+ consecutive revolutions.")
+            if par7 in (1, 2):
+                print(f"  ==> STROBOSCOPE CONFIRMED: the whole burn saw {par_s} "
+                      "sector numbers — the timer-paced re-arm lands past every "
+                      "other ID and 18 sectors split into two closed 9-cycles. "
+                      "Fix class: break the wake/rotation phase lock.")
+            else:
+                print("  ==> both parities seen: not a clean stride-2 lock — "
+                      "longer-cycle alias, or the skip is positional. Compare "
+                      "run vs 64 and look at gap/hunt.")
+        elif run7 <= 20 and run7 > 0:
+            print(f"  ==> run={run7} at -81: the budget died within ONE "
+                  "revolution — contradicts the 64-seed model. Re-derive "
+                  "(is +47 being reseeded mid-scan? different caller?).")
+        if hunt7 >= 100:
+            print(f"  ==> last armed window was {hunt7} ms: a DRY HUNT at -81 "
+                  "contradicts the -67 ownership of that class — re-derive.")
     if nz:
         print(f"  ==> VERDICT: driver posted {nz} error completion(s); "
               f"first {sony_err(w[5] >> 16)}, last {sony_err(w[5] & 0xFFFF)}")
     elif unr:
         print(f"  ==> VERDICT: zero driver errors, but {unr} unr event(s). "
               "Disarmed probes are gated since c372f97, so these are REAL "
-              "armed events — see the w8 forensic latch.")
+              "armed events.")
 
 for path in sys.argv[1:]:
     geom, words = find_and_decode(Image.open(path))

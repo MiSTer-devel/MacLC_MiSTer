@@ -144,7 +144,19 @@ module floppy
 	// spinning, and which term is holding it up? (2026-08-04: once the
 	// drive-select fix let register writes land, MOTORON writes land too and
 	// can stop the disk — mfm_spinning = mfm_disk && (motor||ism_sel) && !CSTIN.)
-	output wire [7:0]  dbg_status
+	output wire [7:0]  dbg_status,
+	// MFM delivery-stall witness (2026-08-05 pm, the -81 hunt). A payload byte
+	// whose SDRAM fetch has not landed stalls the byte-cell timer at zero (the
+	// `!mfm_needs_data || mfm_fresh` gate in the delivery block below). A real
+	// drive never stalls — data flies under the head regardless — so any stall
+	// here is emulation artifact stretching the rotation. dbg_byte_cnt/miss_cnt
+	// above are GCR-path-only (they count on diskDataByteTimer), so before this
+	// the MFM fetch path was entirely uninstrumented and "miss_cnt=0" said
+	// nothing about it. Max single stall (~us units, saturating) + number of
+	// deliveries that stalled at all: settles the "SDRAM contention at track
+	// boundaries" suspect with numbers.
+	output reg  [15:0] dbg_mfm_stall_us,
+	output reg  [7:0]  dbg_mfm_stall_cnt
 );
 	assign dbg_disk_image_data = diskImageData;
 	assign dbg_drive_track     = driveTrack;
@@ -342,6 +354,39 @@ module floppy
 					mfm_timer       <= mfm_period;
 				end
 				// else: payload byte not fetched yet — stall until an ack lands
+			end
+		end
+	end
+
+	// --- MFM delivery-stall witness (see the port comment). Own always block
+	// (Quartus single-driver law); observation-only. ~1 us = 8 cep ticks at
+	// 8.125 MHz. dbg_mfm_stall_cnt increments when a stall crosses ~1 us so
+	// sub-us fetch latency (the normal case) is not counted.
+	wire mfm_stalled = mfm_spinning && (mfm_timer == 9'd0) &&
+	                   mfm_needs_data && !mfm_fresh;
+	reg [2:0]  mfm_stall_pre;
+	reg [15:0] mfm_stall_run;
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			mfm_stall_pre    <= 3'd0;
+			mfm_stall_run    <= 16'd0;
+			dbg_mfm_stall_us  <= 16'd0;
+			dbg_mfm_stall_cnt <= 8'd0;
+		end
+		else if (cep) begin
+			if (mfm_stalled) begin
+				mfm_stall_pre <= mfm_stall_pre + 3'd1;
+				if (mfm_stall_pre == 3'd7 && mfm_stall_run != 16'hFFFF) begin
+					mfm_stall_run <= mfm_stall_run + 16'd1;
+					if (mfm_stall_run == 16'd0 && dbg_mfm_stall_cnt != 8'hFF)
+						dbg_mfm_stall_cnt <= dbg_mfm_stall_cnt + 8'd1;
+					if (mfm_stall_run >= dbg_mfm_stall_us)
+						dbg_mfm_stall_us <= mfm_stall_run + 16'd1;
+				end
+			end
+			else begin
+				mfm_stall_pre <= 3'd0;
+				mfm_stall_run <= 16'd0;
 			end
 		end
 	end

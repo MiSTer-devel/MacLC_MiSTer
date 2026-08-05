@@ -1174,7 +1174,8 @@ module emu
 	wire [21:0] dbg_flp_gcr_addr;
 	wire [31:0] dbg_ism_verdict_w;
 	wire [31:0] dbg_ism_unrlatch_w;
-	wire [31:0] dbg_ism_lastid_w, dbg_ism_idratio_w;
+	wire [31:0] dbg_ism_scan_w;
+	wire [23:0] dbg_mfm_stall_w;
 	wire [31:0] dbg_ism_state;
 	wire [15:0] dbg_flp_strb_cnt;
 	wire [15:0] dbg_flp_strb_en_cnt;
@@ -1262,23 +1263,42 @@ module emu
 	//           0xFFB3=-77. THE exact failure the guest saw, no inference.
 	//   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]} — error completions /
 	//           ALL word-writes to $142 (every driver-op completion)
-	//   row 7  ID-WITNESS: {C,H,R,N} of the LAST ID field actually DELIVERED
-	//           to the CPU (swim.v, captured at the generator push). Compare
-	//           against row 2's LIVE side/track ON THE SAME FRAME: H != side
-	//           means we served the WRONG HEAD, C != track the wrong cylinder
-	//           — either one makes a CRC-good field never match, burning the
-	//           driver's attempt budget (-84 -> the -81 sectNFErr the guest
-	//           reports) with no error bit set anywhere.
-	//   row 8  the last SIX sector numbers served (5 bits each, newest LOW).
-	//           THE decisive datum: -81 (ROM a6d3a6 via a6d388) means the
-	//           driver read valid IDs at the right cylinder/head but its
-	//           target sector never turned up. 1,2,3,4,5,6 = healthy scan
-	//           (look elsewhere); a stuck (1,1,1,1) or short-cycling
-	//           (1,2,1,2) sequence means re-arm keeps landing on the same
-	//           field and every other sector is unreachable.
+	//   row 7  SCAN-WITNESS latched at the LAST -81 post (the exact cycle the
+	//           driver word-writes 0xFFAF to $142):
+	//             [31:24] run    = consecutive delivered ID fields since the
+	//                              last CONSUMED data field. The -81 budget
+	//                              seed is 64 (SonyVars+46 = 0x40, MAME-
+	//                              measured; healthy MAME never passed 17 =
+	//                              one revolution). ~64 here = the scan model
+	//                              holds and the target was skipped on >= 3
+	//                              consecutive revolutions; ~17 = model wrong.
+	//             [23:16] hunt_ms = duration of the last ARMED window (ms).
+	//                              <1 = normal per-ID windows; ~100+ = a dry
+	//                              hunt, which contradicts -81 (that path
+	//                              posts -67) -> re-derive.
+	//             [15:14] par    = {odd R seen, even R seen} since the last
+	//                              consumed data field. ONE bit set across a
+	//                              64-ID burn = the stride-2 stroboscope
+	//                              (timer-paced re-arm vs 11.1 ms disk slots
+	//                              always lands past the next ID; 18 sectors
+	//                              even => 9-sector cycle, target parity
+	//                              never sampled). Both set = longer-cycle
+	//                              alias or a different mechanism.
+	//             [13:0]  gap_us = us since the last delivery inside an
+	//                              armed+synced window (held over disarm):
+	//                              served-side starvation at the failure.
+	//   row 8  LIVE {stall_us[15:0], stall_cnt[7:0], e81_cnt[7:0]}: worst
+	//           single MFM delivery stall (floppy.v byte-cell timer held at 0
+	//           waiting for the SDRAM fetch — a real drive never stalls), how
+	//           many deliveries stalled >= ~1 us, and how many -81 posts the
+	//           row-7 latch has seen. stall_us ~2 with -81s present kills the
+	//           SDRAM-contention suspect; ms-scale stall_us revives it.
 	//   (retired: hs_b1/hs_b5 verdict counters — the b5 theory was falsified
-	//    on 08-05, unr onsets stayed flat across failing dialogs; and the
-	//    UNR-FORENSIC latch, which answered: first event = mount self-test.)
+	//    on 08-05, unr onsets stayed flat across failing dialogs; the
+	//    UNR-FORENSIC latch, which answered: first event = mount self-test;
+	//    and the ID-WITNESS CHRN capture + ID:DATA ratio, whose job ended
+	//    when hardware measured ratio 1.12 vs 3.15 and killed the interleave
+	//    theory — see mfm_track_encoder.v.)
 	//   row 11 LIVE {status, 6'b0, ins_int, ins_ext, disk_data, raw_byte}
 	//   row 10 latch @ FIRST nonzero $142: {side, track[6:0], 2'b0, addr[21:0]}
 	//           — where the head/fetch was when the first error was POSTED
@@ -1317,6 +1337,11 @@ module emu
 	reg [15:0] hud_e142_first = 16'd0, hud_e142_last = 16'd0;
 	reg [15:0] hud_e142_nz_cnt = 16'd0, hud_e142_all_cnt = 16'd0;
 	reg [31:0] hud_e142_pos = 32'd0;
+	// -81 (0xFFAF) snapshot: freeze the swim SCAN-WITNESS word on the exact
+	// bus cycle the driver posts sectNFErr, and count the posts. dbg_ism_scan_w
+	// is clk_sys-domain (swim runs on clk_sys/cen), so this is a clean sample.
+	reg [7:0]  hud_e81_cnt  = 8'd0;
+	reg [31:0] hud_e81_scan = 32'd0;
 	wire hud_e142_hit = !_cpuAS && !_cpuRW && !_cpuUDS && !_cpuLDS &&
 	                    (cpuAddr[23:0] == 24'h000142);
 	always @(posedge clk_sys) begin
@@ -1333,6 +1358,10 @@ module emu
 					hud_e142_first <= cpuDataOut;
 					hud_e142_pos   <= {dbg_flp_side, dbg_flp_track[6:0],
 					                   2'b00, dskReadAddrInt[21:0]};
+				end
+				if (cpuDataOut == 16'hFFAF) begin
+					if (hud_e81_cnt != 8'hFF) hud_e81_cnt <= hud_e81_cnt + 1'd1;
+					hud_e81_scan <= dbg_ism_scan_w;
 				end
 			end
 		end
@@ -1373,8 +1402,8 @@ module emu
 			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
 			hud_w5 <= {hud_e142_first, hud_e142_last};
 			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
-			hud_w7 <= dbg_ism_lastid_w;
-			hud_w8 <= dbg_ism_idratio_w;
+			hud_w7 <= hud_e81_scan;
+			hud_w8 <= {dbg_mfm_stall_w, hud_e81_cnt};
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
@@ -1876,8 +1905,8 @@ module emu
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
 		.dbg_ism_verdict(dbg_ism_verdict_w),
 		.dbg_ism_unrlatch(dbg_ism_unrlatch_w),
-		.dbg_ism_lastid(dbg_ism_lastid_w),
-		.dbg_ism_idratio(dbg_ism_idratio_w),
+		.dbg_ism_scan(dbg_ism_scan_w),
+		.dbg_mfm_stall(dbg_mfm_stall_w),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),

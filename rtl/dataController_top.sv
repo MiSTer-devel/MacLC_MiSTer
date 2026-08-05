@@ -196,8 +196,8 @@ module dataController_top(
 	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
 	output [31:0] dbg_ism_verdict,  // {b1_hot,b5_hot} over handshake reads
 	output [31:0] dbg_ism_unrlatch, // first-error[2]-onset forensic latch
-	output [31:0] dbg_ism_lastid,   // {C,H,R,N} of the last ID field served
-	output [31:0] dbg_ism_idratio    // {ID fields, DATA fields} served
+	output [31:0] dbg_ism_scan,     // SCAN-WITNESS {run,hunt_ms,par,gap_us}
+	output [23:0] dbg_mfm_stall     // {stall_us[15:0], stall_cnt[7:0]}
 );
 	
 	parameter SCSI_DEVS = 2;
@@ -1090,8 +1090,8 @@ module dataController_top(
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
 		.dbg_ism_verdict(dbg_ism_verdict),
 		.dbg_ism_unrlatch(dbg_ism_unrlatch),
-		.dbg_ism_lastid(dbg_ism_lastid),
-		.dbg_ism_idratio(dbg_ism_idratio),
+		.dbg_ism_scan(dbg_ism_scan),
+		.dbg_mfm_stall(dbg_mfm_stall),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),

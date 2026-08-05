@@ -116,10 +116,13 @@ module swim
 	// unr event (armed pop-empty vs CPU-push-full, and the FIFO/stage/mode
 	// state at that instant). See the UNR-FORENSIC block below.
 	output [31:0] dbg_ism_unrlatch,
-	// {C,H,R,N} of the LAST ID field actually DELIVERED to the CPU, and
-	// {ID fields, DATA fields} served. See the ID-WITNESS block below.
-	output [31:0] dbg_ism_lastid,
-	output [31:0] dbg_ism_idratio
+	// SCAN-WITNESS live word {run[7:0], hunt_ms[7:0], par[1:0], gap_us[13:0]}
+	// — the -81 discriminator, latched by MacLC.sv at the instant the Sony
+	// driver posts 0xFFAF to $142. See the SCAN-WITNESS block below.
+	output [31:0] dbg_ism_scan,
+	// {stall_us[15:0], stall_cnt[7:0]} from the internal drive's MFM delivery
+	// path (floppy.v) — the SDRAM-starvation witness.
+	output [23:0] dbg_mfm_stall
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -310,7 +313,9 @@ module swim
 		.dbg_strb_en_cnt(dbg_flp_strb_en_cnt),
 		.dbg_strb_last(dbg_flp_strb_last),
 		.dbg_rej_step(dbg_flp_rej_step),
-		.dbg_status(dbg_flp_status)
+		.dbg_status(dbg_flp_status),
+		.dbg_mfm_stall_us(dbg_mfm_stall[23:8]),
+		.dbg_mfm_stall_cnt(dbg_mfm_stall[7:0])
 	);
 
 	floppy floppyExt
@@ -443,70 +448,122 @@ module swim
 	end
 	assign dbg_ism_unrlatch = dbg_unr_latch;
 
-	// ── ID-WITNESS (2026-08-05 pm) ────────────────────────────────────────
-	// What the CPU is actually SERVED, sampled where it is served: the
-	// generator push into the staging ring. Watch the delivered stream for
-	// A1 A1 A1 FE and capture the next four bytes = C H R N.
+	// ── SCAN-WITNESS (2026-08-05 pm, supersedes the ID-WITNESS) ───────────
+	// Ground truth this instrument rests on (MAME 0.264 runtime + ROM disasm,
+	// docs/sony_driver_mfm_read_reference.md):
+	//   * The -81 give-up budget seed SonyVars+46 = 0x40 = 64 unwanted IDs
+	//     (~3.5 revolutions), measured live in MAME. MAME's deepest healthy
+	//     scan consumed 17 of 64 — exactly the one-revolution physics bound.
+	//   * A delivery outage or CRC-bad ID CANNOT produce -81: the ID
+	//     primitive's 20000-poll timeout returns -67 (ROM a6ee40/a6ee76) and
+	//     a bad ID CRC returns -69 (a6eed0); both retry via SonyVars+43 and
+	//     post FFBD/FFBB. The dialogs show FFAF (-81) only.
+	//   * Therefore -81 REQUIRES ~64 CRC-good, right-cyl/head, unwanted IDs
+	//     in one scan — the target's ID skipped on >= 3 consecutive
+	//     revolutions. Between attempts the driver SLEEPS via a timer
+	//     (a6d592, d0=75 for MFM -> [$568] after /10) with interrupts open
+	//     (a6d58c), so the attempt cadence is timer-paced against the
+	//     disk-paced 11.1 ms sector slots — a stroboscope. A phase-locked
+	//     wake (e.g. always +3.4 ms late) advances the catch TWO slots per
+	//     attempt; 18 sectors being even, a stride-2 walk cycles 9 sectors
+	//     forever and the target's parity class is never sampled.
 	//
-	// This is the direct test the counters could not make. The copy fails on
-	// whole files with byte-exact payloads, no error bits, and run-to-run
-	// non-determinism — the signature of serving a real, CRC-good track from
-	// the WRONG PLACE. floppy.v samples driveSide only while ACTION is set
-	// (from driveReadAddr={ca2,ca1,ca0,SEL}, RDDATA0/1 = 8/9), so a stale or
-	// mid-read-flipped head yields exactly that: correct C, WRONG H. Latching
-	// C/H/N here says which — the ROM's ID primitive compares only the A1A1A1
-	// FE pattern and leaves C/H/R to its caller, so a wrong-H field looks
-	// perfect to the primitive and simply never matches, burning the caller's
-	// attempt budget until it gives up (-84 -> -81 sectNFErr).
-	// Compare against HUD row 2 (LIVE side/track) on the same frame: an
-	// H that disagrees with side, or a C that disagrees with track, is the bug.
-	//
-	// ★ THE RATIO is the measurement. -81 is reached (ROM a6d3a6, via a6d388)
-	// when the driver keeps reading VALID ID fields — right cylinder and head,
-	// or it would have taken the -80 seekErr path at a6d166, where the head
-	// rides in d1 bit 11 (a6eea6) — yet its target sector never turns up,
-	// burning one retry per unwanted sector until SonyVars+47 runs out. So
-	// what matters is how many ID fields the CPU walks per DATA field it
-	// actually consumes:
-	//   ~1:1  the scan catches its target immediately (healthy)
-	//   ~2:1  one interleave step per read — the intended 2:1 behaviour
-	//   ~18:1 a FULL REVOLUTION per sector: the scan is over the timing cliff
-	//         and the retry budget dies in ~2 sectors (the -81 signature)
-	// Counting both marks costs two counters and answers it outright, which a
-	// sequence of sector numbers cannot: a healthy walk and an over-cliff walk
-	// both step 1,2,3,4 — they differ only in how many DATA fields land.
-	reg [1:0]  idw_mark_run;
-	reg [2:0]  idw_phase;      // 0=idle, 1..4 = capturing C,H,R,N
-	reg [31:0] idw_last = 32'd0;
-	reg [15:0] idw_ids = 16'd0, idw_datas = 16'd0;
+	// What is measured, all on generator pushes (what the CPU is served):
+	//   scw_run[7:0]   consecutive ID fields since the last CONSUMED data
+	//                  field (>= 64 payload bytes streamed = the driver was
+	//                  reading it; a free FB catch dies at ~2-3 bytes because
+	//                  the ROM re-arms through CLRFIFO at a6ee46). At a -81
+	//                  post this reads ~the budget actually burned: ~64
+	//                  confirms the model; ~17 means the model is wrong.
+	//   scw_par[1:0]   {odd R seen, even R seen} since the last consumed
+	//                  data field. A full-budget scan with ONE parity bit set
+	//                  = the stride-2 stroboscope, case closed.
+	//   scw_hunt_ms[7:0] duration of the current/last ARMED window, ms:
+	//                  short (<1) = per-ID windows, the healthy shape.
+	//   scw_gap_us[13:0] us since the last delivery inside an armed+synced
+	//                  window (held across disarm): the served-side
+	//                  starvation witness, pairs with dbg_mfm_stall.
+	// MacLC.sv latches dbg_ism_scan into HUD row 7 at each 0xFFAF post.
+	reg [1:0]  scw_mark_run;
+	reg [2:0]  scw_phase;      // 0=idle, 1..4 = C,H,R,N byte positions
+	reg [6:0]  scw_fbrun;      // payload bytes streamed since the last FB
+	reg [7:0]  scw_run;
+	reg [1:0]  scw_par;
+	reg [7:0]  scw_hunt_ms;
+	reg [13:0] scw_gap_us;
+	reg [2:0]  scw_pre_us;     // /8 of cen ~= 0.985 us
+	reg [9:0]  scw_pre_ms;     // /1024 of us ticks ~= 1.008 ms
 	always @(posedge clk or negedge _reset) begin
 		if (!_reset) begin
-			idw_mark_run <= 2'd0; idw_phase <= 3'd0;
-			idw_last <= 32'd0;    idw_ids <= 16'd0; idw_datas <= 16'd0;
+			scw_mark_run <= 2'd0; scw_phase <= 3'd0; scw_fbrun <= 7'd0;
+			scw_run <= 8'd0;      scw_par <= 2'd0;
+			scw_hunt_ms <= 8'd0;  scw_gap_us <= 14'd0;
+			scw_pre_us <= 3'd0;   scw_pre_ms <= 10'd0;
 		end
-		else if (cen && ism_gen_push) begin
-			if (mfm_mark_sel && mfm_byte_sel == 8'hA1) begin
-				if (idw_mark_run != 2'd3) idw_mark_run <= idw_mark_run + 1'd1;
-				idw_phase <= 3'd0;
+		else if (cen) begin
+			scw_pre_us <= scw_pre_us + 3'd1;
+
+			// armed-window timer: reset on the arm rising edge (ism_arm_d is
+			// the main block's delayed copy, read-only here — same edge), run
+			// while armed, hold the final value across the disarmed gap.
+			if (ism_arm && !ism_arm_d) begin
+				scw_hunt_ms <= 8'd0;
+				scw_pre_ms  <= 10'd0;
 			end
-			else begin
-				if (idw_mark_run == 2'd3 && mfm_byte_sel == 8'hFE) begin
-					idw_phase <= 3'd1;                  // IDAM: capture CHRN
-					if (idw_ids != 16'hFFFF) idw_ids <= idw_ids + 1'd1;
+			else if (ism_arm && scw_pre_us == 3'd7) begin
+				scw_pre_ms <= scw_pre_ms + 10'd1;
+				if (scw_pre_ms == 10'd1023 && scw_hunt_ms != 8'hFF)
+					scw_hunt_ms <= scw_hunt_ms + 8'd1;
+			end
+
+			// inter-delivery gap: cleared by every push (the syncing mark is
+			// itself a push, so counting restarts fresh each window), counts
+			// only inside an armed+synced stream, held across disarm.
+			if (ism_gen_push)
+				scw_gap_us <= 14'd0;
+			else if (ism_arm && mfm_synced && scw_pre_us == 3'd7 &&
+			         scw_gap_us != 14'h3FFF)
+				scw_gap_us <= scw_gap_us + 14'd1;
+
+			// delivered-stream parser
+			if (ism_gen_push) begin
+				if (mfm_mark_sel && mfm_byte_sel == 8'hA1) begin
+					if (scw_mark_run != 2'd3) scw_mark_run <= scw_mark_run + 2'd1;
+					scw_phase <= 3'd0;
+					scw_fbrun <= 7'd0;
 				end
-				else if (idw_mark_run == 2'd3 && mfm_byte_sel == 8'hFB) begin
-					if (idw_datas != 16'hFFFF) idw_datas <= idw_datas + 1'd1;
+				else begin
+					if (scw_mark_run == 2'd3 && mfm_byte_sel == 8'hFE) begin
+						scw_phase <= 3'd1;               // IDAM: C H R N follow
+						scw_fbrun <= 7'd0;
+						if (scw_run != 8'hFF) scw_run <= scw_run + 8'd1;
+					end
+					else if (scw_mark_run == 2'd3 && mfm_byte_sel == 8'hFB) begin
+						scw_fbrun <= 7'd1;               // data field opened
+					end
+					else begin
+						if (scw_phase != 3'd0) begin
+							if (scw_phase == 3'd3)       // this byte is R (1-based)
+								scw_par <= scw_par |
+								           {mfm_byte_sel[0], ~mfm_byte_sel[0]};
+							scw_phase <= (scw_phase == 3'd4) ? 3'd0
+							                                 : scw_phase + 3'd1;
+						end
+						if (scw_fbrun != 7'd0) begin
+							if (scw_fbrun == 7'd64) begin // driver is consuming it
+								scw_run   <= 8'd0;
+								scw_par   <= 2'd0;
+								scw_fbrun <= 7'd0;
+							end else
+								scw_fbrun <= scw_fbrun + 7'd1;
+						end
+					end
+					scw_mark_run <= 2'd0;
 				end
-				else if (idw_phase != 3'd0) begin
-					idw_last <= {idw_last[23:0], mfm_byte_sel};
-					idw_phase <= (idw_phase == 3'd4) ? 3'd0 : idw_phase + 1'd1;
-				end
-				idw_mark_run <= 2'd0;
 			end
 		end
 	end
-	assign dbg_ism_lastid  = idw_last;
-	assign dbg_ism_idratio = {idw_ids, idw_datas};
+	assign dbg_ism_scan = {scw_run, scw_hunt_ms, scw_par, scw_gap_us};
 	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
 	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
 	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};

@@ -59,9 +59,17 @@ Same shape at `a6c746`. Consequences:
 |---|---|---|
 | `-81 sectNFErr` | `a6d3a6`, reached via `a6d388` | **the wanted sector never turned up** before the give-up budget ran out — see §4 |
 | `-80 seekErr` | `a6d3b2`, from the `a6d166` compare | the ID's **cylinder or head** did not match |
+| `-67 noAdrMkErr` | `a6ee40`, taken at `a6ee76` | the ID primitive's **20000-poll budget expired** hunting for `A1 A1 A1 FE` — the class every *delivery outage / dry hunt* falls into. Retries via SonyVars+43 (seed +42 = **8**), so it posts `FFBD` only after 8 straight timeouts. |
+| `-69 badCksmErr` | `a6eed0`, via the `a6ef78` verdict tail | the ID field's **CRC/error verdict failed** — the class a corrupt-but-delivered ID falls into. Same +43 retry wrapper. |
 | `-65 offLinErr` | `a6c866`, `a6cdb4` | **benign.** A drive-state byte `< 2` at driver *entry* — it never touches the disk. The Mac polls both drives and the LC has one, so routine polling of the absent second drive posts this constantly. **Not a read failure.** |
 | `-84 verErr` | `a6f356` | format/verify budget exhausted (not the copy path) |
 | `-83 fmt2Err` | `a6e7dc` | posted literally during mount speed calibration — expected |
+
+★ **Consequence (2026-08-05 pm): a delivery outage or a CRC-bad ID CANNOT
+produce `-81`.** Those classes are owned by `-67`/`-69`. A dialog showing
+`FFAF` means the stream was serving **CRC-good, right-cylinder/head IDs the
+whole time** and the target simply was never among the ones the driver
+consumed.
 
 ★ **The head rides in bit 11 of the compared word.** `a6eea6` does
 `bset #11,%d1` when the ID's H byte is nonzero, and `a6d166` compares the whole
@@ -92,6 +100,50 @@ scan-efficiency failure, not a data-integrity one.
 This is the single most important fact in this file, and the one that makes
 sector interleave actively harmful — see §5.
 
+### 4b. The budget numbers + the inter-attempt SLEEP (2026-08-05 pm)
+
+Measured **live in MAME 0.264** (`verilator/mame/floppy/sonyvars_watch.lua`,
+watching SonyVars through a whole 1.44 MB System 6.0.8 floppy boot):
+
+- **`+46` (the `-81` seed) = `0x40` = 64 unwanted IDs ≈ 3.5 revolutions.**
+- `+42` (ID-error retry seed) = 8, `+48` (outer) = 8, `+62` = 100 (GCR sleep
+  amount; the MFM path uses the literal 75 — `a6d396`).
+- MAME's **deepest healthy scan consumed 17 of 64** — exactly the
+  one-revolution physics bound (enter just after the target ⇒ 17 unwanted IDs
+  before it comes around). It never spent one ID more.
+- MAME posts **zero** `$142` writes across the whole boot.
+
+So a real `-81` requires ~64 consecutive CRC-good unwanted IDs = **the target
+skipped on at least 3 consecutive revolutions** — a systematic, revolution-
+periodic skip, not bad luck.
+
+**The scan is not a busy-poll walk — it SLEEPS between attempts.** On every
+unwanted, uncached ID (`a6d388`): `d0 = SonyVars+62`, or **75 if MFM**
+(`a6d390`–`a6d396`, testing the +17-indexed MFM flag), then `a6d592`:
+`SonyVars+20 -= d0`, arm a timer task (SonyVars+280, callback `a6d5ca`) for
+`d0/10` units via the vector at low-mem **`[$568]`**, and block until the
+callback (`a6d3f2`). The mask is **opened during the sleep**
+(`andiw #$F8FF,%sr` at `a6d58c`; same pattern at `a6d226`/`a6d368`), so
+interrupt service directly adds to wake latency. Nominal intent: sleep ~7.5 ms
+so the unwanted sector's data field (~8.5 ms) passes, wake, re-arm, catch the
+next ID ~10.9 ms after the last one.
+
+That makes the attempt cadence **timer-paced against disk-paced 11.1 ms sector
+slots — a stroboscope**. The wake→re-arm has ~3.4 ms of margin before the next
+ID's sync run; a wake that is consistently later than that catches the sector
+AFTER next instead — a stride-2 walk. **18 sectors being even, a stride-2 walk
+closes into two disjoint 9-sector cycles and the target's parity class is
+never sampled again** — burning all 64 budget units on the same 9 unwanted
+IDs with every payload byte-exact and no error bit set. This is the standing
+suspect for the residual copy failures; the SCAN-WITNESS (§6) measures it
+directly (run ≈ 64 + single-parity at the `-81` instant = confirmed).
+
+Note our emulation timing side: E is +3.7% fast (sleeps run *short*, the safe
+direction) and the MFM rotation is 198.75 ms/rev (+0.63% fast) — but both are
+**crystal-locked with zero wobble**, unlike a real drive's ±1.5% mechanical
+variation, so any phase relationship that does arise **persists** instead of
+self-healing within a revolution or two.
+
 Other notes on the primitives:
 
 - Every read loop is **b7-guarded** (`a6ee70`, `a6ef1c`, `a6ef36`/`a6ef42`,
@@ -99,6 +151,15 @@ Other notes on the primitives:
 - The ID primitive **re-arms internally** on a mismatch (`a6ee82`), sharing a
   20000-poll budget. Catching a data mark (`FB` where `FE` was wanted) therefore
   costs nothing from the caller's budget.
+- **The internal re-arm is a full mode cycle** (`a6ee46`): read Error,
+  `ModeClr $18`, `ModeSet $01` + `ModeClr $01` (**an explicit CLRFIFO
+  pulse**), read Error, `ModeSet $08`. Two consequences: (a) after a free
+  `FB` catch the armed stream is cut within ~2–3 payload bytes — a
+  fully-streamed data field always means the driver was consuming it; (b) the
+  ROM clears the FIFO itself before EVERY arm, so `swim.v`'s F8 arm-edge FIFO
+  clear is redundant for this driver (MAME/Snow reset only the shifter/sync
+  on the arm edge; the Snow cross-check confirms `ism_fifo.clear()` happens
+  only on the explicit mode-bit-0 write).
 - The per-field verdict is ONE handshake sample at the CRC-low byte, tested
   `d5 & 0x22` (`a6ef86`/`a6ef96`): b5 = error pending, b1 = running CRC ≠ 0.
 - Reads run **interrupt-masked**; every exit path disarms via `ModeClr 18`
@@ -128,11 +189,21 @@ evidence that specifically addresses the refutation.
 - **`USE_DBG_HUD`** (`MacLC.sv`, macro in `MacLC.qsf`) + **`scripts/parse_hud.py`** —
   12 rows of binary pixels, top-left, decoded from a screenshot. JTAG is dead on
   this board, so this is the only in-system probe. Row 5/6 = `$142` codes and
-  counts, row 7 = last ID served {C,H,R,N}, row 8 = {ID fields, DATA fields}
-  served. ★ Row 8's ratio is a **relative** metric (it compares builds); it
-  cannot be inverted into a miss rate, because a skipped sector's ID-hunt also
-  streams that sector's data field.
+  counts. **Rows 7/8 are the SCAN-WITNESS (2026-08-05 pm,** replacing the
+  ID-WITNESS/ratio whose job ended with the interleave verdict**)**: row 7
+  latches `{run, hunt_ms, par, gap_us}` at the exact cycle the driver posts
+  `0xFFAF` to `$142` — `run` ≈ the budget actually burned (≈64 confirms §4b,
+  ≈17 refutes it), `par` = which sector-number parities the burn saw (one
+  parity = the stride-2 stroboscope), `gap_us`/row 8's
+  `{stall_us, stall_cnt}` = delivery-side starvation (the MFM byte engine's
+  SDRAM stall was previously uninstrumented — `miss_cnt` is GCR-only).
+  Row 8 low byte counts the `-81` posts the latch has seen.
   ★ **The HUD must be switched off in `MacLC.qsf` before any release fit.**
+- **`verilator/mame/floppy/sonyvars_watch.lua`** — MAME-side ground truth:
+  logs the SonyVars retry seeds on change and every `$140-$143` write with
+  the posting PC. This is how the 64-ID budget and the healthy-scan depth
+  were measured; rerun it whenever a new theory needs the driver's actual
+  numbers.
 - **`verilator/tb_ism_sony.v`** — models the driver instruction-for-instruction
   (poll budgets, the `d5 & 0x22` verdict, E-paced accesses, teardown probes).
   `run_track_scan` + `+postgap=N` measures scan efficiency with no artificial
@@ -146,16 +217,32 @@ evidence that specifically addresses the refutation.
   the desktop (keys on the alert triangle; an earlier lavender-track test
   over-counted 3×).
 
-## 7. Current state (2026-08-05)
+## 7. Current state (2026-08-05 pm)
 
 The copy still fails, ~6–8 files per whole-disk copy, **non-deterministically**
 (two identical runs failed on disjoint file sets). Established: payloads are
-byte-exact, no error bit is set anywhere, cylinder/head/size are always correct,
-`miss_cnt = 0`, `ovr = 0`. Per §4 the failure is that the wanted sector does not
-appear before the budget expires — a **timing** fault in rare late arms, not a
-format or data fault.
+byte-exact, no error bit is set anywhere, cylinder/head/size are always correct.
+Per §3/§4b the `-81` class **requires** ~64 CRC-good unwanted IDs consumed with
+the target skipped on 3+ consecutive revolutions (outages and CRC-bad IDs
+surface as `-67`/`-69`, which the dialogs do not show).
 
-Suspects not yet excluded: SDRAM fetch contention at track boundaries; the
-`ism_arm` rising-edge FIFO clear racing a delivery; driver-side latency between
-the ID verdict and the data-primitive arm. `tb_ism_sony` passes 145/145, so the
-effect is **hardware-only** — instrument it, don't simulate it.
+Suspect ranking after the 08-05 pm ROM/MAME pass:
+
+1. **The §4b sleep stroboscope** (timer-paced re-arm phase-locked against the
+   11.1 ms sector slots; zero-wobble emulation lets the lock persist) — the
+   only mechanism found that produces the full observed signature. Measured by
+   SCAN-WITNESS `run`/`par` at the `-81` instant.
+2. SDRAM fetch stall stretching the rotation (previously **uninstrumented**;
+   `miss_cnt` is GCR-path-only) — now measured by `stall_us`/`stall_cnt`, but
+   note a stall alone belongs to the `-67` class, so it can at most be an
+   accomplice (phase-shifter), not the direct cause.
+3. ~~`ism_arm` FIFO-clear race~~ — de-prioritized: the ROM pulses CLRFIFO
+   itself before every arm (§4-notes), and the A1×3 redundancy absorbs a
+   single lost byte.
+
+`tb_ism_sony` passes 145/145 with a FIXED modeled inter-attempt latency — a
+phase-locked cadence cannot fail in a testbench that never sleeps on a timer,
+which is exactly why this is hardware-only. If the stroboscope confirms, the
+fix class is **break the phase lock**: model the real drive's rotational
+wobble (dither `mfm_period` ±~0.5% slowly, e.g. LFSR-walked) so a straddle
+self-heals in a revolution or two, exactly as physical media does.
