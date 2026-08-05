@@ -105,7 +105,7 @@ module tb_ism_step;
 	begin
 		swim_wr(4'h0, 8'h00);            // ca0 = 0  -\ DIRTN register (0)
 		swim_wr(4'h2, 8'h00);            // ca1 = 0  -/
-		swim_wr(4'h5, 8'h00);            // ca2 = 1   = direction "toward 79"
+		swim_wr(4'h4, 8'h00);            // ca2 = 0   = direction "toward 79"
 		swim_wr(4'h7, 8'h00);            // lstrb = 1  (addr hi bit0 = 1 -> set)
 		swim_wr(4'h6, 8'h00);            // lstrb = 0  -> commit DIRTN
 		swim_wr(4'h1, 8'h00);            // ca0 = 1  -\ STEP register (2)
@@ -120,9 +120,9 @@ module tb_ism_step;
 	// data = {oe[3:0], lstrb, ca2, ca1, ca0}
 	task ism_step(input [3:0] oe);
 	begin
-		swim_wr(4'h4, {oe, 4'b0100});    // DIRTN reg, data ca2=1 (toward 79), lstrb low
-		swim_wr(4'h4, {oe, 4'b1100});    // lstrb high
-		swim_wr(4'h4, {oe, 4'b0100});    // lstrb low  -> commit DIRTN
+		swim_wr(4'h4, {oe, 4'b0000});    // DIRTN reg, data ca2=0 (toward 79), lstrb low
+		swim_wr(4'h4, {oe, 4'b1000});    // lstrb high
+		swim_wr(4'h4, {oe, 4'b0000});    // lstrb low  -> commit DIRTN
 		swim_wr(4'h4, {oe, 4'b0001});    // STEP reg (ca0=1), lstrb low
 		swim_wr(4'h4, {oe, 4'b1001});    // lstrb high
 		swim_wr(4'h4, {oe, 4'b0001});    // lstrb low  -> commit STEP
