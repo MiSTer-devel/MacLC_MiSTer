@@ -1,5 +1,11 @@
 # SWIM ISM-mode MFM READ — register-level reference (for 1.44 MB support)
 
+> **Companion doc:** this file covers the SWIM **hardware** registers (from
+> MAME). For what the boot ROM's **Sony driver** does with them — the read-path
+> routine map, what each error code the guest sees actually means, and the list
+> of theories already tested and refuted — see
+> [`sony_driver_mfm_read_reference.md`](sony_driver_mfm_read_reference.md).
+
 *Ground truth: MAME `swim1.cpp` (the Mac LC instantiates **SWIM1** @ C15M, drive
 `35hd`/`mfd75w` — `src/mame/apple/maclc.cpp`) + Apple SWIM Chip User's Reference.
 Compiled 2026-06-13 from a MAME-source research pass. Use this to implement the

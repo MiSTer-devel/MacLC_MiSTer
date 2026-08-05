@@ -182,6 +182,19 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 ## Known Limitations
 
 - Floppy disks are read-only
+- **1.44 MB MFM read works; the Finder COPY still fails on ~6-8 files per
+  whole-disk copy, non-deterministically.** Before touching this, read
+  **`docs/sony_driver_mfm_read_reference.md`** — it maps the ROM Sony driver's
+  read path, decodes what each error code means (`-81` = the wanted sector never
+  appeared before the give-up budget expired, spent **per unwanted sector ID**;
+  `-65` is benign polling of the absent second drive), and lists **six theories
+  already tested and refuted** with their evidence. Three of them were built and
+  demolished for want of that page. The residual defect is a **timing** fault in
+  rare late arms: payloads are byte-exact, no error bit is set, cylinder/head are
+  provably correct, and `tb_ism_sony` passes 145/145 — so it is hardware-only.
+  Instruments: `USE_DBG_HUD` + `scripts/parse_hud.py`, `verilator/tb_mfm_idcensus.v`
+  (full-disk ID census), `tb_ism_sony +postgap=N` (scan efficiency).
+  ★ `USE_DBG_HUD=1` is committed ON in `MacLC.qsf` — turn it OFF for release fits.
 - SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
   (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO
