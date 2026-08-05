@@ -574,25 +574,28 @@ module via6522 (
     assign port_b_t[6:0] = pio_i_ddrb[6:0];
     assign port_b_t[7] = pio_i_ddrb[7] | tmr_a_output_en;
     // ------------------------------------------------------------------
-    // Mac LC timer prescaler: the V8 clocks the real VIA at C15M/20 =
-    // 783.36 kHz (MAME v8.cpp: R65NC22(..., 15.6672_MHz_XTAL / 20)), but our
-    // rising/falling enables come from the TG68's 68000-style E = CPU/10 =
-    // 1.56672 MHz — exactly 2x too fast. Software that times against the VIA
-    // (TattleTech CPU-speed report, T2 delay loops) reads half the true CPU
-    // speed. Divide ONLY the timer count cadence by 2; register access, port
-    // latching and the (Egret-critical) shift-register path stay on the bus-E
-    // rate so VPA-timed reads/writes are never missed. Reload consumption and
-    // the timeout/tick clears stay at full rate so each timeout still spans
-    // exactly one falling→falling window and IRQ events fire exactly once.
+    // Mac LC timer cadence: count on EVERY falling enable — the enables
+    // already arrive at the real VIA phi2 rate. The V8 clocks the real VIA
+    // at C15M/20 = 783.36 kHz (MAME v8.cpp: R65NC22(..., 15.6672_MHz_XTAL
+    // / 20)); our TG68 is instantiated with E_div=1 (MacLC.sv/sim.v), which
+    // halves its 68000-style E to CPU/20 ≈ 812.5 kHz — the VIA phi2
+    // emulation itself (+3.7%, the clock-audit-blessed rate).
+    //
+    // ★ HISTORY (2026-08-05): a /2 prescaler lived here from 1850a7f
+    // (2026-06-05) to 606224b+1, justified by "enables come at CPU/10 =
+    // 1.56672 MHz". That was true in March (E_div was status_turbo, i.e. 0
+    // at normal speed) but E_div was pinned to 1'b1 before the prescaler
+    // landed, so it double-halved: T1/T2 counted at 406 kHz and EVERY VIA
+    // timer interval ran 2.0x long. Measured on hardware via the floppy
+    // SCAN-WITNESS: the Time Manager (VIA1 T2, unit = 16 ticks, ROM
+    // a0afbe reads T2C and asr #4) stretched the Sony driver's 7 ms
+    // inter-attempt sleep to ~13.5 ms, landing every re-arm ~3 ms past the
+    // next sector's ID sync — a stride-2 rotational phase lock (run=130,
+    // par=ODD-only, hunt=8 ms at every -81 post). Do NOT reintroduce a
+    // prescaler here without first checking what rate the enables really
+    // run at (tg68k.v en_E / E_div).
     // ------------------------------------------------------------------
-    reg timer_phase = 1'b0;
-    always @(posedge clock) begin
-        if (reset == 1'b1)
-            timer_phase <= 1'b0;
-        else if (falling == 1'b1)
-            timer_phase <= ~timer_phase;
-    end
-    wire timer_tick = timer_phase;  // true on every other falling (783.36 kHz)
+    wire timer_tick = 1'b1;  // every falling enable = phi2 rate
 
     // Timer A
     reg        timer_a_reload = 1'b0;

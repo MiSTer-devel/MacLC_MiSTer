@@ -217,32 +217,39 @@ evidence that specifically addresses the refutation.
   the desktop (keys on the alert triangle; an earlier lavender-track test
   over-counted 3×).
 
-## 7. Current state (2026-08-05 pm)
+## 7. RESOLVED (2026-08-05 evening): VIA timers ran 2.0× slow — the sleep
+## stroboscope confirmed and root-caused
 
-The copy still fails, ~6–8 files per whole-disk copy, **non-deterministically**
-(two identical runs failed on disjoint file sets). Established: payloads are
-byte-exact, no error bit is set anywhere, cylinder/head/size are always correct.
-Per §3/§4b the `-81` class **requires** ~64 CRC-good unwanted IDs consumed with
-the target skipped on 3+ consecutive revolutions (outages and CRC-bad IDs
-surface as `-67`/`-69`, which the dialogs do not show).
+**The SCAN-WITNESS run (build `ae5bbd47` = `606224b`, SEED 2) confirmed the
+§4b stroboscope on every one of 5 failure dialogs, with the identical latch:**
 
-Suspect ranking after the 08-05 pm ROM/MAME pass:
+| witness | value | reading |
+|---|---|---|
+| `run` | **130** | 2 retry passes (SonyVars+45 seeds 2) × the 64-ID budget: the scan crossed **7 revolutions** without its target |
+| `par` | **ODD only** | the whole 130-ID burn saw one parity class — a perfect stride-2 lock. (Always the complement of the unreachable class: odd wanted sectors still matched the bitmap mid-call, so the failing calls are exactly those whose *remaining* wanted set was all-even.) |
+| `hunt` | **8 ms** | the last armed window waited 8 ms ⇒ re-arm landed ~3 ms past the straddled ID's sync ⇒ total sleep+dispatch ≈ 13.5 ms vs the intended ~6.75 |
+| `gap`/`stall` | 10 µs / **0** | delivery never starved; **zero MFM SDRAM stalls all run** — the fetch-contention suspect is dead at the source |
 
-1. **The §4b sleep stroboscope** (timer-paced re-arm phase-locked against the
-   11.1 ms sector slots; zero-wobble emulation lets the lock persist) — the
-   only mechanism found that produces the full observed signature. Measured by
-   SCAN-WITNESS `run`/`par` at the `-81` instant.
-2. SDRAM fetch stall stretching the rotation (previously **uninstrumented**;
-   `miss_cnt` is GCR-path-only) — now measured by `stall_us`/`stall_cnt`, but
-   note a stall alone belongs to the `-67` class, so it can at most be an
-   accomplice (phase-shifter), not the direct cause.
-3. ~~`ism_arm` FIFO-clear race~~ — de-prioritized: the ROM pulses CLRFIFO
-   itself before every arm (§4-notes), and the A1×3 redundancy absorbs a
-   single lost byte.
+**Root cause: `rtl/via6522.sv` prescaled T1/T2 by 2 on top of enables that are
+already at phi2 rate.** The TG68 is instantiated with `E_div=1` (E = CPU/20 ≈
+812.5 kHz = the V8's real VIA clock C15M/20 = 783.36 kHz, +3.7%), but the
+prescaler (1850a7f, 2026-06-05) assumed E = CPU/10 — true only of the March
+`status_turbo` wiring. Net: **every VIA timer interval since June ran 2.0×
+long.** The Time Manager (VIA1 T2; unit = 16 ticks — `a0afbe` reads T2C-H/L
+and `asr #4`; ms→unit constant 0xC3D70A3E at `a0af30`; vector `[$568]` =
+`a0af1a`) doubled the §4b sleep from ~6.75 ms to ~13.5 ms, planting every
+re-arm ~3 ms past the next ID — stride-2, 9-sector cycle, `-81`.
+
+Fix: count on every falling enable (`timer_tick = 1'b1`), history + do-not-
+reintroduce note in `via6522.sv`. A real LC survives its own late-ish wakes
+because 7.5 ms + dispatch still lands inside the ~10.9 ms slot — only the 2×
+stretch pushed it over, and the crystal-locked zero-wobble rotation made the
+resulting phase lock permanent instead of self-healing.
+
+Expected side effects of the fix (VIA-timer clients, all previously 2×): any
+Time-Manager-paced delay, T2 delay loops (TattleTech CPU reports read 2× the
+true speed while the bug lived), TimeDBRA-calibrated spinwaits.
 
 `tb_ism_sony` passes 145/145 with a FIXED modeled inter-attempt latency — a
-phase-locked cadence cannot fail in a testbench that never sleeps on a timer,
-which is exactly why this is hardware-only. If the stroboscope confirms, the
-fix class is **break the phase lock**: model the real drive's rotational
-wobble (dither `mfm_period` ±~0.5% slowly, e.g. LFSR-walked) so a straddle
-self-heals in a revolution or two, exactly as physical media does.
+phase-locked cadence cannot fail in a testbench that never sleeps on a real
+timer, which is exactly why this stayed hardware-only for so long.
