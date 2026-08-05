@@ -74,6 +74,8 @@ SONY_ERR = {
     0xFFB7: "-73 badDBtSlp", 0xFFB6: "-74 wrUnderrun", 0xFFB5: "-75 cantStepErr",
     0xFFB4: "-76 tk0BadErr", 0xFFB3: "-77 initIWMErr", 0xFFB2: "-78 twoSideErr",
     0xFFB1: "-79 spdAdjErr", 0xFFB0: "-80 seekErr", 0xFFAF: "-81 sectNFErr",
+    0xFFAE: "-82 fmt1Err", 0xFFAD: "-83 fmt2Err (ROM a6e7dc posts this literal)",
+    0xFFAC: "-84 verErr",
 }
 
 def sony_err(v):
@@ -94,15 +96,14 @@ def decode(words):
     print(f"  w5 $142 FIRST err = {sony_err(w[5] >> 16)}")
     print(f"     $142 LAST  err = {sony_err(w[5] & 0xFFFF)}")
     print(f"  w6 $142 error completions={w[6] >> 16:5d}  ALL completions={w[6] & 0xFFFF:5d}")
-    print(f"  w7 lstrb falling edges: total={w[7] >> 16:5d}  with _enable low={w[7] & 0xFFFF:5d}")
+    b1, b5 = w[7] >> 16, w[7] & 0xFFFF
+    print(f"  w7 VERDICT bits on handshake reads: b1(CRC-bad-on-newest)={b1:5d}  "
+          f"b5(error-pending)={b5:5d}")
     if len(w) > 8:
-        last = w[8] & 0xFFFFFF
-        print("  w8 last 4 strobes (newest first):")
-        for i in range(4):
-            f = (last >> (6 * i)) & 0x3F
-            print(f"       _enable={f >> 5} ca2={(f >> 4) & 1} ca1={(f >> 3) & 1} "
-                  f"ca0={(f >> 2) & 1} SEL={(f >> 1) & 1} ism_active={f & 1}"
-                  f"   -> writeAddr {{ca1,ca0,SEL}}={((f >> 3) & 1) * 4 + ((f >> 2) & 1) * 2 + ((f >> 1) & 1)}")
+        pop2, strb = w[8] >> 16, w[8] & 0xFFFF
+        print(f"  w8 pops with FIFO at 2 entries={pop2:5d}   lstrb falling edges={strb:5d}")
+        if pop2:
+            print("     (b1/b0 describe the byte AFTER the popped one in that state)")
     if len(w) > 9:
         m = w[9]
         mode, setup = m >> 24, (m >> 16) & 0xFF
@@ -130,14 +131,11 @@ def decode(words):
             print("      ** image IS mounted to the internal slot but the drive says NO DISK")
         elif ie and not ii:
             print("      ** image landed in the EXTERNAL slot (unreachable in ISM mode)")
-    tot = w[7] >> 16
-    step = (w[2] >> 8) & 0xFFFF
-    if tot == 0:
-        print("  ==> VERDICT: the driver NEVER strobes lstrb — no step is ever commanded")
-    elif step == 0:
-        print("  ==> VERDICT: strobes ARRIVE but none decode as STEP "
-              "(need {ca1,ca0,SEL}=2, ca2=0, _enable=0) — our decode rejects them")
     nz, unr = w[6] >> 16, w[4] & 0xFF
+    if b1 or b5:
+        print(f"  ==> VERDICT-BIT: the ROM's `d5 & 0x22` sample was hot "
+              f"{b1 + b5} time(s) — b1={b1}, b5={b5}. Each one rejects a field "
+              "whose data may have been read perfectly.")
     if nz:
         print(f"  ==> VERDICT: driver posted {nz} error completion(s); "
               f"first {sony_err(w[5] >> 16)}, last {sony_err(w[5] & 0xFFFF)}")

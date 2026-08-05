@@ -107,7 +107,13 @@ module swim
 	output [23:0] dbg_flp_strb_last,
 	output [8:0]  dbg_flp_rej_step,
 	output [7:0]  dbg_flp_status,
-	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
+	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
+	// {b1_hot[15:0], b5_hot[15:0]} over handshake READS — the two bits the
+	// ROM's `d5 & 0x22` field verdict is made of; and pops taken with the
+	// FIFO at 2 entries (b1/b0 then describe the NEXT byte, not the popped
+	// one). See the VERDICT-BIT forensics block below.
+	output [31:0] dbg_ism_verdict,
+	output [15:0] dbg_ism_pop2
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -364,6 +370,39 @@ module swim
 		if (~dbg_ra_d  & ism_read_active & (dbg_flpe_arm != 8'hFF)) dbg_flpe_arm <= dbg_flpe_arm + 1'd1;
 	end
 	assign dbg_ism_flpe = {5'b0, ism_error, dbg_flpe_arm, dbg_flpe_ovr, dbg_flpe_unr};
+
+	// ── VERDICT-BIT forensics (2026-08-05) ─────────────────────────────────
+	// The ROM decides a field good/bad from ONE handshake sample taken at the
+	// CRC-low byte: `d5 & 0x22` (ROM a6ef86/a6ef96) = b5 (error pending) OR
+	// b1 (running CRC != 0 on the NEWEST fifo entry). Everything else about a
+	// sector can be perfect and the field is still rejected -> retry ->
+	// -69/-72 -> retries exhausted -> the -81 sectNFErr the guest reports.
+	//
+	// Neither bit leaves any trace in the existing counters, which is why a
+	// whole-disk copy shows miss_cnt=0, ovr=0 and still fails ~1 file in 6.
+	// These count, over handshake READS only (the sample the ROM actually
+	// takes), how often each verdict bit was hot, plus how often the CPU
+	// popped with the FIFO holding TWO entries — the state in which b1/b0
+	// describe the byte AFTER the one being popped (a real SWIM1's 2-deep
+	// FIFO cannot run further ahead; our 16-deep staging ring can hold that
+	// state for a whole field, which would make the poisoning persistent
+	// across the ROM's retries exactly as observed).
+	wire hs_read_now = acc_end && ism_mode && acc_rw_l && (acc_addr_l[2:0] == 3'h7);
+	wire hs_b1_now = (ism_fifo_pos != 0) &&
+	                 ~ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_CRC0];
+	reg [15:0] dbg_hs_b1 = 0, dbg_hs_b5 = 0, dbg_pop2 = 0;
+	always @(posedge clk) begin
+		if (cen) begin
+			if (hs_read_now && hs_b1_now && dbg_hs_b1 != 16'hFFFF)
+				dbg_hs_b1 <= dbg_hs_b1 + 1'd1;
+			if (hs_read_now && (ism_error != 0) && dbg_hs_b5 != 16'hFFFF)
+				dbg_hs_b5 <= dbg_hs_b5 + 1'd1;
+			if (ism_pop_req && ism_fifo_pos == 2'd2 && dbg_pop2 != 16'hFFFF)
+				dbg_pop2 <= dbg_pop2 + 1'd1;
+		end
+	end
+	assign dbg_ism_verdict = {dbg_hs_b1, dbg_hs_b5};
+	assign dbg_ism_pop2    = dbg_pop2;
 	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
 	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
 	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};

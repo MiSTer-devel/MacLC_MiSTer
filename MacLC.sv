@@ -1172,6 +1172,8 @@ module emu
 	wire        dbg_flp_byte_stb;
 	wire [7:0]  dbg_flp_raw;
 	wire [21:0] dbg_flp_gcr_addr;
+	wire [31:0] dbg_ism_verdict_w;
+	wire [15:0] dbg_ism_pop2_w;
 	wire [31:0] dbg_ism_state;
 	wire [15:0] dbg_flp_strb_cnt;
 	wire [15:0] dbg_flp_strb_en_cnt;
@@ -1259,7 +1261,14 @@ module emu
 	//           0xFFB3=-77. THE exact failure the guest saw, no inference.
 	//   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]} — error completions /
 	//           ALL word-writes to $142 (every driver-op completion)
-	//   row 7  {strb_cnt[15:0], strb_en_cnt[15:0]}   ALL lstrb falls / enabled
+	//   row 7  {hs_b1_hot[15:0], hs_b5_hot[15:0]}   VERDICT bits: how often a
+	//           handshake READ (the ROM's `d5 & 0x22` sample) showed b1 (CRC
+	//           bad on the NEWEST fifo entry) or b5 (error pending). Either
+	//           one rejects a field whose data was read perfectly.
+	//   row 8  {pop_at_pos2[15:0], strb_cnt[15:0]} — pops taken with the FIFO
+	//           holding TWO entries: the state where b1/b0 describe the byte
+	//           AFTER the one being popped (a real 2-deep SWIM cannot run
+	//           further ahead; our staging ring can hold it for a whole field)
 	//   row 11 LIVE {status, 6'b0, ins_int, ins_ext, disk_data, raw_byte}
 	//   row 10 latch @ FIRST nonzero $142: {side, track[6:0], 2'b0, addr[21:0]}
 	//           — where the head/fetch was when the first error was POSTED
@@ -1360,8 +1369,8 @@ module emu
 			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
 			hud_w5 <= {hud_e142_first, hud_e142_last};
 			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
-			hud_w7 <= {dbg_flp_strb_cnt, dbg_flp_strb_en_cnt};
-			hud_w8 <= {8'b0, dbg_flp_strb_last};
+			hud_w7 <= dbg_ism_verdict_w;
+			hud_w8 <= {dbg_ism_pop2_w, dbg_flp_strb_cnt};
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
@@ -1861,6 +1870,8 @@ module emu
 		.dbg_flp_byte_stb(dbg_flp_byte_stb),
 		.dbg_flp_raw(dbg_flp_raw),
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_ism_verdict(dbg_ism_verdict_w),
+		.dbg_ism_pop2(dbg_ism_pop2_w),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),

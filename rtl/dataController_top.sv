@@ -193,7 +193,9 @@ module dataController_top(
 	output [23:0] dbg_flp_strb_last,
 	output [8:0]  dbg_flp_rej_step,
 	output [7:0]  dbg_flp_status,
-	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
+	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
+	output [31:0] dbg_ism_verdict,  // {b1_hot,b5_hot} over handshake reads
+	output [15:0] dbg_ism_pop2      // pops taken with the FIFO at 2 entries
 );
 	
 	parameter SCSI_DEVS = 2;
@@ -1073,6 +1075,8 @@ module dataController_top(
 		.dbg_flp_byte_stb(dbg_flp_byte_stb),
 		.dbg_flp_raw(dbg_flp_raw),
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_ism_verdict(dbg_ism_verdict),
+		.dbg_ism_pop2(dbg_ism_pop2),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),

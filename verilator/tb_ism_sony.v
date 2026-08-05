@@ -88,6 +88,12 @@ module tb_ism_sony;
 	integer ack_div = 0;
 	integer ack_phase = 0;
 	integer ack_hold = 0;
+	integer stall_byte = 0;      // +stallbyte=N : inject a late poll at data byte N
+	integer stall_len = 700;     // +stalllen=N  : its length in clk (700 ~ 22us)
+	initial begin
+		if (!$value$plusargs("stallbyte=%d", stall_byte)) stall_byte = 0;
+		if (!$value$plusargs("stalllen=%d", stall_len))   stall_len  = 700;
+	end
 	initial if (!$value$plusargs("ackphase=%d", ack_phase)) ack_phase = 0;
 	initial begin
 		ack_hold = 1;
@@ -328,6 +334,16 @@ module tb_ism_sony;
 		// 31-poll budget with SCC
 		n = 0;
 		while (res == 0 && n < 512) begin
+			// ★ +stallbyte=N injects ONE late poll mid-field, the way a VPA
+			// phase/refresh hiccup stretches a real poll past the 16us byte
+			// cell. Harmless for DATA (the byte is still delivered) but it
+			// lets a second byte land, so the FIFO sits at pos=2 and the
+			// handshake's b1/b0 — which describe the NEWEST entry — start
+			// reporting the byte AFTER the one being popped. At the CRC-low
+			// byte that is the gap 0x4E (crc0=0) and the driver's `d5 & 0x22`
+			// verdict rejects a sector whose data was read perfectly.
+			if (stall_byte != 0 && n == stall_byte)
+				repeat (stall_len) @(posedge clk);
 			swim_rd(4'h7, hs);
 			if (!hs[7]) begin
 				wait_byte_scc(ok);
