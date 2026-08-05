@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 
 MARKER = 0xA5C3F00F
-NROWS = 11
+NROWS = 12
 
 def find_and_decode(img):
     g = np.array(img.convert('L')) > 128
@@ -102,6 +102,18 @@ def decode(words):
             print("      ==> MEDIA WAS NOT SPINNING at the first underrun")
         else:
             print("      ==> media WAS spinning — delivery failed to keep up")
+    if len(w) > 11:
+        st = w[11] >> 24
+        ii, ie = (w[11] >> 17) & 1, (w[11] >> 16) & 1
+        print(f"  w11 LIVE spinning={st >> 7} motor={(st >> 6) & 1} ism_sel={(st >> 5) & 1} "
+              f"MOTORONreg={(st >> 4) & 1} side={(st >> 3) & 1} ism_active={(st >> 2) & 1} "
+              f"action={(st >> 1) & 1} diskin={st & 1}")
+        print(f"      insertDisk: internal={ii} external={ie}   "
+              f"disk_data={(w[11] >> 8) & 0xFF:#04x} raw={w[11] & 0xFF:#04x}")
+        if ii and not (st & 1):
+            print("      ** image IS mounted to the internal slot but the drive says NO DISK")
+        elif ie and not ii:
+            print("      ** image landed in the EXTERNAL slot (unreachable in ISM mode)")
     tot = w[7] >> 16
     step = (w[2] >> 8) & 0xFFFF
     if tot == 0:

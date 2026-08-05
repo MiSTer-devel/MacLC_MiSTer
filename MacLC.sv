@@ -1255,6 +1255,7 @@ module emu
 	//   row 5  latch @ FIRST error onset: {side, track[6:0], 2'b0, addr[21:0]}
 	//   row 6  latch @ FIRST error onset: {byte_cnt[15:0], step_cnt[15:0]}
 	//   row 7  {strb_cnt[15:0], strb_en_cnt[15:0]}   ALL lstrb falls / enabled
+	//   row 11 LIVE {status, 6'b0, ins_int, ins_ext, disk_data, raw_byte}
 	//   row 10 FIRST-onset latch {MODE, status, miss_cnt} — status =
 	//           {spinning,motor,ism_sel,MOTORONreg,side,ism_active,action,diskin}
 	//   row 9  {ism_mode_reg[7:0], ism_setup[7:0], 8'b0, diskEnableInt,
@@ -1310,8 +1311,9 @@ module emu
 	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
 	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
-	           hud_w9 = 32'd0, hud_w10 = 32'd0;
+	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0;
 	wire [31:0] hud_wmux =
+		(hud_y[6:3] == 4'd11) ? hud_w11 :
 		(hud_y[6:3] == 4'd10) ? hud_w10 :
 		(hud_y[6:3] == 4'd9) ? hud_w9 :
 		(hud_y[6:3] == 4'd8) ? hud_w8 :
@@ -1341,8 +1343,10 @@ module emu
 			hud_w8 <= {8'b0, dbg_flp_strb_last};
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 			hud_w10 <= hud_lat_st;
+			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
+			             dbg_flp_disk_data, dbg_flp_raw};
 		end
-		hud_on_q    <= (hud_y < 10'd88) && (hud_x < 10'd256) && v8_de;
+		hud_on_q    <= (hud_y < 10'd96) && (hud_x < 10'd256) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[7:3]];
 	end
 `endif // USE_DBG_HUD
