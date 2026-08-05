@@ -168,10 +168,17 @@ ghdl synth -fsynopsys -fexplicit --latches --out=verilog
 
 ```bash
 cd verilator && make clean && make
-./obj_dir/Vemu --screenshot 350 --stop-at-frame 351 2>/dev/null 1>/dev/null
+./obj_dir/Vemu --screenshot 450 --stop-at-frame 451 2>/dev/null 1>/dev/null
 ```
 
-Check `screenshot_frame_0350.png` — it must show the grey/black alternating line pattern (memory test). Uniform grey means the SR change broke Egret communication.
+Check `screenshot_frame_0450.png` — it must show the **50% dither grey desktop
+with the arrow cursor top-left** (boot reached cursor-visible state). A uniform
+flat grey at 450 means the boot stalled — Egret communication is the first
+suspect. Corroborate with `bash check_boot.sh` (stages + ADVANCING).
+(Re-calibrated 2026-08-05: the old criterion was the memory-test line pattern
+at frame 350, timed against VIA timers that counted 2× slow — the via6522.sv
+timer fix moved every timer-paced boot delay earlier, so the pattern now
+passes before frame 180 and 350 lands in a featureless VRAM-fill phase.)
 
 **SR edge-detection patterns (history + FPGA caveat):**
 - `cb2_latched` (shift-in: capturing CB2 at the CB1 rising edge) — **removed; do not re-introduce.** Shift-in uses live `cb2_i`. Re-introducing it hung the 4th Egret SR transfer in Verilator (CPU stuck polling IFR bit 2 at `0xA14E5E`).
