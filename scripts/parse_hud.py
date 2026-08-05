@@ -12,9 +12,8 @@ white=1 / black=0.
   row 4  {err_onset_cnt[7:0], arm[7:0], ovr[7:0], unr[7:0]}
   row 5  {e142_first[15:0], e142_last[15:0]}   Sony driver result codes
   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]}
-  row 7  {hs_b1_poisoned[15:0], hs_b5_hot[15:0]}
-  row 8  UNR-FORENSIC latch @ first error[2] onset: {onsets[3:0], push?,
-         arm, synced, stage[4], mode[7:0], addr[3:0], stage[3:0], pos[1:0], 6'b0}
+  row 7  ID-WITNESS {C,H,R,N} of the last ID field DELIVERED to the CPU
+  row 8  last 6 sector numbers served (5 bits each, newest LOW)
   row 10 latch @ first nonzero $142 {side, track[6:0], 2'b0, addr[21:0]}
 
 The $142 watcher (2026-08-05): the ROM Sony driver posts every MFM read
@@ -98,32 +97,36 @@ def decode(words):
     print(f"  w5 $142 FIRST err = {sony_err(w[5] >> 16)}")
     print(f"     $142 LAST  err = {sony_err(w[5] & 0xFFFF)}")
     print(f"  w6 $142 error completions={w[6] >> 16:5d}  ALL completions={w[6] & 0xFFFF:5d}")
-    b1, b5 = w[7] >> 16, w[7] & 0xFFFF
-    print(f"  w7 POISONED handshake samples={b1:5d}  (good CRC byte at the FIFO "
-          f"head, newer byte reports CRC-bad)")
-    print(f"     b5(error-pending) on handshake reads={b5:5d}")
+    idC, idH, idR, idN = (w[7] >> 24) & 0xFF, (w[7] >> 16) & 0xFF, \
+                         (w[7] >> 8) & 0xFF, w[7] & 0xFF
+    live_side, live_trk = w[2] >> 31, (w[2] >> 24) & 0x7F
+    print(f"  w7 LAST ID SERVED: C={idC} H={idH} R={idR} N={idN}"
+          f"   (live: track={live_trk} side={live_side})")
+    if w[7]:
+        if idH != live_side:
+            print(f"     ** WRONG HEAD: served H={idH} while the drive says "
+                  f"side={live_side} — CRC-good fields that can never match")
+        if idC != live_trk:
+            print(f"     ** WRONG CYLINDER: served C={idC} while the drive says "
+                  f"track={live_trk}")
+        if idN != 2:
+            print(f"     ** BAD SIZE CODE N={idN} (want 2 = 512 B)")
+        if idH == live_side and idC == live_trk and idN == 2:
+            print("     position agrees with the drive (C/H/N all correct)")
     if len(w) > 8:
-        f = w[8]
-        onsets = f >> 28
-        if onsets:
-            kind = "CPU-PUSH-FULL" if (f >> 27) & 1 else "POP-EMPTY"
-            stage = ((f >> 20) & 0x10) | ((f >> 8) & 0xF)
-            print(f"  w8 UNR FORENSIC: {onsets} onset(s); FIRST was {kind} "
-                  f"arm={(f >> 26) & 1} synced={(f >> 25) & 1}")
-            print(f"     mode={( f >> 16) & 0xFF:#04x} reg_addr={(f >> 12) & 0xF} "
-                  f"stage_cnt={stage} fifo_pos={(f >> 6) & 3}")
-            if (f >> 27) & 1:
-                print("     ==> a WRITE-side push filled the FIFO (write datapath "
-                      "is unimplemented — the guest attempted a floppy write?)")
-            elif (f >> 26) & 1:
-                if stage == 0:
-                    print("     ==> armed pop with FIFO+stage BOTH empty: generator "
-                          "starved or b7 phantom — check byte_cnt/miss_cnt activity")
-                else:
-                    print("     ==> armed pop-empty WITH staged data waiting: the "
-                          "stage->FIFO drain was blocked — drain-gating defect")
-        else:
-            print("  w8 UNR FORENSIC: no error[2] onsets (clean)")
+        h = w[8] & 0x3FFFFFFF
+        seq = [(h >> (5 * k)) & 0x1F for k in range(6)]   # newest first
+        print(f"  w8 last sectors SERVED (newest first): {seq}")
+        fresh = [s for s in seq if s]
+        if len(fresh) >= 4:
+            if len(set(fresh)) == 1:
+                print(f"     ** STUCK on sector {fresh[0]} — re-arm keeps landing on "
+                      "the SAME field; any other target is unreachable (-> -81)")
+            elif len(set(fresh)) <= 2:
+                print(f"     ** SHORT-CYCLING between {sorted(set(fresh))} — the scan "
+                      "cannot reach the rest of the track (-> -81)")
+            else:
+                print("     scan is walking distinct sectors (healthy)")
     if len(w) > 9:
         m = w[9]
         mode, setup = m >> 24, (m >> 16) & 0xFF

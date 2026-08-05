@@ -1174,6 +1174,7 @@ module emu
 	wire [21:0] dbg_flp_gcr_addr;
 	wire [31:0] dbg_ism_verdict_w;
 	wire [31:0] dbg_ism_unrlatch_w;
+	wire [31:0] dbg_ism_lastid_w, dbg_ism_idhist_w;
 	wire [31:0] dbg_ism_state;
 	wire [15:0] dbg_flp_strb_cnt;
 	wire [15:0] dbg_flp_strb_en_cnt;
@@ -1261,16 +1262,23 @@ module emu
 	//           0xFFB3=-77. THE exact failure the guest saw, no inference.
 	//   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]} — error completions /
 	//           ALL word-writes to $142 (every driver-op completion)
-	//   row 7  {hs_b1_hot[15:0], hs_b5_hot[15:0]}   VERDICT bits: how often a
-	//           handshake READ (the ROM's `d5 & 0x22` sample) showed b1 (CRC
-	//           bad on the NEWEST fifo entry) or b5 (error pending). Either
-	//           one rejects a field whose data was read perfectly.
-	//   row 8  UNR-FORENSIC latch @ FIRST error[2] onset (swim.v):
-	//           {onsets[3:0], push?, arm, synced, stage[4], mode[7:0],
-	//            addr[3:0], stage[3:0], fifo_pos[1:0], 6'b0}
-	//           — names the agent (armed pop-empty vs push-full) and the
-	//           FIFO/stage/mode state at that instant. pop_at_pos2 (old row
-	//           8) measured 0 on hardware: staging ring exonerated, retired.
+	//   row 7  ID-WITNESS: {C,H,R,N} of the LAST ID field actually DELIVERED
+	//           to the CPU (swim.v, captured at the generator push). Compare
+	//           against row 2's LIVE side/track ON THE SAME FRAME: H != side
+	//           means we served the WRONG HEAD, C != track the wrong cylinder
+	//           — either one makes a CRC-good field never match, burning the
+	//           driver's attempt budget (-84 -> the -81 sectNFErr the guest
+	//           reports) with no error bit set anywhere.
+	//   row 8  the last SIX sector numbers served (5 bits each, newest LOW).
+	//           THE decisive datum: -81 (ROM a6d3a6 via a6d388) means the
+	//           driver read valid IDs at the right cylinder/head but its
+	//           target sector never turned up. 1,2,3,4,5,6 = healthy scan
+	//           (look elsewhere); a stuck (1,1,1,1) or short-cycling
+	//           (1,2,1,2) sequence means re-arm keeps landing on the same
+	//           field and every other sector is unreachable.
+	//   (retired: hs_b1/hs_b5 verdict counters — the b5 theory was falsified
+	//    on 08-05, unr onsets stayed flat across failing dialogs; and the
+	//    UNR-FORENSIC latch, which answered: first event = mount self-test.)
 	//   row 11 LIVE {status, 6'b0, ins_int, ins_ext, disk_data, raw_byte}
 	//   row 10 latch @ FIRST nonzero $142: {side, track[6:0], 2'b0, addr[21:0]}
 	//           — where the head/fetch was when the first error was POSTED
@@ -1365,8 +1373,8 @@ module emu
 			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
 			hud_w5 <= {hud_e142_first, hud_e142_last};
 			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
-			hud_w7 <= dbg_ism_verdict_w;
-			hud_w8 <= dbg_ism_unrlatch_w;
+			hud_w7 <= dbg_ism_lastid_w;
+			hud_w8 <= dbg_ism_idhist_w;
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
@@ -1868,6 +1876,8 @@ module emu
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
 		.dbg_ism_verdict(dbg_ism_verdict_w),
 		.dbg_ism_unrlatch(dbg_ism_unrlatch_w),
+		.dbg_ism_lastid(dbg_ism_lastid_w),
+		.dbg_ism_idhist(dbg_ism_idhist_w),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),

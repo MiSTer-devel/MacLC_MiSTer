@@ -115,7 +115,11 @@ module swim
 	// First-error[2]-onset forensic latch: names the agent behind a residual
 	// unr event (armed pop-empty vs CPU-push-full, and the FIFO/stage/mode
 	// state at that instant). See the UNR-FORENSIC block below.
-	output [31:0] dbg_ism_unrlatch
+	output [31:0] dbg_ism_unrlatch,
+	// {C,H,R,N} of the LAST ID field actually DELIVERED to the CPU, and the
+	// last SIX sector numbers served. See the ID-WITNESS block below.
+	output [31:0] dbg_ism_lastid,
+	output [31:0] dbg_ism_idhist
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -438,6 +442,65 @@ module swim
 		end
 	end
 	assign dbg_ism_unrlatch = dbg_unr_latch;
+
+	// ── ID-WITNESS (2026-08-05 pm) ────────────────────────────────────────
+	// What the CPU is actually SERVED, sampled where it is served: the
+	// generator push into the staging ring. Watch the delivered stream for
+	// A1 A1 A1 FE and capture the next four bytes = C H R N.
+	//
+	// This is the direct test the counters could not make. The copy fails on
+	// whole files with byte-exact payloads, no error bits, and run-to-run
+	// non-determinism — the signature of serving a real, CRC-good track from
+	// the WRONG PLACE. floppy.v samples driveSide only while ACTION is set
+	// (from driveReadAddr={ca2,ca1,ca0,SEL}, RDDATA0/1 = 8/9), so a stale or
+	// mid-read-flipped head yields exactly that: correct C, WRONG H. Latching
+	// C/H/N here says which — the ROM's ID primitive compares only the A1A1A1
+	// FE pattern and leaves C/H/R to its caller, so a wrong-H field looks
+	// perfect to the primitive and simply never matches, burning the caller's
+	// attempt budget until it gives up (-84 -> -81 sectNFErr).
+	// Compare against HUD row 2 (LIVE side/track) on the same frame: an
+	// H that disagrees with side, or a C that disagrees with track, is the bug.
+	//
+	// ★ The SEQUENCE matters more than any count. -81 is reached (ROM a6d3a6,
+	// via a6d388) when the driver keeps reading VALID ID fields — right
+	// cylinder and head, or it would have taken the -80 seekErr path at
+	// a6d166 where the head rides in d1 bit 11 (a6eea6) — yet its target
+	// sector never turns up, until the SonyVars+47 counter runs out. So the
+	// question the HUD must answer is: which sector numbers is the CPU
+	// actually walking? 1,2,3,4,5,6 = a healthy scan and the fault is
+	// elsewhere. A stuck or short-cycling sequence (1,1,1,1 / 1,2,1,2) means
+	// re-arm is landing us on the same field forever and any target beyond it
+	// is unreachable — which is exactly the -81 signature.
+	reg [1:0]  idw_mark_run;
+	reg [2:0]  idw_phase;      // 0=idle, 1..4 = capturing C,H,R,N
+	reg [31:0] idw_last = 32'd0;
+	reg [29:0] idw_hist = 30'd0;   // last 6 sector numbers, 5 bits each, newest LOW
+	always @(posedge clk or negedge _reset) begin
+		if (!_reset) begin
+			idw_mark_run <= 2'd0; idw_phase <= 3'd0;
+			idw_last <= 32'd0;    idw_hist <= 30'd0;
+		end
+		else if (cen && ism_gen_push) begin
+			if (mfm_mark_sel && mfm_byte_sel == 8'hA1) begin
+				if (idw_mark_run != 2'd3) idw_mark_run <= idw_mark_run + 1'd1;
+				idw_phase <= 3'd0;
+			end
+			else begin
+				if (idw_mark_run == 2'd3 && mfm_byte_sel == 8'hFE)
+					idw_phase <= 3'd1;                  // IDAM: capture CHRN
+				else if (idw_phase != 3'd0) begin
+					idw_last <= {idw_last[23:0], mfm_byte_sel};
+					idw_phase <= (idw_phase == 3'd4) ? 3'd0 : idw_phase + 1'd1;
+					// R (the sector number) is the 3rd captured byte
+					if (idw_phase == 3'd3)
+						idw_hist <= {idw_hist[24:0], mfm_byte_sel[4:0]};
+				end
+				idw_mark_run <= 2'd0;
+			end
+		end
+	end
+	assign dbg_ism_lastid = idw_last;
+	assign dbg_ism_idhist = {2'b0, idw_hist};
 	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
 	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
 	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};
