@@ -510,8 +510,69 @@ module tb_ism_sony;
 	end
 	endtask
 
+	// ---- SCAN EFFICIENCY: a whole track read in order, NO artificial jitter --
+	// run_round() injects up to ~4 ms of jitter between sectors, which destroys
+	// the rotational phase relationship on purpose (robustness). That hides the
+	// question a real sequential file copy actually asks: with only the
+	// driver's own inter-read overhead, does the scan catch the NEXT sector, or
+	// does it miss it and go the long way round?
+	//
+	// This matters because -81 sectNFErr (ROM a6d3a6 via a6d388) is reached by
+	// burning one retry per UNWANTED sector encountered, from the fixed budget
+	// at SonyVars+46. Our encoder lays sectors 1..18 with NO interleave, so if
+	// post-read processing overruns gap3+sync (108+12 bytes = 1.92 ms) the scan
+	// misses every following sector and each read costs ~18 IDs instead of ~1.
+	// Ideal here is id_reads/18 ~= 1. A ratio near 2 means we skip every other
+	// sector; near 18 means a full revolution per sector.
+	// +postgap=N models the driver's PER-SECTOR post-processing (copying the
+	// 512 bytes out, updating the wanted bitmap, loop bookkeeping) in clk
+	// ticks. The margin it eats is the gap3+sync window between the end of one
+	// data field and the next ID mark: 108+12 bytes x 16 us = 1.92 ms =
+	// ~61,440 clk @32 MHz. Sweeping it finds the cliff where the scan starts
+	// missing the next sector, which is what turns into -81 on hardware.
+	integer scan_id0, scan_ids, postgap;
+	task run_track_scan(input integer side);
+		integer si, res_l, mism_l, j_l;
+	begin
+		SEL = side[0];
+		repeat (100) @(posedge clk);
+		scan_id0 = id_reads;
+		for (si = 1; si <= 18; si = si + 1) begin
+			if (postgap > 0) repeat (postgap) @(posedge clk);
+			read_sector(cur_track, side, si, res_l);
+			total_reads = total_reads + 1;
+			if (res_l != 0) begin
+				total_fail = total_fail + 1;
+				if (res_l == ERR_NOTARGET) fail_notgt = fail_notgt + 1;
+				$display("TB: SCAN trk %0d side %0d sector %0d -> ERROR %0d",
+				         cur_track, side, si, res_l);
+			end else begin
+				mism_l = 0;
+				for (j_l = 0; j_l < 512; j_l = j_l + 1)
+					if (buffer[j_l] !== expect_byte(cur_track, side, si, j_l))
+						mism_l = mism_l + 1;
+				if (mism_l != 0) begin
+					fail_data = fail_data + 1; total_fail = total_fail + 1;
+					$display("TB: SCAN trk %0d side %0d sector %0d -> DATA MISMATCH %0d",
+					         cur_track, side, si, mism_l);
+				end
+			end
+		end
+		scan_ids = id_reads - scan_id0;
+		$display("TB: SCAN EFFICIENCY trk %0d side %0d postgap=%0d clk (%0d.%02d ms): %0d ID reads for 18 sectors = %0d.%02d per sector",
+		         cur_track, side, postgap, postgap / 32000,
+		         ((postgap % 32000) * 100) / 32000,
+		         scan_ids, scan_ids / 18, ((scan_ids % 18) * 100) / 18);
+		if (scan_ids > 18 * 3)
+			$display("TB:   ** POOR: the scan is missing the next sector — a real copy would burn the driver's +46 retry budget and fail -81");
+	end
+	endtask
+
 	initial begin
 		id_reads = 0; err_cnt = 0;
+		scan_id0 = 0; scan_ids = 0;
+		postgap = 0;
+		void'($value$plusargs("postgap=%d", postgap));
 		fail_66 = 0; fail_67 = 0; fail_69 = 0; fail_71 = 0; fail_72 = 0;
 		fail_data = 0; fail_notgt = 0; total_reads = 0; total_fail = 0;
 		cur_track = 0;
@@ -563,6 +624,13 @@ module tb_ism_sony;
 		// R3: track 0 side 1, strided
 		// R4: seek to track 1 (ISM STEP), side 0 strided — seek+read interplay
 		// R5: track 1 side 1, strided; then seek home and spot-check track 0
+		// R-scan: the realistic sequential-copy case, measured before anything
+		// else perturbs the rotational phase.
+		run_track_scan(0);
+		teardown_probe;  repeat (7717) @(posedge clk);
+		run_track_scan(1);
+		teardown_probe;  repeat (7717) @(posedge clk);
+
 		run_round(0, 0, 0);
 		teardown_probe;  repeat (7717) @(posedge clk);
 		run_round(1, 0, 1);
