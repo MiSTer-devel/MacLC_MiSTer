@@ -77,9 +77,25 @@ module tb_ism_sony;
 
 	// Periodic fetch ack, mimicking addrController's extra bus slot: one
 	// cen-wide pulse every 16 cen (= every ~1.97 us), unconditional.
+	//
+	// ★ ACK_PHASE sweeps the slot's phase relative to the MFM byte clock.
+	// On hardware that phase is arbitrary — the extra-slot rotation is free-
+	// running and the MFM session starts whenever the driver arms — so a
+	// delivery/fetch race that only bites at some alignments would look
+	// exactly like the observed NON-DETERMINISTIC per-file copy failures
+	// (2026-08-05: two identical runs failed on disjoint file sets).
+	// Override per run: ./obj_dir/Vtb_ism_sony +ackphase=N   (N = 0..63 clk)
 	integer ack_div = 0;
+	integer ack_phase = 0;
+	integer ack_hold = 0;
+	initial if (!$value$plusargs("ackphase=%d", ack_phase)) ack_phase = 0;
+	initial begin
+		ack_hold = 1;
+		repeat (ack_phase) @(posedge clk);
+		ack_hold = 0;
+	end
 	always @(posedge clk) begin
-		if (cen) begin
+		if (cen && !ack_hold) begin
 			ack_div <= ack_div + 1;
 			if (ack_div >= 15) begin
 				ack_div <= 0;
@@ -522,6 +538,7 @@ module tb_ism_sony;
 		// spin-up
 		repeat (20000) @(posedge clk);
 
+		$display("TB: ACK_PHASE = %0d clk", ack_phase);
 		// --- the sweep -------------------------------------------------------
 		// R0: track 0 side 0, sequential (phase-locked baseline, as a real
 		//     sequential copy runs)
