@@ -42,12 +42,10 @@
 
  Sector image address: the data fork stores sectors in (cyl, head, sector)
  order, so
-   byte = ((track*2 + side)*SPT + lsec)*512 + offset        SPT=18 (HD) / 9 (DD)
- where lsec is the LOGICAL sector living in the current physical slot. The
- track is laid out 2:1 INTERLEAVED (slots 0,9,1,10,2,...) so that consecutive
- logical sectors sit two slots apart, giving the driver a full sector time to
- come back for the next one instead of one gap3. See the interleave comment by
- the geometry wires for why 1:1 breaks the Sony driver.
+   byte = ((track*2 + side)*SPT + sector)*512 + offset      SPT=18 (HD) / 9 (DD)
+ The track is laid out 1:1 (logical order == physical order). A 2:1 interleave
+ was measured on hardware and is a REGRESSION — see the note by the geometry
+ wires before considering it again.
  Max for 1.44M: ((79*2+1)*18+17)*512+511 = 1,474,559 -> fits 22-bit addr.
 
  The track free-runs (a spinning disk); the SWIM/driver resyncs on the A1 marks.
@@ -85,41 +83,33 @@ module mfm_track_encoder
 	wire [7:0] track_side = {track, side};            // = track*2 + side
 	wire [4:0] spt_max    = hd ? 5'd17 : 5'd8;        // last sector index (18 / 9 spt)
 
-	// ---- 2:1 SECTOR INTERLEAVE (2026-08-05) ---------------------------------
-	// `sector` is the PHYSICAL slot on the track; `lsec` is the LOGICAL sector
-	// that lives in it. They used to be the same value — a 1:1 layout — and
-	// that is what made the Finder copy fail with -81 sectNFErr.
+	// ---- sector layout: 1:1, and it must STAY 1:1 (measured 2026-08-05) -----
+	// `sector` is the physical slot AND the logical sector: consecutive
+	// logical sectors are physically adjacent.
 	//
-	// Why 1:1 is a trap here: the Sony driver reads a sector, processes it,
-	// then wants the NEXT logical sector. On a 1:1 track that sector arrives
-	// one gap3+sync later — 120 bytes x 16 us = 1.92 ms. Miss that window by
-	// any margin and the target has already gone by, so the driver must wait a
-	// FULL REVOLUTION for it. Measured in tb_ism_sony (+postgap sweep) the
-	// behaviour is a cliff, not a slope: 1.00 ID reads per sector at 1.93 ms
-	// of post-processing, and 18.00 at 2.18 ms. Since -81 is reached by
-	// burning one retry per UNWANTED sector from the fixed budget at
-	// SonyVars+46 (ROM a6d3a6 via a6d388), an 18x scan collapse exhausts that
-	// budget in ~2 sectors — which is exactly the observed failure: whole
-	// files failing, payloads byte-exact, no error bits, non-deterministic
-	// (the driver's overhead drifts either side of the cliff with interrupt
-	// and bus load, so different files fail on different runs).
+	// ★ A 2:1 interleave was tried here and is a REGRESSION — do not re-try it
+	// without re-reading this. The theory was that 1:1 gives the Sony driver
+	// only one gap3+sync (120 bytes x 16 us = 1.92 ms) to come back for the
+	// next logical sector, and tb_ism_sony's +postgap sweep does show a hard
+	// cliff there (1.00 ID reads/sector at 1.93 ms, 18.00 at 2.18 ms). But the
+	// hardware says the driver is NOWHERE NEAR that cliff: HUD row 8 measured
+	// 1.12 ID fields served per DATA field on a real mount, i.e. the scan
+	// already lands on its target almost every time.
 	//
-	// Interleaving buys a whole sector time (10.9 ms) of slack instead of
-	// 1.92 ms. Physical order becomes 0,9,1,10,2,11,... so consecutive
-	// logical sectors sit two slots apart. This is a pure FORMAT choice and
-	// invisible to software: the driver finds sectors by scanning ID fields,
-	// so any permutation is legal as long as each ID's R matches the payload
-	// served after it — which is why both `lsec` uses below must stay in sync.
-	//   slot even -> lsec = slot/2 ;  slot odd -> lsec = half + slot/2
-	wire [4:0] half_spt = hd ? 5'd9 : 5'd5;
-	wire [4:0] lsec = sector[0] ? (half_spt + {1'b0, sector[4:1]})
-	                            : {1'b0, sector[4:1]};
+	// Interleaving then does pure harm, because the driver's give-up budget
+	// (SonyVars+46, ROM a6d3a6 via a6d388) is spent per UNWANTED SECTOR ID
+	// encountered — not per revolution. Making consecutive logical sectors two
+	// slots apart forces it past an unwanted sector on EVERY read: the ratio
+	// went 1.12 -> 3.15 and Finder copy errors went 6-8 -> 14 per whole-disk
+	// copy. Keep the layout 1:1 and keep the ratio as close to 1.00 as
+	// possible; the residual failures are the ~0.7% of reads that miss and
+	// cost a full revolution, and those want a timing fix, not a format one.
 
-	// sector_block = track_side*SPT + lsec, via shift-add (no multiplier).
+	// sector_block = track_side*SPT + sector, via shift-add (no multiplier).
 	//   *18 = <<4 + <<1 ;  *9 = <<3 + <<0
 	wire [12:0] block_hd = {track_side, 4'b0000} + {1'b0, track_side, 1'b0};
 	wire [12:0] block_dd = {1'b0, track_side, 3'b000} + {5'b0, track_side};
-	wire [12:0] sector_block = (hd ? block_hd : block_dd) + {8'b0, lsec};
+	wire [12:0] sector_block = (hd ? block_hd : block_dd) + {8'b0, sector};
 
 	// addr = sector_block*512 + src_offset  (block in [21:9], offset in [8:0])
 	assign addr = {sector_block[12:0], src_offset[8:0]};
@@ -196,9 +186,8 @@ module mfm_track_encoder
 		case (cnt[1:0])
 			2'd0:    chrn = {1'b0, track};        // C: cylinder 0..79
 			2'd1:    chrn = {7'b0, side};         // H: head 0/1
-			2'd2:    chrn = {3'b0, lsec + 5'd1};  // R: LOGICAL sector, 1-based
-			                                      // (must match sector_block's
-			                                      // lsec — see the interleave)
+			2'd2:    chrn = {3'b0, sector + 5'd1};// R: sector, 1-based (must
+			                                      // match sector_block's index)
 			default: chrn = 8'h02;                // N: 128<<2 = 512
 		endcase
 	end
