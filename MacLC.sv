@@ -1252,12 +1252,17 @@ module emu
 	//   row 2  {side, track[6:0], step_cnt[15:0], 5'b0, ism_error[2:0]}
 	//   row 3  {10'b0, dskReadAddrInt[21:0]}         live fetch address
 	//   row 4  {err_onset_cnt[7:0], arm_cnt[7:0], ovr_cnt[7:0], unr_cnt[7:0]}
-	//   row 5  latch @ FIRST error onset: {side, track[6:0], 2'b0, addr[21:0]}
-	//   row 6  latch @ FIRST error onset: {byte_cnt[15:0], step_cnt[15:0]}
+	//   row 5  {e142_first[15:0], e142_last[15:0]} — FIRST and LAST nonzero
+	//           result code the Sony driver posted to low-mem $142 (a6ea60:
+	//           movew d0,$142). 0xFFBE=-66 noNyb, 0xFFBD=-67 noAdrMk,
+	//           0xFFBB=-69 IDcksm, 0xFFB9=-71 noDtaMk, 0xFFB8=-72 Dcksm,
+	//           0xFFB3=-77. THE exact failure the guest saw, no inference.
+	//   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]} — error completions /
+	//           ALL word-writes to $142 (every driver-op completion)
 	//   row 7  {strb_cnt[15:0], strb_en_cnt[15:0]}   ALL lstrb falls / enabled
 	//   row 11 LIVE {status, 6'b0, ins_int, ins_ext, disk_data, raw_byte}
-	//   row 10 FIRST-onset latch {MODE, status, miss_cnt} — status =
-	//           {spinning,motor,ism_sel,MOTORONreg,side,ism_active,action,diskin}
+	//   row 10 latch @ FIRST nonzero $142: {side, track[6:0], 2'b0, addr[21:0]}
+	//           — where the head/fetch was when the first error was POSTED
 	//   row 9  {ism_mode_reg[7:0], ism_setup[7:0], 8'b0, diskEnableInt,
 	//           driveSel, devsel_int, devsel_ext, selonly_int, ism_mode,
 	//           diskEnableExt, 0} — what the driver PROGRAMMED
@@ -1272,34 +1277,50 @@ module emu
 	// static once the Finder error dialog is up, floppy quiesced).
 	// Video-only overlay: input/choreography pixels underneath still work.
 
-	// clk_sys side: latch position/counters at each ism_error 0->nonzero
-	// onset. ism_error is CLEARED ON READ by the driver's own error
-	// handling, so the live value (row 2) usually reads 0 by dialog time —
-	// these latches plus the saturating FLPE counters are the persistent
-	// record. Re-latching every onset leaves the LAST (fatal) context: the
-	// driver's final retries all target the sector it gave up on.
+	// clk_sys side. The ism_error onset counter stays (row 4) — with the 08-05
+	// teardown-probe finding (the Sony driver READS the data/mark registers
+	// with an empty FIFO in its session teardown, ROM a6ea9e/a6eaf0/a6eb64,
+	// setting error b2 exactly as MAME does) it now serves to CONFIRM that
+	// unr events are that benign noise, uncorrelated with real failures.
 	wire [2:0] hud_err_live = dbg_ism_flpe_w[26:24];
 	reg  [2:0] hud_err_d = 3'd0;
 	reg  [7:0] hud_onset_cnt = 8'd0;
-	reg [31:0] hud_lat_pos = 32'd0, hud_lat_cnt = 32'd0;
-	// Latch the FIRST onset and freeze it. Re-latching every onset (the original
-	// behaviour) is worthless once unr saturates at 255: it only ever shows the
-	// post-mortem, long after the driver gave up. The first onset is the one that
-	// explains the failure. hud_lat_st captures the drive status + ISM Mode in
-	// force at that instant, so an underrun can be attributed to a stopped
-	// spindle vs a delivery that simply did not keep up.
-	reg        hud_first_done = 1'b0;
-	reg [31:0] hud_lat_st = 32'd0;
 	always @(posedge clk_sys) begin
 		hud_err_d <= hud_err_live;
 		if ((hud_err_d == 3'd0) && (hud_err_live != 3'd0)) begin
 			if (hud_onset_cnt != 8'hFF) hud_onset_cnt <= hud_onset_cnt + 1'd1;
-			if (!hud_first_done) begin
-				hud_first_done <= 1'b1;
-				hud_lat_pos <= {dbg_flp_side, dbg_flp_track[6:0], 2'b00, dskReadAddrInt[21:0]};
-				hud_lat_cnt <= {dbg_flp_byte_cnt, dbg_flp_step_cnt};
-				hud_lat_st  <= {dbg_ism_state[31:24], dbg_flp_status,
-				                dbg_flp_miss_cnt};
+		end
+	end
+
+	// ── Sony driver result-code watcher ────────────────────────────────────
+	// The ROM MFM read path posts every operation's result as a WORD write to
+	// low-mem $142 (a6ea60: movew %d0,$142; the retry wrapper reads it back at
+	// a6f0c8). Watching that address captures the EXACT Mac error code of
+	// every failed sector read — the number the "disk error" dialog is made
+	// of — with zero inference. Byte writes ($142 'st' done-flag) are
+	// excluded by requiring both strobes (word write). One latch per AS
+	// assertion (write cycles hold the bus for many clk_sys cycles).
+	reg        hud_e142_armed = 1'b1;
+	reg [15:0] hud_e142_first = 16'd0, hud_e142_last = 16'd0;
+	reg [15:0] hud_e142_nz_cnt = 16'd0, hud_e142_all_cnt = 16'd0;
+	reg [31:0] hud_e142_pos = 32'd0;
+	wire hud_e142_hit = !_cpuAS && !_cpuRW && !_cpuUDS && !_cpuLDS &&
+	                    (cpuAddr[23:0] == 24'h000142);
+	always @(posedge clk_sys) begin
+		if (_cpuAS) hud_e142_armed <= 1'b1;
+		else if (hud_e142_hit && hud_e142_armed) begin
+			hud_e142_armed <= 1'b0;
+			if (hud_e142_all_cnt != 16'hFFFF)
+				hud_e142_all_cnt <= hud_e142_all_cnt + 1'd1;
+			if (cpuDataOut != 16'h0000) begin
+				if (hud_e142_nz_cnt != 16'hFFFF)
+					hud_e142_nz_cnt <= hud_e142_nz_cnt + 1'd1;
+				hud_e142_last <= cpuDataOut;
+				if (hud_e142_first == 16'd0) begin
+					hud_e142_first <= cpuDataOut;
+					hud_e142_pos   <= {dbg_flp_side, dbg_flp_track[6:0],
+					                   2'b00, dskReadAddrInt[21:0]};
+				end
 			end
 		end
 	end
@@ -1337,12 +1358,12 @@ module emu
 			hud_w2 <= {dbg_flp_side, dbg_flp_track[6:0], dbg_flp_step_cnt, 5'b0, hud_err_live};
 			hud_w3 <= {10'b0, dskReadAddrInt[21:0]};
 			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
-			hud_w5 <= hud_lat_pos;
-			hud_w6 <= hud_lat_cnt;
+			hud_w5 <= {hud_e142_first, hud_e142_last};
+			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
 			hud_w7 <= {dbg_flp_strb_cnt, dbg_flp_strb_en_cnt};
 			hud_w8 <= {8'b0, dbg_flp_strb_last};
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
-			hud_w10 <= hud_lat_st;
+			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
 			             dbg_flp_disk_data, dbg_flp_raw};
 		end
