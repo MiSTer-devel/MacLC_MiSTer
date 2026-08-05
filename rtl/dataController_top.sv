@@ -195,7 +195,7 @@ module dataController_top(
 	output [7:0]  dbg_flp_status,
 	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
 	output [31:0] dbg_ism_verdict,  // {b1_hot,b5_hot} over handshake reads
-	output [15:0] dbg_ism_pop2      // pops taken with the FIFO at 2 entries
+	output [31:0] dbg_ism_unrlatch  // first-error[2]-onset forensic latch
 );
 	
 	parameter SCSI_DEVS = 2;
@@ -510,12 +510,23 @@ module dataController_top(
 
 	// Port A - Mac LC configuration sense lines.
 	// MAME v8.cpp via_in_a(): return 0xd4 | (config & 1), where config bit0 =
-	// FPU present. The LC has no FPU, so the correct value is $D4 (not the old
-	// $55 placeholder). NOTE: setting $D4 alone does NOT avoid the STM serial
+	// FPU present. NOTE: setting $D4 alone does NOT avoid the STM serial
 	// monitor (confirmed: with $D4 our VIA matches MAME exactly yet still enters
-	// STM), so the STM-entry root cause is elsewhere (boot state machine). Keep
-	// $55 until the real cause is found, to avoid mixing unconfirmed changes.
-	assign via_pa_i = 8'h55;
+	// STM), so the STM-entry root cause is elsewhere (boot state machine).
+	//
+	// ★ PA7 MUST READ 1 (2026-08-05, the floppy-copy "disk error" hunt).
+	// PA7 is the SCC Wait/Request INPUT and idles HIGH (request is active-low).
+	// Both references agree: MAME v8.cpp via_in_a bit7=1; Snow via.rs:372
+	// force-sets sccwrreq before every ORA read. The Sony driver's MFM
+	// primitives poll it in EVERY byte/hunt loop (tstb vBufA; bmi skip — ROM
+	// a6ee6a/a6ef16/a6ef3c with a5=[$1D4]+$1E00): with PA7=0 each slow-path
+	// iteration executes `moveb SCC-A-data,-(sp)` — one EXTRA E-paced access
+	// per poll (handshake poll rate drops ~1/3) AND one byte of stack descent
+	// that nothing pops, kilobytes per sector, interrupts masked — silently
+	// scribbling below the stack. The old $55 placeholder read PA7=0.
+	// Bit0 deliberately stays 1 (as every hardware-validated build to date);
+	// MAME would tie it to the FPU-sense config — evaluate separately.
+	assign via_pa_i = 8'hD5;
 	// Sound volume still comes from PA[2:0] output latch
 	assign snd_vol = ~via_pa_oe[2:0] | via_pa_o[2:0];
 	assign driveSel = ~via_pa_oe[4] | via_pa_o[4];  // Drive select from VIA PA4
@@ -1076,7 +1087,7 @@ module dataController_top(
 		.dbg_flp_raw(dbg_flp_raw),
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
 		.dbg_ism_verdict(dbg_ism_verdict),
-		.dbg_ism_pop2(dbg_ism_pop2),
+		.dbg_ism_unrlatch(dbg_ism_unrlatch),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),

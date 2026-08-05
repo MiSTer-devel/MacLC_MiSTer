@@ -12,7 +12,9 @@ white=1 / black=0.
   row 4  {err_onset_cnt[7:0], arm[7:0], ovr[7:0], unr[7:0]}
   row 5  {e142_first[15:0], e142_last[15:0]}   Sony driver result codes
   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]}
-  row 7  {strb_cnt[15:0], strb_en_cnt[15:0]}
+  row 7  {hs_b1_poisoned[15:0], hs_b5_hot[15:0]}
+  row 8  UNR-FORENSIC latch @ first error[2] onset: {onsets[3:0], push?,
+         arm, synced, stage[4], mode[7:0], addr[3:0], stage[3:0], pos[1:0], 6'b0}
   row 10 latch @ first nonzero $142 {side, track[6:0], 2'b0, addr[21:0]}
 
 The $142 watcher (2026-08-05): the ROM Sony driver posts every MFM read
@@ -101,10 +103,27 @@ def decode(words):
           f"head, newer byte reports CRC-bad)")
     print(f"     b5(error-pending) on handshake reads={b5:5d}")
     if len(w) > 8:
-        pop2, strb = w[8] >> 16, w[8] & 0xFFFF
-        print(f"  w8 pops with FIFO at 2 entries={pop2:5d}   lstrb falling edges={strb:5d}")
-        if pop2:
-            print("     (b1/b0 describe the byte AFTER the popped one in that state)")
+        f = w[8]
+        onsets = f >> 28
+        if onsets:
+            kind = "CPU-PUSH-FULL" if (f >> 27) & 1 else "POP-EMPTY"
+            stage = ((f >> 20) & 0x10) | ((f >> 8) & 0xF)
+            print(f"  w8 UNR FORENSIC: {onsets} onset(s); FIRST was {kind} "
+                  f"arm={(f >> 26) & 1} synced={(f >> 25) & 1}")
+            print(f"     mode={( f >> 16) & 0xFF:#04x} reg_addr={(f >> 12) & 0xF} "
+                  f"stage_cnt={stage} fifo_pos={(f >> 6) & 3}")
+            if (f >> 27) & 1:
+                print("     ==> a WRITE-side push filled the FIFO (write datapath "
+                      "is unimplemented — the guest attempted a floppy write?)")
+            elif (f >> 26) & 1:
+                if stage == 0:
+                    print("     ==> armed pop with FIFO+stage BOTH empty: generator "
+                          "starved or b7 phantom — check byte_cnt/miss_cnt activity")
+                else:
+                    print("     ==> armed pop-empty WITH staged data waiting: the "
+                          "stage->FIFO drain was blocked — drain-gating defect")
+        else:
+            print("  w8 UNR FORENSIC: no error[2] onsets (clean)")
     if len(w) > 9:
         m = w[9]
         mode, setup = m >> 24, (m >> 16) & 0xFF
@@ -144,8 +163,9 @@ def decode(words):
         print(f"  ==> VERDICT: driver posted {nz} error completion(s); "
               f"first {sony_err(w[5] >> 16)}, last {sony_err(w[5] & 0xFFFF)}")
     elif unr:
-        print(f"  ==> VERDICT: zero driver errors; {unr} unr event(s) = "
-              "teardown-probe noise (expected, benign)")
+        print(f"  ==> VERDICT: zero driver errors, but {unr} unr event(s). "
+              "Disarmed probes are gated since c372f97, so these are REAL "
+              "armed events — see the w8 forensic latch.")
 
 for path in sys.argv[1:]:
     geom, words = find_and_decode(Image.open(path))

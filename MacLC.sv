@@ -1173,7 +1173,7 @@ module emu
 	wire [7:0]  dbg_flp_raw;
 	wire [21:0] dbg_flp_gcr_addr;
 	wire [31:0] dbg_ism_verdict_w;
-	wire [15:0] dbg_ism_pop2_w;
+	wire [31:0] dbg_ism_unrlatch_w;
 	wire [31:0] dbg_ism_state;
 	wire [15:0] dbg_flp_strb_cnt;
 	wire [15:0] dbg_flp_strb_en_cnt;
@@ -1265,22 +1265,18 @@ module emu
 	//           handshake READ (the ROM's `d5 & 0x22` sample) showed b1 (CRC
 	//           bad on the NEWEST fifo entry) or b5 (error pending). Either
 	//           one rejects a field whose data was read perfectly.
-	//   row 8  {pop_at_pos2[15:0], strb_cnt[15:0]} — pops taken with the FIFO
-	//           holding TWO entries: the state where b1/b0 describe the byte
-	//           AFTER the one being popped (a real 2-deep SWIM cannot run
-	//           further ahead; our staging ring can hold it for a whole field)
+	//   row 8  UNR-FORENSIC latch @ FIRST error[2] onset (swim.v):
+	//           {onsets[3:0], push?, arm, synced, stage[4], mode[7:0],
+	//            addr[3:0], stage[3:0], fifo_pos[1:0], 6'b0}
+	//           — names the agent (armed pop-empty vs push-full) and the
+	//           FIFO/stage/mode state at that instant. pop_at_pos2 (old row
+	//           8) measured 0 on hardware: staging ring exonerated, retired.
 	//   row 11 LIVE {status, 6'b0, ins_int, ins_ext, disk_data, raw_byte}
 	//   row 10 latch @ FIRST nonzero $142: {side, track[6:0], 2'b0, addr[21:0]}
 	//           — where the head/fetch was when the first error was POSTED
 	//   row 9  {ism_mode_reg[7:0], ism_setup[7:0], 8'b0, diskEnableInt,
 	//           driveSel, devsel_int, devsel_ext, selonly_int, ism_mode,
 	//           diskEnableExt, 0} — what the driver PROGRAMMED
-	//   row 8  {8'b0, strb_last[23:0]}  last 4 edges, 6b each, newest LOW:
-	//                                   {_enable,ca2,ca1,ca0,SEL,ism_active}
-	// Rows 7/8 separate "the driver never strobes a step" (strb_cnt==0) from
-	// "we reject the strobe it does send" (strb_cnt>0 while step_cnt==0):
-	// dbg_step_cnt alone reads 0 in BOTH cases, which is exactly the ambiguity
-	// the first HUD build hit. strb_last then names the failing qualifier.
 	// CDC note: rows are sampled from clk_sys into clk_vid once per frame
 	// with no handshake — acceptable for a HUD (the values of interest are
 	// static once the Finder error dialog is up, floppy quiesced).
@@ -1370,7 +1366,7 @@ module emu
 			hud_w5 <= {hud_e142_first, hud_e142_last};
 			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
 			hud_w7 <= dbg_ism_verdict_w;
-			hud_w8 <= {dbg_ism_pop2_w, dbg_flp_strb_cnt};
+			hud_w8 <= dbg_ism_unrlatch_w;
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
@@ -1871,7 +1867,7 @@ module emu
 		.dbg_flp_raw(dbg_flp_raw),
 		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
 		.dbg_ism_verdict(dbg_ism_verdict_w),
-		.dbg_ism_pop2(dbg_ism_pop2_w),
+		.dbg_ism_unrlatch(dbg_ism_unrlatch_w),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),

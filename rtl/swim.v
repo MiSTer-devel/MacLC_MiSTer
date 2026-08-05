@@ -109,11 +109,13 @@ module swim
 	output [7:0]  dbg_flp_status,
 	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
 	// {b1_hot[15:0], b5_hot[15:0]} over handshake READS — the two bits the
-	// ROM's `d5 & 0x22` field verdict is made of; and pops taken with the
-	// FIFO at 2 entries (b1/b0 then describe the NEXT byte, not the popped
-	// one). See the VERDICT-BIT forensics block below.
+	// ROM's `d5 & 0x22` field verdict is made of. See the VERDICT-BIT
+	// forensics block below.
 	output [31:0] dbg_ism_verdict,
-	output [15:0] dbg_ism_pop2
+	// First-error[2]-onset forensic latch: names the agent behind a residual
+	// unr event (armed pop-empty vs CPU-push-full, and the FIFO/stage/mode
+	// state at that instant). See the UNR-FORENSIC block below.
+	output [31:0] dbg_ism_unrlatch
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -398,19 +400,44 @@ module swim
 	wire hs_poison_now = (ism_fifo_pos == 2'd2) &&
 	                      ism_fifo[0][FIFO_B_CRC0] &&
 	                     ~ism_fifo[1][FIFO_B_CRC0];
-	reg [15:0] dbg_hs_b1 = 0, dbg_hs_b5 = 0, dbg_pop2 = 0;
+	reg [15:0] dbg_hs_b1 = 0, dbg_hs_b5 = 0;
 	always @(posedge clk) begin
 		if (cen) begin
 			if (hs_read_now && hs_poison_now && dbg_hs_b1 != 16'hFFFF)
 				dbg_hs_b1 <= dbg_hs_b1 + 1'd1;
 			if (hs_read_now && (ism_error != 0) && dbg_hs_b5 != 16'hFFFF)
 				dbg_hs_b5 <= dbg_hs_b5 + 1'd1;
-			if (ism_pop_req && ism_fifo_pos == 2'd2 && dbg_pop2 != 16'hFFFF)
-				dbg_pop2 <= dbg_pop2 + 1'd1;
 		end
 	end
 	assign dbg_ism_verdict = {dbg_hs_b1, dbg_hs_b5};
-	assign dbg_ism_pop2    = dbg_pop2;
+
+	// ── UNR-FORENSIC latch (2026-08-05, the residual armed pop-empty) ──────
+	// error[2] has TWO setters: a pop with the FIFO empty and a CPU push with
+	// it full. The ROM disassembly proves every pop is b7-guarded and every
+	// primitive disarms on every exit path, and swim-internal logic cannot
+	// empty the FIFO between the b7 sample and the pop — so a residual onset
+	// is telling us something structural (spurious extra acc_end, phantom
+	// handshake data, or a genuine push). Latch the discriminating state at
+	// the FIRST onset; count all of them in [31:28].
+	//   [31:28] onset count (saturating)   [27] 1=push-full 0=pop-empty
+	//   [26] ism_arm  [25] mfm_synced  [24] stage_cnt[4]
+	//   [23:16] ism_mode_reg  [15:12] acc_addr_l  [11:8] stage_cnt[3:0]
+	//   [7:6] fifo_pos  [5:0] spare
+	wire unr_pop_now  = ism_pop_req  && (ism_fifo_pos == 2'd0);
+	wire unr_push_now = ism_cpu_push && (ism_fifo_pos == 2'd2);
+	reg [31:0] dbg_unr_latch = 32'd0;
+	always @(posedge clk) begin
+		if (cen && (unr_pop_now || unr_push_now)) begin
+			if (dbg_unr_latch[31:28] == 4'd0)
+				dbg_unr_latch[27:0] <= {unr_push_now, ism_arm, mfm_synced,
+				                        ism_stage_cnt[4], ism_mode_reg,
+				                        acc_addr_l, ism_stage_cnt[3:0],
+				                        ism_fifo_pos, 6'b0};
+			if (dbg_unr_latch[31:28] != 4'hF)
+				dbg_unr_latch[31:28] <= dbg_unr_latch[31:28] + 1'd1;
+		end
+	end
+	assign dbg_ism_unrlatch = dbg_unr_latch;
 	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
 	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
 	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};
