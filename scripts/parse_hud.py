@@ -13,7 +13,7 @@ white=1 / black=0.
   row 5  {e142_first[15:0], e142_last[15:0]}   Sony driver result codes
   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]}
   row 7  ID-WITNESS {C,H,R,N} of the last ID field DELIVERED to the CPU
-  row 8  last 6 sector numbers served (5 bits each, newest LOW)
+  row 8  {ID fields served[15:0], DATA fields served[15:0]} — the scan ratio
   row 10 latch @ first nonzero $142 {side, track[6:0], 2'b0, addr[21:0]}
 
 The $142 watcher (2026-08-05): the ROM Sony driver posts every MFM read
@@ -114,19 +114,23 @@ def decode(words):
         if idH == live_side and idC == live_trk and idN == 2:
             print("     position agrees with the drive (C/H/N all correct)")
     if len(w) > 8:
-        h = w[8] & 0x3FFFFFFF
-        seq = [(h >> (5 * k)) & 0x1F for k in range(6)]   # newest first
-        print(f"  w8 last sectors SERVED (newest first): {seq}")
-        fresh = [s for s in seq if s]
-        if len(fresh) >= 4:
-            if len(set(fresh)) == 1:
-                print(f"     ** STUCK on sector {fresh[0]} — re-arm keeps landing on "
-                      "the SAME field; any other target is unreachable (-> -81)")
-            elif len(set(fresh)) <= 2:
-                print(f"     ** SHORT-CYCLING between {sorted(set(fresh))} — the scan "
-                      "cannot reach the rest of the track (-> -81)")
+        ids, datas = w[8] >> 16, w[8] & 0xFFFF
+        print(f"  w8 fields SERVED: ID={ids}  DATA={datas}", end="")
+        if datas:
+            r = ids / datas
+            print(f"   ratio={r:.2f} ID per DATA")
+            if r >= 8:
+                print(f"     ** SCAN OVER THE CLIFF (~{r:.0f} IDs per data field = "
+                      "about a full revolution per sector): the driver burns one "
+                      "retry per unwanted sector and dies at -81 within ~2 sectors")
+            elif r >= 3:
+                print("     ** scan is wasteful (>3 IDs per data field) — losing "
+                      "the target and going part-way round")
             else:
-                print("     scan is walking distinct sectors (healthy)")
+                print("     scan efficiency healthy (1:1 direct, ~2:1 = one "
+                      "interleave step per read)")
+        else:
+            print("   (no data fields served yet)")
     if len(w) > 9:
         m = w[9]
         mode, setup = m >> 24, (m >> 16) & 0xFF

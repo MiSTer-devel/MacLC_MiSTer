@@ -116,10 +116,10 @@ module swim
 	// unr event (armed pop-empty vs CPU-push-full, and the FIFO/stage/mode
 	// state at that instant). See the UNR-FORENSIC block below.
 	output [31:0] dbg_ism_unrlatch,
-	// {C,H,R,N} of the LAST ID field actually DELIVERED to the CPU, and the
-	// last SIX sector numbers served. See the ID-WITNESS block below.
+	// {C,H,R,N} of the LAST ID field actually DELIVERED to the CPU, and
+	// {ID fields, DATA fields} served. See the ID-WITNESS block below.
 	output [31:0] dbg_ism_lastid,
-	output [31:0] dbg_ism_idhist
+	output [31:0] dbg_ism_idratio
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -461,24 +461,28 @@ module swim
 	// Compare against HUD row 2 (LIVE side/track) on the same frame: an
 	// H that disagrees with side, or a C that disagrees with track, is the bug.
 	//
-	// ★ The SEQUENCE matters more than any count. -81 is reached (ROM a6d3a6,
-	// via a6d388) when the driver keeps reading VALID ID fields — right
-	// cylinder and head, or it would have taken the -80 seekErr path at
-	// a6d166 where the head rides in d1 bit 11 (a6eea6) — yet its target
-	// sector never turns up, until the SonyVars+47 counter runs out. So the
-	// question the HUD must answer is: which sector numbers is the CPU
-	// actually walking? 1,2,3,4,5,6 = a healthy scan and the fault is
-	// elsewhere. A stuck or short-cycling sequence (1,1,1,1 / 1,2,1,2) means
-	// re-arm is landing us on the same field forever and any target beyond it
-	// is unreachable — which is exactly the -81 signature.
+	// ★ THE RATIO is the measurement. -81 is reached (ROM a6d3a6, via a6d388)
+	// when the driver keeps reading VALID ID fields — right cylinder and head,
+	// or it would have taken the -80 seekErr path at a6d166, where the head
+	// rides in d1 bit 11 (a6eea6) — yet its target sector never turns up,
+	// burning one retry per unwanted sector until SonyVars+47 runs out. So
+	// what matters is how many ID fields the CPU walks per DATA field it
+	// actually consumes:
+	//   ~1:1  the scan catches its target immediately (healthy)
+	//   ~2:1  one interleave step per read — the intended 2:1 behaviour
+	//   ~18:1 a FULL REVOLUTION per sector: the scan is over the timing cliff
+	//         and the retry budget dies in ~2 sectors (the -81 signature)
+	// Counting both marks costs two counters and answers it outright, which a
+	// sequence of sector numbers cannot: a healthy walk and an over-cliff walk
+	// both step 1,2,3,4 — they differ only in how many DATA fields land.
 	reg [1:0]  idw_mark_run;
 	reg [2:0]  idw_phase;      // 0=idle, 1..4 = capturing C,H,R,N
 	reg [31:0] idw_last = 32'd0;
-	reg [29:0] idw_hist = 30'd0;   // last 6 sector numbers, 5 bits each, newest LOW
+	reg [15:0] idw_ids = 16'd0, idw_datas = 16'd0;
 	always @(posedge clk or negedge _reset) begin
 		if (!_reset) begin
 			idw_mark_run <= 2'd0; idw_phase <= 3'd0;
-			idw_last <= 32'd0;    idw_hist <= 30'd0;
+			idw_last <= 32'd0;    idw_ids <= 16'd0; idw_datas <= 16'd0;
 		end
 		else if (cen && ism_gen_push) begin
 			if (mfm_mark_sel && mfm_byte_sel == 8'hA1) begin
@@ -486,21 +490,23 @@ module swim
 				idw_phase <= 3'd0;
 			end
 			else begin
-				if (idw_mark_run == 2'd3 && mfm_byte_sel == 8'hFE)
+				if (idw_mark_run == 2'd3 && mfm_byte_sel == 8'hFE) begin
 					idw_phase <= 3'd1;                  // IDAM: capture CHRN
+					if (idw_ids != 16'hFFFF) idw_ids <= idw_ids + 1'd1;
+				end
+				else if (idw_mark_run == 2'd3 && mfm_byte_sel == 8'hFB) begin
+					if (idw_datas != 16'hFFFF) idw_datas <= idw_datas + 1'd1;
+				end
 				else if (idw_phase != 3'd0) begin
 					idw_last <= {idw_last[23:0], mfm_byte_sel};
 					idw_phase <= (idw_phase == 3'd4) ? 3'd0 : idw_phase + 1'd1;
-					// R (the sector number) is the 3rd captured byte
-					if (idw_phase == 3'd3)
-						idw_hist <= {idw_hist[24:0], mfm_byte_sel[4:0]};
 				end
 				idw_mark_run <= 2'd0;
 			end
 		end
 	end
-	assign dbg_ism_lastid = idw_last;
-	assign dbg_ism_idhist = {2'b0, idw_hist};
+	assign dbg_ism_lastid  = idw_last;
+	assign dbg_ism_idratio = {idw_ids, idw_datas};
 	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
 	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
 	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};

@@ -1174,7 +1174,7 @@ module emu
 	wire [21:0] dbg_flp_gcr_addr;
 	wire [31:0] dbg_ism_verdict_w;
 	wire [31:0] dbg_ism_unrlatch_w;
-	wire [31:0] dbg_ism_lastid_w, dbg_ism_idhist_w;
+	wire [31:0] dbg_ism_lastid_w, dbg_ism_idratio_w;
 	wire [31:0] dbg_ism_state;
 	wire [15:0] dbg_flp_strb_cnt;
 	wire [15:0] dbg_flp_strb_en_cnt;
@@ -1374,7 +1374,7 @@ module emu
 			hud_w5 <= {hud_e142_first, hud_e142_last};
 			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
 			hud_w7 <= dbg_ism_lastid_w;
-			hud_w8 <= dbg_ism_idhist_w;
+			hud_w8 <= dbg_ism_idratio_w;
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
@@ -1877,7 +1877,7 @@ module emu
 		.dbg_ism_verdict(dbg_ism_verdict_w),
 		.dbg_ism_unrlatch(dbg_ism_unrlatch_w),
 		.dbg_ism_lastid(dbg_ism_lastid_w),
-		.dbg_ism_idhist(dbg_ism_idhist_w),
+		.dbg_ism_idratio(dbg_ism_idratio_w),
 		.dbg_ism_state(dbg_ism_state),
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
