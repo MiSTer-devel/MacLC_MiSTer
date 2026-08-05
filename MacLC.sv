@@ -1177,6 +1177,7 @@ module emu
 	wire [15:0] dbg_flp_strb_en_cnt;
 	wire [23:0] dbg_flp_strb_last;
 	wire [8:0]  dbg_flp_rej_step;
+	wire [7:0]  dbg_flp_status;
 
 	// ── Always-on marginality anchor (2026-07-29) ───────────────────────────
 	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
@@ -1251,9 +1252,11 @@ module emu
 	//   row 2  {side, track[6:0], step_cnt[15:0], 5'b0, ism_error[2:0]}
 	//   row 3  {10'b0, dskReadAddrInt[21:0]}         live fetch address
 	//   row 4  {err_onset_cnt[7:0], arm_cnt[7:0], ovr_cnt[7:0], unr_cnt[7:0]}
-	//   row 5  latch @ last error onset: {side, track[6:0], 2'b0, addr[21:0]}
-	//   row 6  latch @ last error onset: {byte_cnt[15:0], step_cnt[15:0]}
+	//   row 5  latch @ FIRST error onset: {side, track[6:0], 2'b0, addr[21:0]}
+	//   row 6  latch @ FIRST error onset: {byte_cnt[15:0], step_cnt[15:0]}
 	//   row 7  {strb_cnt[15:0], strb_en_cnt[15:0]}   ALL lstrb falls / enabled
+	//   row 10 FIRST-onset latch {MODE, status, miss_cnt} — status =
+	//           {spinning,motor,ism_sel,MOTORONreg,side,ism_active,action,diskin}
 	//   row 9  {ism_mode_reg[7:0], ism_setup[7:0], 8'b0, diskEnableInt,
 	//           driveSel, devsel_int, devsel_ext, selonly_int, ism_mode,
 	//           diskEnableExt, 0} — what the driver PROGRAMMED
@@ -1278,12 +1281,25 @@ module emu
 	reg  [2:0] hud_err_d = 3'd0;
 	reg  [7:0] hud_onset_cnt = 8'd0;
 	reg [31:0] hud_lat_pos = 32'd0, hud_lat_cnt = 32'd0;
+	// Latch the FIRST onset and freeze it. Re-latching every onset (the original
+	// behaviour) is worthless once unr saturates at 255: it only ever shows the
+	// post-mortem, long after the driver gave up. The first onset is the one that
+	// explains the failure. hud_lat_st captures the drive status + ISM Mode in
+	// force at that instant, so an underrun can be attributed to a stopped
+	// spindle vs a delivery that simply did not keep up.
+	reg        hud_first_done = 1'b0;
+	reg [31:0] hud_lat_st = 32'd0;
 	always @(posedge clk_sys) begin
 		hud_err_d <= hud_err_live;
 		if ((hud_err_d == 3'd0) && (hud_err_live != 3'd0)) begin
 			if (hud_onset_cnt != 8'hFF) hud_onset_cnt <= hud_onset_cnt + 1'd1;
-			hud_lat_pos <= {dbg_flp_side, dbg_flp_track[6:0], 2'b00, dskReadAddrInt[21:0]};
-			hud_lat_cnt <= {dbg_flp_byte_cnt, dbg_flp_step_cnt};
+			if (!hud_first_done) begin
+				hud_first_done <= 1'b1;
+				hud_lat_pos <= {dbg_flp_side, dbg_flp_track[6:0], 2'b00, dskReadAddrInt[21:0]};
+				hud_lat_cnt <= {dbg_flp_byte_cnt, dbg_flp_step_cnt};
+				hud_lat_st  <= {dbg_ism_state[31:24], dbg_flp_status,
+				                dbg_flp_miss_cnt};
+			end
 		end
 	end
 
@@ -1294,8 +1310,9 @@ module emu
 	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
 	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
-	           hud_w9 = 32'd0;
+	           hud_w9 = 32'd0, hud_w10 = 32'd0;
 	wire [31:0] hud_wmux =
+		(hud_y[6:3] == 4'd10) ? hud_w10 :
 		(hud_y[6:3] == 4'd9) ? hud_w9 :
 		(hud_y[6:3] == 4'd8) ? hud_w8 :
 		(hud_y[5:3] == 3'd0) ? 32'hA5C3F00F :
@@ -1323,8 +1340,9 @@ module emu
 			hud_w7 <= {dbg_flp_strb_cnt, dbg_flp_strb_en_cnt};
 			hud_w8 <= {8'b0, dbg_flp_strb_last};
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
+			hud_w10 <= hud_lat_st;
 		end
-		hud_on_q    <= (hud_y < 10'd80) && (hud_x < 10'd256) && v8_de;
+		hud_on_q    <= (hud_y < 10'd88) && (hud_x < 10'd256) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[7:3]];
 	end
 `endif // USE_DBG_HUD
@@ -1822,7 +1840,8 @@ module emu
 		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
 		.dbg_flp_strb_last(dbg_flp_strb_last),
-		.dbg_flp_rej_step(dbg_flp_rej_step)
+		.dbg_flp_rej_step(dbg_flp_rej_step),
+		.dbg_flp_status(dbg_flp_status)
 	);
 
 	reg disk_act;

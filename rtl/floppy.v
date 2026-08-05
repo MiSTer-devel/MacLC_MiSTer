@@ -139,7 +139,12 @@ module floppy
 	// drive — so the mode register sampled 'now' need not be the mode in force
 	// when a seek was actually dropped. This flags THAT instant.
 	// [7:0] = rejected-step count (saturating), [8] = ever happened.
-	output reg  [8:0]  dbg_rej_step
+	output reg  [8:0]  dbg_rej_step,
+	// Live drive status, so an underrun can be attributed: is the media even
+	// spinning, and which term is holding it up? (2026-08-04: once the
+	// drive-select fix let register writes land, MOTORON writes land too and
+	// can stop the disk — mfm_spinning = mfm_disk && (motor||ism_sel) && !CSTIN.)
+	output wire [7:0]  dbg_status
 );
 	assign dbg_disk_image_data = diskImageData;
 	assign dbg_drive_track     = driveTrack;
@@ -148,6 +153,9 @@ module floppy
 	assign dbg_gcr_addr        = gcrReadAddr;
 
 	assign motor = ~driveRegs[`DRIVE_REG_MOTORON];
+	assign dbg_status = {mfm_spinning, motor, ism_sel,
+	                     driveRegs[`DRIVE_REG_MOTORON], driveSide, ism_active,
+	                     ism_action, ~driveRegs[`DRIVE_REG_CSTIN]};
 	assign act = lstrbEdge;
 
 	reg [15:0] driveRegs;

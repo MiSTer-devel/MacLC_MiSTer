@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 
 MARKER = 0xA5C3F00F
-NROWS = 10
+NROWS = 11
 
 def find_and_decode(img):
     g = np.array(img.convert('L')) > 128
@@ -67,9 +67,9 @@ def decode(words):
     print(f"  w3 LIVE fetch addr {w[3] & 0x3FFFFF:#08x} = {sec_geom(w[3] & 0x3FFFFF)}")
     print(f"  w4 onset_cnt={w[4] >> 24:3d} arm={(w[4] >> 16) & 0xFF:3d} "
           f"ovr={(w[4] >> 8) & 0xFF:3d} unr={w[4] & 0xFF:3d}")
-    print(f"  w5 LATCH side={w[5] >> 31} track={(w[5] >> 24) & 0x7F:3d} "
+    print(f"  w5 FIRST-onset side={w[5] >> 31} track={(w[5] >> 24) & 0x7F:3d} "
           f"addr {w[5] & 0x3FFFFF:#08x} = {sec_geom(w[5] & 0x3FFFFF)}")
-    print(f"  w6 LATCH byte_cnt={w[6] >> 16:5d} step_cnt={w[6] & 0xFFFF:5d}")
+    print(f"  w6 FIRST-onset byte_cnt={w[6] >> 16:5d} step_cnt={w[6] & 0xFFFF:5d}")
     print(f"  w7 lstrb falling edges: total={w[7] >> 16:5d}  with _enable low={w[7] & 0xFFFF:5d}")
     if len(w) > 8:
         last = w[8] & 0xFFFFFF
@@ -91,6 +91,17 @@ def decode(words):
                   f"(well-formed STEP dropped because _enable was high)")
         else:
             print("     no rejected steps recorded")
+    if len(w) > 10 and w[10]:
+        mo, st, miss = w[10] >> 24, (w[10] >> 16) & 0xFF, w[10] & 0xFFFF
+        print(f"  w10 AT FIRST UNDERRUN: MODE={mo:#04x} [motor={mo >> 7} "
+              f"action={(mo >> 3) & 1} drvsel={(mo >> 1) & 3:02b}]  miss_cnt={miss}")
+        print(f"      spinning={st >> 7} motor={(st >> 6) & 1} ism_sel={(st >> 5) & 1} "
+              f"MOTORONreg={(st >> 4) & 1} side={(st >> 3) & 1} ism_active={(st >> 2) & 1} "
+              f"action={(st >> 1) & 1} diskin={st & 1}")
+        if not (st >> 7):
+            print("      ==> MEDIA WAS NOT SPINNING at the first underrun")
+        else:
+            print("      ==> media WAS spinning — delivery failed to keep up")
     tot = w[7] >> 16
     step = (w[2] >> 8) & 0xFFFF
     if tot == 0:

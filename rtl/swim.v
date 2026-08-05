@@ -106,6 +106,7 @@ module swim
 	output [15:0] dbg_flp_strb_en_cnt,
 	output [23:0] dbg_flp_strb_last,
 	output [8:0]  dbg_flp_rej_step,
+	output [7:0]  dbg_flp_status,
 	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
 );
 
@@ -296,7 +297,8 @@ module swim
 		.dbg_strb_cnt(dbg_flp_strb_cnt),
 		.dbg_strb_en_cnt(dbg_flp_strb_en_cnt),
 		.dbg_strb_last(dbg_flp_strb_last),
-		.dbg_rej_step(dbg_flp_rej_step)
+		.dbg_rej_step(dbg_flp_rej_step),
+		.dbg_status(dbg_flp_status)
 	);
 
 	floppy floppyExt
