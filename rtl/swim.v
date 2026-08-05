@@ -418,7 +418,22 @@ module swim
 	// ISM FIFO transaction requests (consumed in the clocked block below).
 	// CPU pop/push commit at acc_end; the generator pushes on the delivery
 	// strobe, but only once the mark hunt has synced (or at the syncing A1).
-	wire ism_pop_req  = acc_end && ism_mode && acc_rw_l &&
+	// ★ A Data/Mark read with ACTION clear is NOT a pop (Snow ism.rs:228 —
+	// `if !self.ism_mode.action() { return Some(0xFF); }`). The LC ROM's
+	// session teardown/init probes the data and mark registers with the
+	// engine disarmed (a6ea9e/a6eaf0/a6eb64); popping there hits an empty
+	// FIFO and latches ism_error[2].
+	//
+	// That latched error is NOT cosmetic: Handshake b5 = "error pending", and
+	// the ROM's per-field verdict is ONE handshake sample tested as
+	// `d5 & 0x22` (a6ef86/a6ef96). While the error stays latched, every
+	// handshake read reports b5, so a field whose data was read perfectly is
+	// rejected -> retry -> retries exhausted -> the -81 sectNFErr / -65
+	// offLinErr the guest shows as "couldn't be read, a disk error occurred".
+	// Measured on hardware (build d0cbdd30, HUD row 7): 14 underrun onsets ->
+	// 553 handshake reads with b5 hot across one whole-disk copy, while the
+	// b1 (CRC-on-newest) poisoning count was exactly 0.
+	wire ism_pop_req  = acc_end && ism_mode && acc_rw_l && ism_mode_reg[3] &&
 	                    (acc_addr_l[2:0] == 3'h0 || acc_addr_l[2:0] == 3'h1);
 	wire ism_cpu_push = acc_end && ism_mode && !acc_rw_l &&
 	                    (acc_addr_l[2:0] == 3'h0 || acc_addr_l[2:0] == 3'h1 ||
@@ -542,8 +557,13 @@ module swim
 				// side-effect commits at access end (acc_end), so the value is
 				// stable for the whole CPU access. Empty pop floats FF (Snow
 				// ism.rs; the underrun error is raised in the pop transaction).
+				// With ACTION clear this is a disarmed probe, not a pop: return
+				// FF and leave the FIFO/error alone (Snow ism.rs:228). See the
+				// ism_pop_req comment — a spurious error here poisons the ROM's
+				// `d5 & 0x22` field verdict through Handshake b5.
 				3'h0, 3'h1:
-					dataOutLo = (ism_fifo_pos == 0) ? 8'hFF : ism_fifo[0][7:0];
+					dataOutLo = (!ism_mode_reg[3] || ism_fifo_pos == 0)
+					            ? 8'hFF : ism_fifo[0][7:0];
 				3'h2: // Error register
 					dataOutLo = ism_error;
 				3'h3: // Param[idx]
