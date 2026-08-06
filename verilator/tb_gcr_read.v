@@ -84,6 +84,10 @@ module tb_gcr_read;
 	wire [7:0]  dskReadData = (dskReadAddrInt < IMG_BYTES) ? img[dskReadAddrInt] : 8'hE5;
 	wire [6:0]  dbg_track;
 	wire        dbg_side;
+	// +ds=0 selects the SINGLE-sided 400K geometry (floppy_track_encoder's
+	// `sides`=0 path, which nothing else exercises). Driven from an initial
+	// plusarg before reset is released.
+	reg         tb_ds = 1'b1;
 
 	// Periodic fetch ack, mimicking addrController's extra bus slot (~2 us).
 	integer ack_div = 0;
@@ -111,7 +115,7 @@ module tb_gcr_read;
 		.dataOut(dataOut),
 		.insertDisk(2'b01),      // internal drive: disk in
 		.diskEject(),
-		.diskSides(2'b01),       // double-sided (800K)
+		.diskSides({1'b0, tb_ds}),  // 1 = double-sided 800K, 0 = 400K (+ds=0)
 		.diskMFM(2'b00),         // GCR disk -> IWM path
 		.diskHD(2'b00),
 		.diskMotor(), .diskAct(),
@@ -147,6 +151,7 @@ module tb_gcr_read;
 	integer req_track = 0;
 	integer req_side  = 0;
 	integer ncap_want = 6000;
+	integer req_ds    = 1;
 
 	task swim_wr(input [3:0] a, input [7:0] d);
 	begin
@@ -209,6 +214,7 @@ module tb_gcr_read;
 		if (!$value$plusargs("side=%d", req_side))   req_side  = 0;
 		if (!$value$plusargs("ncap=%d", ncap_want))  ncap_want = 6000;
 		if (ncap_want > NCAP_MAX) ncap_want = NCAP_MAX;
+		if ($value$plusargs("ds=%d", req_ds)) tb_ds = (req_ds != 0);
 
 		_reset = 0;
 		repeat (40) @(posedge clk);

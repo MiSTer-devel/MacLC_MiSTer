@@ -57,8 +57,13 @@ def soff_of(t):
     return s
 
 
-def expected_block(track, side, sector):
-    return 2 * soff_of(track) + side * spt_of(track) + sector
+def expected_block(track, side, sector, sides=1):
+    """floppy_track_encoder.v's address arithmetic. `sides`=1 (800K, two-sided)
+    counts each track's sectors on BOTH surfaces before the next track; `sides`=0
+    (400K) is a single spiral with no side term."""
+    if sides:
+        return 2 * soff_of(track) + side * spt_of(track) + sector
+    return soff_of(track) + sector
 
 
 def pattern_block(b):
@@ -131,6 +136,8 @@ def census(path):
     print(f"== {path}: {len(s)} bytes, TB requested track={want_track} "
           f"side={want_side}")
 
+    # fmt in the address field encodes it: 0x22 = double-sided, 0x02 = single
+    sides = 1
     ok = True
     naddr = ndata = ngood = 0
     last_addr = None            # (track, side, sector) of last good addr field
@@ -145,6 +152,7 @@ def census(path):
                     naddr += 1
                     track = trk_lo | ((trk_hi & 1) << 6)
                     side = (trk_hi >> 5) & 1
+                    sides = 1 if (fmt & 0x20) else 0
                     last_addr = (track, side, sec)
                     if want_track is not None and \
                        (track != want_track or side != want_side):
@@ -182,7 +190,7 @@ def census(path):
                 verdict = 'ORPHAN'
             else:
                 track, side, asec = last_addr
-                blk = expected_block(track, side, dsec)
+                blk = expected_block(track, side, dsec, sides)
                 exp = pattern_block(blk)
                 claimed = data[0] | (data[1] << 8)
                 if dsec != asec:
