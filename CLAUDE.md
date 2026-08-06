@@ -188,7 +188,18 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 
 ## Known Limitations
 
-- Floppy disks are read-only
+- Floppy disks are read-only (**no write datapath exists** in `rtl/floppy.v`;
+  the drive reports `WRTPRT=0` = write-protected so the OS never tries. That
+  is load-bearing: the ROM's write primitive polls handshake b7 in an
+  UNBOUNDED loop, so an attempted write would hang the machine, not fail.)
+- **BOOTING FROM FLOPPY WORKS** (user-confirmed on hardware 2026-08-05,
+  bench build `78a46cf2`). The old "Welcome to Macintosh" retry loop and the
+  ~39 KB-then-UNDERRUN freeze are gone. Several fixes contributed and no
+  single one was isolated: the constant-300-RPM MFM tach (`62aee5c`, which
+  targeted the Welcome loop directly), the ISM drive-select fix, the INDEX
+  pulse, VIA1 PA7, and the VIA timer half-rate fix (`33ebdd1` — the driver's
+  install-time drive-speed check is timer-paced, so a 2x timer error would
+  also have corrupted it).
 - **1.44 MB MFM read works, and the Finder whole-disk COPY was FIXED
   2026-08-05** (`33ebdd1`): the real defect was **`rtl/via6522.sv` counting
   T1/T2 at half rate** — a `/2` prescaler stacked on enables that were already
