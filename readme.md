@@ -24,18 +24,17 @@ the Egret (HC05) system controller, and the LC's other peripherals.
   [CD-ROM support](#cd-rom-support-scsi).
 - **Color display** — 1/2/4/8/16bpp, 512×384 (12" RGB) or 640×480 (VGA)
 - **Sound**, including CD audio
+- **QuickTime video playback**
 - **Memory:** 2 MB or 10 MB configurations
 - **PRAM/NVRAM:** save (on entering the OSD), automatic load at core start (or forced load),
   and clear
 - **SCC serial** is wired in and "usable" but not yet doing anything useful
-
 - **Floppy disks (read-only):** 800 KB GCR and 1.44 MB MFM disks in raw or
   DiskCopy 4.2 format — booting, mounting, launching applications and copying
   files off a floppy all work. See [Floppy disk support](#floppy-disk-support)
 
 ### Not working yet
 
-- **QuickTime video playback**
 - **Floppy writes** (disks mount locked/write-protected)
 - **Hot-swapping floppy images** — a running Mac does not notice that you mounted a
   different image; reset after a swap, see
