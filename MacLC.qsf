@@ -105,12 +105,13 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # scripts/parse_hud.py, which auto-detects both this and the older top-left 8x8
 # geometry). Built 2026-08-04 because this board's JTAG hub name table is
 # corrupt and the ISSP probes can't be read. Needs NO JTAG.
-# ★ COMMENTED for release (2026-08-06): the strip is drawn over real picture.
-# Uncomment for any floppy/VIA-timer investigation — it is the only working
+# ★ Uncomment for any floppy/VIA-timer investigation — it is the only working
 # forensic channel on this board. HUD-on and HUD-off are DIFFERENT netlists and
 # re-roll the fit lottery independently, so re-gate after flipping it (icon gate
-# + >= 2-boot Finder soak).
-# set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
+# + >= 2-boot Finder soak). COMMENT AGAIN for release fits.
+# ON 2026-08-06: disk-swap mission — HUD row 7 is the media-change witness
+# (floppy.v dbg_media; layout at its port comment).
+set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"

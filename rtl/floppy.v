@@ -17,7 +17,9 @@
   0      0      1      1      WRTPRT       Disk locked (0=locked)
   0      1      0      0      MOTORON      Drive motor running (0=on, 1=off)
   0      1      0      1      TKO          Head at track 0 (0=at track 0)
-  0		1		 1		  0		SWITCHED   	 Disk switched (1=yes?)
+  0		1		 1		  0		SWITCHED   	 Disk switched (1=yes; set on media REMOVAL, survives the
+                                          next insert, cleared only by the DskchgClear strobe —
+                                          MAME mac_floppy m_dskchg, sense reads !m_dskchg)
   0      1      1      1      TACH         Tachometer (produces 60 pulses for each rotation of the drive motor)
   1      0      0      0      RDDATA0      Read data, lower head, side 0
   1      0      0      1      RDDATA1      Read data, upper head, side 1 
@@ -121,6 +123,19 @@ module floppy
 	                                         // cleared on this edge — sample it now)
 	output wire [7:0]  dbg_raw_byte,         // pre-encoder SDRAM fetch latch (idata)
 	output wire [21:0] dbg_gcr_addr,         // live GCR encoder fetch address
+	// Media-change witness (2026-08-06, the disk-swap mission). One packed
+	// word for the HUD so a failed swap on hardware is attributable at a
+	// glance: live media/flag state in the top byte, saturating event
+	// counters below, and wrapping counters of the guest's sense polls of
+	// the two registers the Sony driver reads in pairs (NoDiskInPl=our reg 1,
+	// DiskChg=our reg 6 — findings_mame_floppy_groundtruth §2).
+	//   [31] CSTIN reg (1 = no disk)   [30] disk_switched (1 = changed)
+	//   [29] insertDisk                [28] ism_active
+	//   [27:24] ejects ACCEPTED (sat)  [23:20] DskchgClear strobes (sat)
+	//   [19:16] CSTIN transitions (sat, either direction)
+	//   [15:8] entries into "parked on sense reg 1, enabled" (wrap)
+	//   [7:0]  entries into "parked on sense reg 6, enabled" (wrap)
+	output reg  [31:0] dbg_media,
 	// Phase-strobe forensics (2026-08-04): dbg_step_cnt reading 0 on hardware
 	// during a whole ISM/MFM session cannot distinguish "the driver never
 	// strobed a step" from "our decode rejected the strobe" — both leave the
@@ -217,7 +232,10 @@ module floppy
 		          // SuperDrive identify signature x011 (motor-off RdData1 reads 1).
 		1'b0, // RDDATA0
 		driveRegs[`DRIVE_REG_TACH], // TACH: 60 pules for each rotation of the drive motor
-		1'b0, // disk switched?
+		disk_switched, // SWITCHED ($6 here = MAME reg 0x3 DiskChg): 1 = media changed.
+		          // Was hardwired 0 — so a host-side swap presented "the disk left
+		          // and came back but nothing changed", a state no real machine
+		          // produces. See the disk_switched block below (2026-08-06).
 		~(driveTrack == 7'h00), // TK0: track 0 indicator
 		driveRegs[`DRIVE_REG_MOTORON], // motor on
 		1'b0, // WRTPRT = locked
@@ -239,6 +257,50 @@ module floppy
 		else if (cep && _enable == 1'b0 && lstrbEdge == 1'b1) begin
 			if (strobeCmd == 4'h9) m_mfm <= 1'b1;   // MFMModeOn
 			if (strobeCmd == 4'hD) m_mfm <= 1'b0;   // GCRModeOn
+		end
+	end
+
+	// SWITCHED / DiskChg flag (sense reg 6 = MAME mac_floppy reg 0x3, which
+	// returns !m_dskchg). MAME 0.264 floppy.cpp ground truth — mac drives have
+	// m_dskchg_writable=true, so:
+	//   - device_start forces "no change" even with an empty drive -> reset 0;
+	//   - call_unload() ASSERTS it (guest eject and host-side image withdrawal
+	//     both end there) and call_load() does NOT touch it, so it stays
+	//     asserted across the next insert;
+	//   - only the DskchgClear strobe (cmd {SEL,ca2,ca1,ca0}=0xC) clears it
+	//     (the PC-style step auto-clear is !m_dskchg_writable drives only).
+	// Runtime-verified 2026-08-06 (tap_swapB): the 6.0.8 Sony driver polls
+	// NoDiskInPl+DiskChg as a PAIR every ~0.8 s (in ISM through Handshake b3,
+	// phases parked F0/F3), and on reading DiskChg=1 it strobes DskchgClear
+	// (Phases F4->FC->F4, PA5=1) in the same poll before handling the change.
+	// Presenting a CSTIN transition with this flag stuck 0 gave the driver a
+	// state no real machine produces — the prime suspect for the ebbdac6-
+	// reverted fix crashing the mount. Media removal is detected here as the
+	// FALL of insertDisk: a guest eject (MacLC.sv clears the mount flags while
+	// diskEject is asserted) and a host swap (flags cleared at download start)
+	// both route through it.
+	reg disk_switched;
+	reg insertDisk_d;
+	always @(posedge clk or negedge _reset) begin
+		if (!_reset) begin
+			disk_switched <= 1'b0;
+			insertDisk_d  <= 1'b0;
+		end
+		else if (cep) begin
+			insertDisk_d <= insertDisk;
+			if (insertDisk_d && !insertDisk)
+				disk_switched <= 1'b1;
+			else if (_enable == 1'b0 && lstrbEdge && strobeCmd == 4'hC) begin
+				disk_switched <= 1'b0;
+`ifdef SIMULATION
+				$display("FLOPPY %m DskchgClear strobe (switched %b->0) @%0t",
+				         disk_switched, $time);
+`endif
+			end
+`ifdef SIMULATION
+			if (insertDisk_d && !insertDisk)
+				$display("FLOPPY %m media REMOVED -> disk_switched=1 @%0t", $time);
+`endif
 		end
 	end
 
@@ -611,6 +673,46 @@ module floppy
 		end
 	end
 
+	// Media-change witness (see the dbg_media port comment). Observation-only,
+	// own always block (Quartus single-driver law). The park counters count
+	// ENTRIES into "phases parked on that sense register with the drive
+	// enabled" — one per driver poll — because the parked state itself is a
+	// level held across thousands of cycles.
+	wire dbg_park1 = (_enable == 1'b0) && (driveReadAddr == `DRIVE_REG_CSTIN);
+	wire dbg_park6 = (_enable == 1'b0) && (driveReadAddr == `DRIVE_REG_EJECT);
+	reg  dbg_park1_d, dbg_park6_d, dbg_cstin_d;
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			dbg_media   <= 32'd0;
+			dbg_park1_d <= 1'b0;
+			dbg_park6_d <= 1'b0;
+			dbg_cstin_d <= 1'b1;
+		end
+		else if (cep) begin
+			dbg_media[31] <= driveRegs[`DRIVE_REG_CSTIN];
+			dbg_media[30] <= disk_switched;
+			dbg_media[29] <= insertDisk;
+			dbg_media[28] <= ism_active;
+			dbg_park1_d <= dbg_park1;
+			dbg_park6_d <= dbg_park6;
+			dbg_cstin_d <= driveRegs[`DRIVE_REG_CSTIN];
+			if (_enable == 1'b0 && (!ism_active || ism_sel) && lstrbEdge &&
+			    driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1 &&
+			    dbg_media[27:24] != 4'hF)
+				dbg_media[27:24] <= dbg_media[27:24] + 4'd1;
+			if (_enable == 1'b0 && lstrbEdge && strobeCmd == 4'hC &&
+			    dbg_media[23:20] != 4'hF)
+				dbg_media[23:20] <= dbg_media[23:20] + 4'd1;
+			if (dbg_cstin_d != driveRegs[`DRIVE_REG_CSTIN] &&
+			    dbg_media[19:16] != 4'hF)
+				dbg_media[19:16] <= dbg_media[19:16] + 4'd1;
+			if (dbg_park1 && !dbg_park1_d)
+				dbg_media[15:8] <= dbg_media[15:8] + 8'd1;
+			if (dbg_park6 && !dbg_park6_d)
+				dbg_media[7:0] <= dbg_media[7:0] + 8'd1;
+		end
+	end
+
 	assign readData = _enable ? 8'hFF :
 	                  (driveReadAddr == `DRIVE_REG_RDDATA0 || driveReadAddr == `DRIVE_REG_RDDATA1) ?
 	                      (mfm_disk ? {mfm_idx_sense, 7'h00} : diskDataIn) :
@@ -637,37 +739,59 @@ module floppy
 	assign diskEject = (ejectIndicatorTimer != 0);
 	
 	always @(posedge clk or negedge _reset) begin
-		if (_reset == 1'b0) begin		
+		if (_reset == 1'b0) begin
 			driveRegs[`DRIVE_REG_CSTIN] <= 1'b1;
 			ejectIndicatorTimer <= 24'd0;
-		end 
+		end
 		else if(cep) begin
-			// EJECT is ignored while the SWIM is in ISM mode. The ISM Phases
-			// register drives the SAME ca0-2/LSTRB lines as the IWM soft
-			// switches, and the register walks the driver/ROM perform there
-			// pass through $FF = {LSTRB=1, ca2=1, ca1=1, ca0=1}, which this
-			// layer decodes as driveWriteAddr 6 (EJECT) + ca2=1 = "eject the
-			// disk". With a drive selected by ISM devsel that silently ejected
-			// the just-inserted image on every per-mount ISM probe, so the
-			// internal drive could never hold a disk (2026-08-03: the primary
-			// drive stopped reacting to mounts entirely; the external drive was
-			// unaffected because it is not the drive ISM selects). An ISM read
-			// session never needs to eject.
-			if (_enable == 1'b0 && !ism_active && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1) begin
+			// EJECT decode. In IWM mode this is the classic soft-switch strobe.
+			// In ISM mode the Phases register drives the SAME ca0-2/LSTRB lines,
+			// and the ROM's register walks pass through $FF = {LSTRB,ca2,ca1,
+			// ca0}=1111, whose falling edge decodes here as EJECT+ca2 — on
+			// 2026-08-03 that silently ejected the image on every mount, which
+			// is why eject was then gated off with a blanket !ism_active. That
+			// gate made the guest structurally UNABLE to eject an MFM disk
+			// (the 6.0.8 installer's disk-2 swap needs exactly that), so it is
+			// now qualified the way MAME forwards phase strobes to a drive at
+			// all: only when the ISM has this drive devsel'd (ism_sel = Mode
+			// b7 + select code — swim1.cpp update_phases only reaches m_floppy
+			// when selected). Ground truth 2026-08-06 (tap_swapB F4803): every
+			// real ISM-era drive command arrives inside a ModeSet-82 ...
+			// ModeClr-80 bracket, i.e. with ism_sel HIGH, while the ROM/driver
+			// register walks run with Mode b7 CLEAR — so this qualifier passes
+			// genuine ejects and still blocks every walk that burned us.
+			if (_enable == 1'b0 && (!ism_active || ism_sel) && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1) begin
 				// eject the disk
 				driveRegs[`DRIVE_REG_CSTIN] <= 1'b1;
 				ejectIndicatorTimer <= 24'hFFFFFF;
-			end
-			else if (insertDisk) begin
-				// insert a disk
-				driveRegs[`DRIVE_REG_CSTIN] <= 1'b0;
+`ifdef SIMULATION
+				$display("FLOPPY %m EJECT accepted (ism=%b sel=%b) @%0t",
+				         ism_active, ism_sel, $time);
+`endif
 			end
 			else begin
+				// CSTIN simply REPORTS what the host has mounted (78804c1,
+				// re-landed 2026-08-06 together with disk_switched above —
+				// landing it alone was the reverted ebbdac6 regression). It
+				// used to be `else if (insertDisk) CSTIN <= 0;` with no else:
+				// an insert LATCHED the line low and only a guest EJECT strobe
+				// could raise it again, so when the host withdrew the media
+				// (image swapped, wrong-size mount, or the guest's own eject
+				// clearing the flags) the drive kept claiming a disk was
+				// present, the guest never ran its unmount machinery, and it
+				// kept the previous volume's VCB over different SDRAM contents
+				// -> "…cannot be found" on every call with zero disk I/O.
+				// Eject still works: the strobe branch forces the line high
+				// and MacLC.sv clears the mount flags while diskEject is
+				// asserted, so insertDisk is low within a couple of clk_sys
+				// edges — before the next cep evaluates this branch — and the
+				// line stays high.
+				driveRegs[`DRIVE_REG_CSTIN] <= ~insertDisk;
 				if (ejectIndicatorTimer != 0)
 					ejectIndicatorTimer <= ejectIndicatorTimer - 1'b1;
 			end
 		end
-	end									
+	end
 									
 	//`define DRIVE_REG_STEP		2  /* R: drive head stepping (1 = complete) */
 												/* W: 0 = step drive head */

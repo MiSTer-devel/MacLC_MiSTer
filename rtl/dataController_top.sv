@@ -193,6 +193,7 @@ module dataController_top(
 	output [23:0] dbg_flp_strb_last,
 	output [8:0]  dbg_flp_rej_step,
 	output [7:0]  dbg_flp_status,
+	output [31:0] dbg_flp_media,   // media-change witness (floppy.v dbg_media)
 	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
 	output [31:0] dbg_ism_verdict,  // {b1_hot,b5_hot} over handshake reads
 	output [31:0] dbg_ism_unrlatch, // first-error[2]-onset forensic latch
@@ -1097,7 +1098,8 @@ module dataController_top(
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
 		.dbg_flp_strb_last(dbg_flp_strb_last),
 		.dbg_flp_rej_step(dbg_flp_rej_step),
-		.dbg_flp_status(dbg_flp_status)
+		.dbg_flp_status(dbg_flp_status),
+		.dbg_flp_media(dbg_flp_media)
 	);
 
 	// SCC
