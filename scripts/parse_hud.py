@@ -30,35 +30,52 @@ from PIL import Image
 MARKER = 0xA5C3F00F
 NROWS = 12
 
+# Two deck geometries are supported so ARCHIVED captures stay readable:
+#   cell 4 px, bottom-left  — current (MacLC.sv, 2026-08-05 pm)
+#   cell 8 px, top-left     — original
+# Each entry is (base_cell_px, where) with where in {'bottom','top'}.
+LAYOUTS = ((4, 'bottom'), (8, 'top'))
+
+
+def _row_bits(g, x0, yr, cw):
+    w = 0
+    for i in range(32):
+        xc = x0 + i * cw + cw // 2
+        # 3-sample majority along x for noise robustness
+        v = int(g[yr, xc]) + int(g[yr, xc - 1]) + int(g[yr, xc + 1])
+        w = (w << 1) | (1 if v >= 2 else 0)
+    return w
+
+
 def find_and_decode(img):
     g = np.array(img.convert('L')) > 128
     H, W = g.shape
-    for s in (1, 2, 3, 4):          # integer scale
-        cw = 8 * s                   # cell width/height in screenshot px
-        for y0 in range(0, min(40, H - NROWS * cw)):
-            yc = y0 + cw // 2        # sample line of row 0
-            for x0 in range(0, min(3 * s + 4, W - 32 * cw)):
-                val = 0
-                ok = True
-                for i in range(32):
-                    xc = x0 + i * cw + cw // 2
-                    # 3-sample majority along x for noise robustness
-                    v = int(g[yc, xc]) + int(g[yc, xc - 1]) + int(g[yc, xc + 1])
-                    val = (val << 1) | (1 if v >= 2 else 0)
-                if val != MARKER:
-                    continue
-                # locked: decode all rows at (x0, y0, s)
-                words = []
-                for r in range(NROWS):
-                    yr = y0 + r * cw + cw // 2
-                    w = 0
-                    for i in range(32):
-                        xc = x0 + i * cw + cw // 2
-                        v = int(g[yr, xc]) + int(g[yr, xc - 1]) + int(g[yr, xc + 1])
-                        w = (w << 1) | (1 if v >= 2 else 0)
-                    words.append(w)
-                return (x0, y0, s), words
+    for base, where in LAYOUTS:
+        for s in (1, 2, 3, 4):              # integer screenshot scale
+            cw = base * s                   # cell width/height in screen px
+            deck_h = NROWS * cw
+            if deck_h + 2 > H or 32 * cw + 2 > W:
+                continue
+            if where == 'bottom':
+                cands = range(max(0, H - deck_h - 4), H - deck_h + 1)
+            else:
+                cands = range(0, min(40, H - deck_h) + 1)
+            for y0 in cands:
+                yc = y0 + cw // 2           # sample line of row 0 (marker)
+                for x0 in range(0, min(3 * s + 4, W - 32 * cw)):
+                    if _row_bits(g, x0, yc, cw) != MARKER:
+                        continue
+                    words = [_row_bits(g, x0, y0 + r * cw + cw // 2, cw)
+                             for r in range(NROWS)]
+                    return (x0, y0, s, base, where), words
     return None, None
+
+
+def decode_frame(path):
+    """Decode a screenshot -> list of 12 HUD words, or None. For importers
+    (e.g. scratch/copy_babysit2.sh) so the decoder lives in exactly one place."""
+    _, words = find_and_decode(Image.open(path))
+    return words
 
 def sec_geom(byte_addr):
     sec = byte_addr >> 9
@@ -182,10 +199,12 @@ def decode(words):
               "Disarmed probes are gated since c372f97, so these are REAL "
               "armed events.")
 
-for path in sys.argv[1:]:
-    geom, words = find_and_decode(Image.open(path))
-    if words is None:
-        print(f"{path}: no HUD marker found")
-        continue
-    print(f"{path}: HUD at x={geom[0]} y={geom[1]} scale={geom[2]}")
-    decode(words)
+if __name__ == '__main__':
+    for path in sys.argv[1:]:
+        geom, words = find_and_decode(Image.open(path))
+        if words is None:
+            print(f"{path}: no HUD marker found")
+            continue
+        print(f"{path}: HUD at x={geom[0]} y={geom[1]} scale={geom[2]} "
+              f"cell={geom[3]}px {geom[4]}-left")
+        decode(words)

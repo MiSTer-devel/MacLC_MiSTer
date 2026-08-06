@@ -1375,18 +1375,35 @@ module emu
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
 	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
 	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0;
+	// ── Geometry (2026-08-05 pm): 4x4 cells at the BOTTOM-LEFT ─────────────
+	// Was 8x8 cells at the top-left, which covered the Mac MENU BAR — that
+	// cost real bench time (the Special-menu shutdown choreography walked
+	// blind under the black block and had to be re-derived by trial). The
+	// deck is now 128x48 px in the bottom-left corner: menu bar clear, and a
+	// quarter of the former area.
+	// Bottom-alignment is MODE-INDEPENDENT: hud_h latches the previous
+	// frame's active line count (hud_y at vblank), so 512x384 / 640x480 /
+	// any other v8 mode all place the deck against the true last line
+	// without a hard-coded height.
+	localparam [9:0] HUD_W  = 10'd128;   // 32 cells x 4 px
+	localparam [9:0] HUD_HT = 10'd48;    // 12 rows  x 4 lines
+	reg  [9:0] hud_h = 10'd480;          // measured active lines (prev frame)
+	wire [9:0] hud_ytop  = (hud_h > HUD_HT) ? (hud_h - HUD_HT) : 10'd0;
+	wire       hud_vband = (hud_y >= hud_ytop) && (hud_y < hud_h);
+	wire [9:0] hud_yrel  = hud_y - hud_ytop;
+	wire [3:0] hud_rowsel = hud_yrel[5:2];
 	wire [31:0] hud_wmux =
-		(hud_y[6:3] == 4'd11) ? hud_w11 :
-		(hud_y[6:3] == 4'd10) ? hud_w10 :
-		(hud_y[6:3] == 4'd9) ? hud_w9 :
-		(hud_y[6:3] == 4'd8) ? hud_w8 :
-		(hud_y[5:3] == 3'd0) ? 32'hA5C3F00F :
-		(hud_y[5:3] == 3'd1) ? hud_w1 :
-		(hud_y[5:3] == 3'd2) ? hud_w2 :
-		(hud_y[5:3] == 3'd3) ? hud_w3 :
-		(hud_y[5:3] == 3'd4) ? hud_w4 :
-		(hud_y[5:3] == 3'd5) ? hud_w5 :
-		(hud_y[5:3] == 3'd6) ? hud_w6 : hud_w7;
+		(hud_rowsel == 4'd11) ? hud_w11 :
+		(hud_rowsel == 4'd10) ? hud_w10 :
+		(hud_rowsel == 4'd9) ? hud_w9 :
+		(hud_rowsel == 4'd8) ? hud_w8 :
+		(hud_rowsel == 4'd0) ? 32'hA5C3F00F :
+		(hud_rowsel == 4'd1) ? hud_w1 :
+		(hud_rowsel == 4'd2) ? hud_w2 :
+		(hud_rowsel == 4'd3) ? hud_w3 :
+		(hud_rowsel == 4'd4) ? hud_w4 :
+		(hud_rowsel == 4'd5) ? hud_w5 :
+		(hud_rowsel == 4'd6) ? hud_w6 : hud_w7;
 	reg hud_on_q = 1'b0, hud_white_q = 1'b0;
 	wire [7:0] hud_px = hud_white_q ? 8'hFF : 8'h00;
 	always @(posedge clk_vid) begin
@@ -1395,6 +1412,7 @@ module emu
 		if (v8_de) hud_x <= hud_x + 1'd1; else hud_x <= 10'd0;
 		if (hud_de_d & ~v8_de) hud_y <= hud_y + 1'd1;
 		if (~hud_vbl_d & v8_vblank) begin
+			hud_h <= hud_y;          // active line count -> bottom alignment
 			hud_y <= 10'd0;
 			hud_w1 <= {dbg_flp_byte_cnt, dbg_flp_miss_cnt};
 			hud_w2 <= {dbg_flp_side, dbg_flp_track[6:0], dbg_flp_step_cnt, 5'b0, hud_err_live};
@@ -1409,8 +1427,8 @@ module emu
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
 			             dbg_flp_disk_data, dbg_flp_raw};
 		end
-		hud_on_q    <= (hud_y < 10'd96) && (hud_x < 10'd256) && v8_de;
-		hud_white_q <= hud_wmux[5'd31 - hud_x[7:3]];
+		hud_on_q    <= hud_vband && (hud_x < HUD_W) && v8_de;
+		hud_white_q <= hud_wmux[5'd31 - hud_x[6:2]];
 	end
 `endif // USE_DBG_HUD
 
