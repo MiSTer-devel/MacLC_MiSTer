@@ -73,6 +73,7 @@ module scsi
 	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen[5:0] [31]=req
 	output [31:0] dbg_wrstall,
 	output [31:0] dbg_wrfb,     // JTAG WRFB: write-phase first-beat forensics
+	output [31:0] dbg_ring,     // read-ring serve/refill bookkeeping (anchor feed)
 	output [31:0] dbg_cda0,     // JTAG CDA0: cd_audio TOC/engine state (see cd_audio.sv)
 	output [31:0] dbg_cda2,     // JTAG CDA2: last 0xC1 CDB {op9, start5, alloc7, alloc8}
 output [31:0] dbg_cda3,     // JTAG CDA3: last play-class CDB {op, cdb3, cdb4, cdb5}
@@ -459,11 +460,25 @@ reg    wr_pending;
 // and data_complete ends the phase first).
 wire [22:0] rd_ahead_blk    = (data_cnt + 32'd3) >> 9;
 wire        rd_ahead_needed = (rd_ahead_blk < rd_blk_total);
+// Named so the always-on marginality anchor (MacLC.sv) loads the SAME
+// comparator nets io_busy consumes, not shareable duplicates. Pure renaming
+// of the two subexpressions below — no functional change (2026-08-03).
+wire        rd_cur_unfilled   = (rd_cur_blk   >= rd_hps_blk);
+wire        rd_ahead_unfilled = (rd_ahead_blk >= rd_hps_blk);
 wire   io_busy = (phase == PHASE_DATA_OUT && cmd_read && mounted &&
-                  ((rd_cur_blk >= rd_hps_blk) ||
-                   (rd_ahead_needed && (rd_ahead_blk >= rd_hps_blk)))) ||
+                  (rd_cur_unfilled ||
+                   (rd_ahead_needed && rd_ahead_unfilled))) ||
                  (phase == PHASE_DATA_IN  && (io_wr | wr_pending | (io_ack & ~ca_io_active)) && data_cnt[9] == sd_buff_sel) ||
                  (phase != PHASE_DATA_OUT && phase != PHASE_DATA_IN && (io_rd_d | io_wr | wr_pending | (io_ack & ~ca_io_active)));
+// Ring-serve bookkeeping word for the always-on marginality anchor
+// (MacLC.sv). The ring-stale corruption class (f5a3dec 07-17, 082dcc4 07-29,
+// e66fd82 08-01, Finder colour-icon noise 08-03) lives in exactly this cone:
+// a slot served at/past the rd_hps_blk fill boundary returns the slot's
+// previous occupant silently. The value is never read — the word exists so
+// probes-off fits keep these nets loaded as live logic (see the anchor
+// comment block in MacLC.sv; do not trim or fold).
+assign dbg_ring = { io_busy, rd_ahead_needed, rd_ahead_unfilled, rd_cur_unfilled,
+                    rd_hps_blk[13:0], rd_ahead_blk[13:0] };
 	// A zero-length transfer (e.g. INQUIRY with allocation length 0, or a
 	// WRITE with transfer length 0) must complete immediately: data_complete
 	// only sets on an ACK edge, which never comes when the initiator expects

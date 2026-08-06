@@ -86,6 +86,7 @@ module swim
 	input [7:0] dskReadData,
 
 	// --- diagnostic passthroughs (PFLP probes; internal drive only) ---
+	output [31:0] dbg_ism_flpe,  // {5'b0, ism_error, arm_cnt, ovr_cnt, unr_cnt} — JTAG FLPE
 	output [15:0] dbg_flp_byte_cnt,
 	output [15:0] dbg_flp_miss_cnt,
 	output [7:0]  dbg_flp_disk_data,
@@ -95,7 +96,33 @@ module swim
 	output [7:0]  dbg_iwm_latch,     // live IWM read-data latch
 	output        dbg_flp_byte_stb,  // 1-clk delivered-byte strobe (capture ring)
 	output [7:0]  dbg_flp_raw,      // pre-encoder SDRAM fetch latch (internal drive)
-	output [21:0] dbg_flp_gcr_addr  // live GCR fetch address (internal drive)
+	// {ism_mode_reg, ism_setup, 8'b0, diskEnableInt, driveSel, devsel_int,
+	//  devsel_ext, selonly_int, ism_mode, motor_reg, 1'b0} — what the driver
+	// actually PROGRAMMED. Needed because the 08-04 capture showed _enable
+	// still high after keying it on the ISM drive-select code, i.e. that code
+	// is not what we assume (reference doc says bits 2:1, gated by b7).
+	output [31:0] dbg_ism_state,
+	output [15:0] dbg_flp_strb_cnt,
+	output [15:0] dbg_flp_strb_en_cnt,
+	output [23:0] dbg_flp_strb_last,
+	output [8:0]  dbg_flp_rej_step,
+	output [7:0]  dbg_flp_status,
+	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
+	// {b1_hot[15:0], b5_hot[15:0]} over handshake READS — the two bits the
+	// ROM's `d5 & 0x22` field verdict is made of. See the VERDICT-BIT
+	// forensics block below.
+	output [31:0] dbg_ism_verdict,
+	// First-error[2]-onset forensic latch: names the agent behind a residual
+	// unr event (armed pop-empty vs CPU-push-full, and the FIFO/stage/mode
+	// state at that instant). See the UNR-FORENSIC block below.
+	output [31:0] dbg_ism_unrlatch,
+	// SCAN-WITNESS live word {run[7:0], hunt_ms[7:0], par[1:0], gap_us[13:0]}
+	// — the -81 discriminator, latched by MacLC.sv at the instant the Sony
+	// driver posts 0xFFAF to $142. See the SCAN-WITNESS block below.
+	output [31:0] dbg_ism_scan,
+	// {stall_us[15:0], stall_cnt[7:0]} from the internal drive's MFM delivery
+	// path (floppy.v) — the SDRAM-starvation witness.
+	output [23:0] dbg_mfm_stall
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -115,11 +142,24 @@ module swim
 	reg [3:0]  ism_param_idx;      // Auto-incrementing param index
 	reg [15:0] ism_fifo[0:1];      // 2-entry FIFO (data + mark/CRC flags)
 	reg [1:0]  ism_fifo_pos;       // FIFO fill level (0=empty, 1=one, 2=full)
+	// Generator-side staging ring (2026-08-04, the deterministic floppy copy
+	// error): the CPU-visible FIFO stays 2 entries — the ROM self-test and
+	// every handshake/error readback keep their exact semantics — but MFM
+	// deliveries land here first and drain into the FIFO as the CPU makes
+	// room. The old ceiling was one dropped byte (read overrun, error 0x01,
+	// garbled field -> Finder "disk error") whenever the poll loop stalled
+	// >~49us (2 entries x 16.25us); tb_ism_gaptest reproduces that at 60us.
+	// 16 staged entries raise the ceiling to ~290us of CPU stall.
+	(* ramstyle = "MLAB" *) reg [15:0] ism_stage[0:15];
+	reg [3:0]  ism_stage_rd, ism_stage_wr;
+	reg [4:0]  ism_stage_cnt;
 	reg [1:0]  iwm_to_ism_counter; // Mode switch sequence detector
 
-	// ISM FIFO flag bits (stored in upper byte of fifo entries)
-	localparam FIFO_MARK = 8'h01;
-	localparam FIFO_CRC  = 8'h02;
+	// ISM FIFO entry layout: [7:0] data byte, [8] MARK (A1 sync), [9] CRC token
+	// (CPU write-side placeholder), [10] CRC0 (running CRC == 0 at this byte).
+	localparam FIFO_B_MARK = 8;
+	localparam FIFO_B_CRC  = 9;
+	localparam FIFO_B_CRC0 = 10;
 
 	// IWM state
 	reg ca0, ca1, ca2, lstrb, selectExternalDrive, q6, q7;
@@ -142,13 +182,77 @@ module swim
 	wire [7:0] readDataExt;
 	wire senseExt = readDataExt[7]; // bit 7 doubles as the sense line here
 
-	// MFM (ISM) read stream from each drive + the pull/advance one-shot
+	// MFM (ISM) read stream from each drive: byte+flags registered at each
+	// 16/32 us delivery, with a one-cep-period strobe (sampled here on cen).
 	wire [7:0] mfm_byte_int, mfm_byte_ext;
 	wire mfm_mark_int, mfm_mark_ext, mfm_crc0_int, mfm_crc0_ext;
-	reg  mfm_advance;    // 1-cen pull to the active drive's MFM generator
-	reg  ism_rd_armed;   // one advance per ISM reg0/1 read access
-	wire mfm_pull_int = mfm_advance && !selectExternalDrive;
-	wire mfm_pull_ext = mfm_advance &&  selectExternalDrive;
+	wire mfm_stb_int, mfm_stb_ext;
+
+	// F6: in ISM mode the drive select/enable comes from the ISM Mode register
+	// (bit7 gate + the bits2:1 code) — MAME swim1.cpp devsel — NOT from the IWM
+	// soft-switch enables (which the driver turns OFF before the MFM session;
+	// without this the whole session talks to a disabled drive).
+	//
+	// ★ THE MAC LC HAS NO EXTERNAL FLOPPY DRIVE, so every ISM drive-select code
+	// addresses the one internal drive. This used to decode 01=INT / 10=EXT, and
+	// the real driver programs 10 — which routed the whole MFM session to the
+	// absent external drive (2026-08-04 root cause of the floppy copy "disk
+	// error"). Two failures followed, and BOTH match the hardware capture:
+	//   - the internal drive's _enable never asserted, so every drive-register
+	//     write was dropped. dbg_rej_step counted 5 well-formed STEPs discarded;
+	//     driveTrack stayed 0, and since mfm_track_encoder takes .track(driveTrack)
+	//     the engine served cylinder 0 forever while the driver read files
+	//     further out. The volume still mounted and listed perfectly because the
+	//     MDB and the catalog nodes the Finder needs all live on cyl 0.
+	//   - mfm_byte_sel/ism_sense muxed off the EXTERNAL drive, which has no disk
+	//     and so never strobes a byte: ism_error = UNDERRUN with ovr = 0 and the
+	//     internal drive's byte_cnt frozen — exactly what the HUD showed.
+	// Any non-zero code therefore selects the internal drive; 00 still means
+	// "deselected", so an explicit release is still honoured.
+	wire ism_drive_sel  = (ism_mode_reg[2:1] != 2'b00);
+	wire ism_devsel_int = ism_mode && ism_mode_reg[7] && ism_drive_sel;
+	wire ism_devsel_ext = 1'b0;   // no external drive on the LC
+
+	// Drive-register ENABLE is drive SELECT ONLY — motor-on must not gate it.
+	// (2026-08-04 root cause of the floppy copy "disk error".) The devsel wires
+	// above AND in ism_mode_reg[7] = motor on, and they used to drive floppy.v's
+	// _enable, which qualifies every drive-register write. A seek issued while
+	// the motor bit was clear was therefore dropped on the floor: the head never
+	// left cylinder 0, the MFM encoder kept serving cylinder 0 (it takes
+	// .track(driveTrack)), and every read past cyl 0 failed while the volume
+	// still mounted and listed perfectly (MDB + the catalog nodes the Finder
+	// needs all live on cyl 0). Hardware HUD capture: 67 lstrb falling edges,
+	// only 4 with _enable low, and among the rejected ones a perfectly formed
+	// STEP ({ca1,ca0,SEL}=2, ca2=0). Reproduced byte-exactly by tb_ism_step
+	// phase 5. On real hardware /ENBL follows drive select; motor-on only spins
+	// the media. The devsel wires keep the motor term because the DATA path
+	// (mfm_spinning via .ism_sel, sense/byte muxing) genuinely wants it.
+	wire ism_selonly_int = ism_mode && ism_drive_sel;
+	wire ism_selonly_ext = 1'b0;
+
+	// One CPU bus access = one ISM action. The 68k holds UDS across many cen
+	// ticks, so ISM register semantics (param auto-increment, FIFO pop/push,
+	// the IWM->ISM switch counter) must fire ONCE per access: latch the access
+	// while UDS is low, commit side effects on the deassert edge (acc_end).
+	// Read data stays stable through the access; effects land at its close.
+	wire       swim_acc = selectSWIM && (_cpuUDS == 1'b0);
+	reg        swim_acc_d;
+	reg  [3:0] acc_addr_l;
+	reg        acc_rw_l;
+	reg  [7:0] acc_data_l;
+	wire       acc_end = swim_acc_d && !swim_acc;
+
+	reg  [3:0] ism_phase_oe;   // Phases reg high nibble (output enables) — F2
+	// FLPE probe counters (2026-08-04, the deterministic floppy copy error):
+	// count read-side overruns (error[0]: generator pushed into a full FIFO =
+	// the CPU polled too slowly), underrun/CPU-side faults (error[2]), and
+	// read-arms. Plain always block of its own — Quartus single-driver law.
+	reg [2:0] dbg_err_d = 0;
+	reg       dbg_ra_d = 0;
+	reg [7:0] dbg_flpe_ovr = 0, dbg_flpe_unr = 0, dbg_flpe_arm = 0;
+	reg        mfm_synced;     // mark-hunt state: deliver to FIFO only once an
+	                           // A1 mark has been seen since the last read-arm
+	reg        ism_arm_d;      // for the ACTION-rising (read-arm) edge — F8
 
 	// Head-select (SEL/HDSEL) source. On the Mac LC this is V8 VIA1 Port-A bit5 in
 	// EVERY mode: maclc.cpp never wires the SWIM's hdsel_cb, so ISM Mode bit5 does
@@ -171,7 +275,7 @@ module swim
 		.ca2(ca2),
 		.SEL(effSEL),
 		.lstrb(lstrb),
-		._enable(~(diskEnableInt & driveSel)),
+		._enable(ism_mode ? ~ism_selonly_int : ~(diskEnableInt & driveSel)),
 		.writeData(writeData),
 		.readData(readDataInt),
 		.advanceDriveHead(advanceDriveHead),
@@ -186,12 +290,15 @@ module swim
 		.dskReadAddr(dskReadAddrInt),
 		.dskReadAck(dskReadAckInt),
 		.dskReadData(dskReadData),
+		.ism_active(ism_mode),
+		.ism_action(ism_mode && ism_mode_reg[3]),
+		.ism_sel(ism_devsel_int),
 		.mfm_disk(diskMFM[0]),
 		.mfm_hd(diskHD[0]),
-		.mfm_pull(mfm_pull_int),
 		.mfm_byte(mfm_byte_int),
 		.mfm_mark(mfm_mark_int),
 		.mfm_crc0(mfm_crc0_int),
+		.mfm_stb(mfm_stb_int),
 
 		.dbg_byte_cnt(dbg_flp_byte_cnt),
 		.dbg_miss_cnt(dbg_flp_miss_cnt),
@@ -201,7 +308,14 @@ module swim
 		.dbg_step_cnt(dbg_flp_step_cnt),
 		.dbg_byte_stb(dbg_flp_byte_stb),
 		.dbg_raw_byte(dbg_flp_raw),
-		.dbg_gcr_addr(dbg_flp_gcr_addr)
+		.dbg_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_strb_cnt(dbg_flp_strb_cnt),
+		.dbg_strb_en_cnt(dbg_flp_strb_en_cnt),
+		.dbg_strb_last(dbg_flp_strb_last),
+		.dbg_rej_step(dbg_flp_rej_step),
+		.dbg_status(dbg_flp_status),
+		.dbg_mfm_stall_us(dbg_mfm_stall[23:8]),
+		.dbg_mfm_stall_cnt(dbg_mfm_stall[7:0])
 	);
 
 	floppy floppyExt
@@ -216,7 +330,7 @@ module swim
 		.ca2(ca2),
 		.SEL(effSEL),
 		.lstrb(lstrb),
-		._enable(~diskEnableExt),
+		._enable(ism_mode ? ~ism_selonly_ext : ~diskEnableExt),
 		.writeData(writeData),
 		.readData(readDataExt),
 		.advanceDriveHead(advanceDriveHead),
@@ -231,24 +345,282 @@ module swim
 		.dskReadAddr(dskReadAddrExt),
 		.dskReadAck(dskReadAckExt),
 		.dskReadData(dskReadData),
+		.ism_active(ism_mode),
+		.ism_action(ism_mode && ism_mode_reg[3]),
+		.ism_sel(ism_devsel_ext),
 		.mfm_disk(diskMFM[1]),
 		.mfm_hd(diskHD[1]),
-		.mfm_pull(mfm_pull_ext),
 		.mfm_byte(mfm_byte_ext),
 		.mfm_mark(mfm_mark_ext),
-		.mfm_crc0(mfm_crc0_ext)
+		.mfm_crc0(mfm_crc0_ext),
+		.mfm_stb(mfm_stb_ext)
 	);
 
 	wire [7:0] readData = selectExternalDrive ? readDataExt : readDataInt;
 	wire newByteReady = selectExternalDrive ? newByteReadyExt : newByteReadyInt;
 
-	// active drive's MFM (ISM) decoded byte + flags
-	wire [7:0] mfm_byte_sel = selectExternalDrive ? mfm_byte_ext : mfm_byte_int;
-	wire mfm_mark_sel = selectExternalDrive ? mfm_mark_ext : mfm_mark_int;
-	wire mfm_crc0_sel = selectExternalDrive ? mfm_crc0_ext : mfm_crc0_int;
-	wire mfm_sense    = selectExternalDrive ? senseExt : senseInt;  // write-protect/sense
-	// ISM MFM-read active: ISM personality + ACTION (mode bit3) + read (mode bit4=0)
-	wire ism_read_active = ism_mode && ism_mode_reg[3] && !ism_mode_reg[4];
+	// ISM-selected drive's MFM delivery + sense. Sense in ISM mode is polled
+	// through Handshake bit3 and must follow the ISM devsel (both drives
+	// disabled -> readData floats FF -> pull-up 1, matching hardware).
+	wire [7:0] mfm_byte_sel = ism_devsel_ext ? mfm_byte_ext : mfm_byte_int;
+	wire mfm_mark_sel = ism_devsel_ext ? mfm_mark_ext : mfm_mark_int;
+	wire mfm_crc0_sel = ism_devsel_ext ? mfm_crc0_ext : mfm_crc0_int;
+	wire mfm_stb_sel  = ism_devsel_ext ? mfm_stb_ext  : mfm_stb_int;
+	wire ism_sense    = ism_devsel_ext ? senseExt : senseInt;
+	// ISM read armed: (mode & 0x18) == 0x08 (ACTION on, WRITE off) — swim1.cpp.
+	wire ism_arm = ism_mode && ism_mode_reg[3] && !ism_mode_reg[4];
+	// MFM delivery additionally requires the MFM read datapath (Setup bit2=0
+	// selects MFM vs GCR on the READ side — swim1.cpp:377).
+	wire ism_read_active = ism_arm && !ism_setup[2];
+
+	always @(posedge clk) begin
+		dbg_err_d <= ism_error;
+		dbg_ra_d  <= ism_read_active;
+		if (~dbg_err_d[0] & ism_error[0] & (dbg_flpe_ovr != 8'hFF)) dbg_flpe_ovr <= dbg_flpe_ovr + 1'd1;
+		if (~dbg_err_d[2] & ism_error[2] & (dbg_flpe_unr != 8'hFF)) dbg_flpe_unr <= dbg_flpe_unr + 1'd1;
+		if (~dbg_ra_d  & ism_read_active & (dbg_flpe_arm != 8'hFF)) dbg_flpe_arm <= dbg_flpe_arm + 1'd1;
+	end
+	assign dbg_ism_flpe = {5'b0, ism_error, dbg_flpe_arm, dbg_flpe_ovr, dbg_flpe_unr};
+
+	// ── VERDICT-BIT forensics (2026-08-05) ─────────────────────────────────
+	// The ROM decides a field good/bad from ONE handshake sample taken at the
+	// CRC-low byte: `d5 & 0x22` (ROM a6ef86/a6ef96) = b5 (error pending) OR
+	// b1 (running CRC != 0 on the NEWEST fifo entry). Everything else about a
+	// sector can be perfect and the field is still rejected -> retry ->
+	// -69/-72 -> retries exhausted -> the -81 sectNFErr the guest reports.
+	//
+	// Neither bit leaves any trace in the existing counters, which is why a
+	// whole-disk copy shows miss_cnt=0, ovr=0 and still fails ~1 file in 6.
+	// These count, over handshake READS only (the sample the ROM actually
+	// takes), how often each verdict bit was hot, plus how often the CPU
+	// popped with the FIFO holding TWO entries — the state in which b1/b0
+	// describe the byte AFTER the one being popped (a real SWIM1's 2-deep
+	// FIFO cannot run further ahead; our 16-deep staging ring can hold that
+	// state for a whole field, which would make the poisoning persistent
+	// across the ROM's retries exactly as observed).
+	wire hs_read_now = acc_end && ism_mode && acc_rw_l && (acc_addr_l[2:0] == 3'h7);
+	// ★ POISONED sample, detected exactly: the byte the CPU is about to pop is
+	// a CRC byte (crc0 set, so the field IS good) while the FIFO also holds a
+	// NEWER byte whose running CRC is nonzero — the newer one is what b1
+	// reports, so the ROM reads "CRC bad" for a field it read perfectly.
+	// (Counting raw b1-hot reads is useless: b1 is legitimately hot for every
+	// byte except a field's last CRC byte, so it saturates in seconds —
+	// measured 65535 during a mount on build c150e907.)
+	wire hs_poison_now = (ism_fifo_pos == 2'd2) &&
+	                      ism_fifo[0][FIFO_B_CRC0] &&
+	                     ~ism_fifo[1][FIFO_B_CRC0];
+	reg [15:0] dbg_hs_b1 = 0, dbg_hs_b5 = 0;
+	always @(posedge clk) begin
+		if (cen) begin
+			if (hs_read_now && hs_poison_now && dbg_hs_b1 != 16'hFFFF)
+				dbg_hs_b1 <= dbg_hs_b1 + 1'd1;
+			if (hs_read_now && (ism_error != 0) && dbg_hs_b5 != 16'hFFFF)
+				dbg_hs_b5 <= dbg_hs_b5 + 1'd1;
+		end
+	end
+	assign dbg_ism_verdict = {dbg_hs_b1, dbg_hs_b5};
+
+	// ── UNR-FORENSIC latch (2026-08-05, the residual armed pop-empty) ──────
+	// error[2] has TWO setters: a pop with the FIFO empty and a CPU push with
+	// it full. The ROM disassembly proves every pop is b7-guarded and every
+	// primitive disarms on every exit path, and swim-internal logic cannot
+	// empty the FIFO between the b7 sample and the pop — so a residual onset
+	// is telling us something structural (spurious extra acc_end, phantom
+	// handshake data, or a genuine push). Latch the discriminating state at
+	// the FIRST onset; count all of them in [31:28].
+	//   [31:28] onset count (saturating)   [27] 1=push-full 0=pop-empty
+	//   [26] ism_arm  [25] mfm_synced  [24] stage_cnt[4]
+	//   [23:16] ism_mode_reg  [15:12] acc_addr_l  [11:8] stage_cnt[3:0]
+	//   [7:6] fifo_pos  [5:0] spare
+	wire unr_pop_now  = ism_pop_req  && (ism_fifo_pos == 2'd0);
+	wire unr_push_now = ism_cpu_push && (ism_fifo_pos == 2'd2);
+	reg [31:0] dbg_unr_latch = 32'd0;
+	always @(posedge clk) begin
+		if (cen && (unr_pop_now || unr_push_now)) begin
+			if (dbg_unr_latch[31:28] == 4'd0)
+				dbg_unr_latch[27:0] <= {unr_push_now, ism_arm, mfm_synced,
+				                        ism_stage_cnt[4], ism_mode_reg,
+				                        acc_addr_l, ism_stage_cnt[3:0],
+				                        ism_fifo_pos, 6'b0};
+			if (dbg_unr_latch[31:28] != 4'hF)
+				dbg_unr_latch[31:28] <= dbg_unr_latch[31:28] + 1'd1;
+		end
+	end
+	assign dbg_ism_unrlatch = dbg_unr_latch;
+
+	// ── SCAN-WITNESS (2026-08-05 pm, supersedes the ID-WITNESS) ───────────
+	// Ground truth this instrument rests on (MAME 0.264 runtime + ROM disasm,
+	// docs/sony_driver_mfm_read_reference.md):
+	//   * The -81 give-up budget seed SonyVars+46 = 0x40 = 64 unwanted IDs
+	//     (~3.5 revolutions), measured live in MAME. MAME's deepest healthy
+	//     scan consumed 17 of 64 — exactly the one-revolution physics bound.
+	//   * A delivery outage or CRC-bad ID CANNOT produce -81: the ID
+	//     primitive's 20000-poll timeout returns -67 (ROM a6ee40/a6ee76) and
+	//     a bad ID CRC returns -69 (a6eed0); both retry via SonyVars+43 and
+	//     post FFBD/FFBB. The dialogs show FFAF (-81) only.
+	//   * Therefore -81 REQUIRES ~64 CRC-good, right-cyl/head, unwanted IDs
+	//     in one scan — the target's ID skipped on >= 3 consecutive
+	//     revolutions. Between attempts the driver SLEEPS via a timer
+	//     (a6d592, d0=75 for MFM -> [$568] after /10) with interrupts open
+	//     (a6d58c), so the attempt cadence is timer-paced against the
+	//     disk-paced 11.1 ms sector slots — a stroboscope. A phase-locked
+	//     wake (e.g. always +3.4 ms late) advances the catch TWO slots per
+	//     attempt; 18 sectors being even, a stride-2 walk cycles 9 sectors
+	//     forever and the target's parity class is never sampled.
+	//
+	// What is measured, all on generator pushes (what the CPU is served):
+	//   scw_run[7:0]   consecutive ID fields since the last CONSUMED data
+	//                  field (>= 64 payload bytes streamed = the driver was
+	//                  reading it; a free FB catch dies at ~2-3 bytes because
+	//                  the ROM re-arms through CLRFIFO at a6ee46). At a -81
+	//                  post this reads ~the budget actually burned: ~64
+	//                  confirms the model; ~17 means the model is wrong.
+	//   scw_par[1:0]   {odd R seen, even R seen} since the last consumed
+	//                  data field. A full-budget scan with ONE parity bit set
+	//                  = the stride-2 stroboscope, case closed.
+	//   scw_hunt_ms[7:0] duration of the current/last ARMED window, ms:
+	//                  short (<1) = per-ID windows, the healthy shape.
+	//   scw_gap_us[13:0] us since the last delivery inside an armed+synced
+	//                  window (held across disarm): the served-side
+	//                  starvation witness, pairs with dbg_mfm_stall.
+	// MacLC.sv latches dbg_ism_scan into HUD row 7 at each 0xFFAF post.
+	reg [1:0]  scw_mark_run;
+	reg [2:0]  scw_phase;      // 0=idle, 1..4 = C,H,R,N byte positions
+	reg [6:0]  scw_fbrun;      // payload bytes streamed since the last FB
+	reg [7:0]  scw_run;
+	reg [1:0]  scw_par;
+	reg [7:0]  scw_hunt_ms;
+	reg [13:0] scw_gap_us;
+	reg [2:0]  scw_pre_us;     // /8 of cen ~= 0.985 us
+	reg [9:0]  scw_pre_ms;     // /1024 of us ticks ~= 1.008 ms
+	always @(posedge clk or negedge _reset) begin
+		if (!_reset) begin
+			scw_mark_run <= 2'd0; scw_phase <= 3'd0; scw_fbrun <= 7'd0;
+			scw_run <= 8'd0;      scw_par <= 2'd0;
+			scw_hunt_ms <= 8'd0;  scw_gap_us <= 14'd0;
+			scw_pre_us <= 3'd0;   scw_pre_ms <= 10'd0;
+		end
+		else if (cen) begin
+			scw_pre_us <= scw_pre_us + 3'd1;
+
+			// armed-window timer: reset on the arm rising edge (ism_arm_d is
+			// the main block's delayed copy, read-only here — same edge), run
+			// while armed, hold the final value across the disarmed gap.
+			if (ism_arm && !ism_arm_d) begin
+				scw_hunt_ms <= 8'd0;
+				scw_pre_ms  <= 10'd0;
+			end
+			else if (ism_arm && scw_pre_us == 3'd7) begin
+				scw_pre_ms <= scw_pre_ms + 10'd1;
+				if (scw_pre_ms == 10'd1023 && scw_hunt_ms != 8'hFF)
+					scw_hunt_ms <= scw_hunt_ms + 8'd1;
+			end
+
+			// inter-delivery gap: cleared by every push (the syncing mark is
+			// itself a push, so counting restarts fresh each window), counts
+			// only inside an armed+synced stream, held across disarm.
+			if (ism_gen_push)
+				scw_gap_us <= 14'd0;
+			else if (ism_arm && mfm_synced && scw_pre_us == 3'd7 &&
+			         scw_gap_us != 14'h3FFF)
+				scw_gap_us <= scw_gap_us + 14'd1;
+
+			// delivered-stream parser
+			if (ism_gen_push) begin
+				if (mfm_mark_sel && mfm_byte_sel == 8'hA1) begin
+					if (scw_mark_run != 2'd3) scw_mark_run <= scw_mark_run + 2'd1;
+					scw_phase <= 3'd0;
+					scw_fbrun <= 7'd0;
+				end
+				else begin
+					if (scw_mark_run == 2'd3 && mfm_byte_sel == 8'hFE) begin
+						scw_phase <= 3'd1;               // IDAM: C H R N follow
+						scw_fbrun <= 7'd0;
+						if (scw_run != 8'hFF) scw_run <= scw_run + 8'd1;
+					end
+					else if (scw_mark_run == 2'd3 && mfm_byte_sel == 8'hFB) begin
+						scw_fbrun <= 7'd1;               // data field opened
+					end
+					else begin
+						if (scw_phase != 3'd0) begin
+							if (scw_phase == 3'd3)       // this byte is R (1-based)
+								scw_par <= scw_par |
+								           {mfm_byte_sel[0], ~mfm_byte_sel[0]};
+							scw_phase <= (scw_phase == 3'd4) ? 3'd0
+							                                 : scw_phase + 3'd1;
+						end
+						if (scw_fbrun != 7'd0) begin
+							if (scw_fbrun == 7'd64) begin // driver is consuming it
+								scw_run   <= 8'd0;
+								scw_par   <= 2'd0;
+								scw_fbrun <= 7'd0;
+							end else
+								scw_fbrun <= scw_fbrun + 7'd1;
+						end
+					end
+					scw_mark_run <= 2'd0;
+				end
+			end
+		end
+	end
+	assign dbg_ism_scan = {scw_run, scw_hunt_ms, scw_par, scw_gap_us};
+	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
+	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
+	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};
+
+	// ISM FIFO transaction requests (consumed in the clocked block below).
+	// CPU pop/push commit at acc_end; the generator pushes on the delivery
+	// strobe, but only once the mark hunt has synced (or at the syncing A1).
+	// ★ A Data/Mark read with ACTION clear is NOT a pop (Snow ism.rs:228 —
+	// `if !self.ism_mode.action() { return Some(0xFF); }`). The LC ROM's
+	// session teardown/init probes the data and mark registers with the
+	// engine disarmed (a6ea9e/a6eaf0/a6eb64); popping there hits an empty
+	// FIFO and latches ism_error[2].
+	//
+	// That latched error is NOT cosmetic: Handshake b5 = "error pending", and
+	// the ROM's per-field verdict is ONE handshake sample tested as
+	// `d5 & 0x22` (a6ef86/a6ef96). While the error stays latched, every
+	// handshake read reports b5, so a field whose data was read perfectly is
+	// rejected -> retry -> retries exhausted -> the -81 sectNFErr / -65
+	// offLinErr the guest shows as "couldn't be read, a disk error occurred".
+	// Measured on hardware (build d0cbdd30, HUD row 7): 14 underrun onsets ->
+	// 553 handshake reads with b5 hot across one whole-disk copy, while the
+	// b1 (CRC-on-newest) poisoning count was exactly 0.
+	wire ism_pop_req  = acc_end && ism_mode && acc_rw_l && ism_mode_reg[3] &&
+	                    (acc_addr_l[2:0] == 3'h0 || acc_addr_l[2:0] == 3'h1);
+	wire ism_cpu_push = acc_end && ism_mode && !acc_rw_l &&
+	                    (acc_addr_l[2:0] == 3'h0 || acc_addr_l[2:0] == 3'h1 ||
+	                     acc_addr_l[2:0] == 3'h2);
+	wire ism_gen_push = ism_read_active && mfm_stb_sel &&
+	                    (mfm_synced || mfm_mark_sel);
+	wire [15:0] ism_gen_word = {5'b0, mfm_crc0_sel, 1'b0, mfm_mark_sel, mfm_byte_sel};
+	// staging flow control: push on delivery (unless full), drain into the
+	// 2-entry FIFO on quiet cycles (CPU FIFO events only fire at acc_end)
+	wire stage_push  = ism_gen_push && (ism_stage_cnt != 5'd16);
+	wire stage_drain = (ism_stage_cnt != 5'd0) && (ism_fifo_pos < 2'd2) && !acc_end;
+	wire [15:0] ism_cpu_word = (acc_addr_l[2:0] == 3'h2) ? 16'h0200 :
+	                           (acc_addr_l[2:0] == 3'h1) ? {7'b0, 1'b1, acc_data_l} :
+	                                                       {8'b0, acc_data_l};
+
+`ifdef SIMULATION
+	reg [7:0]  dbg_arm_cnt = 0;
+	reg [15:0] dbg_pop_cnt = 0;
+	reg [15:0] dbg_hs_cnt = 0;
+	reg [7:0]  dbg_hs_last = 0;
+	reg [15:0] dbg_hs_rpt = 0;
+	reg [15:0] dbg_mode_cnt = 0;
+	reg [7:0]  dbg_err_cnt = 0;
+	// live Handshake value (same expression as the read mux)
+	wire [7:0] dbg_hs_now = {
+		ism_mode_reg[4] ? (ism_fifo_pos <= 1) : (ism_fifo_pos != 0),
+		ism_mode_reg[4] ? (ism_fifo_pos == 0) : (ism_fifo_pos == 2),
+		(ism_error != 0),
+		1'b0,
+		ism_sense,
+		1'b0,
+		(ism_fifo_pos != 0) && ~ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_CRC0],
+		(ism_fifo_pos != 0) &&  ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_MARK]};
+`endif
 
 	reg [4:0] iwmMode;
 	/* IWM mode register: S C M H L
@@ -334,34 +706,46 @@ module swim
 		if (ism_mode) begin
 			// ISM mode reads
 			case (ism_reg_addr)
-				// Data ($0) / Mark ($1): during an MFM read, return the generator's
-				// current decoded byte (mark status is in the handshake); otherwise
-				// the legacy CPU-written FIFO.
-				3'h0:
-					dataOutLo = ism_read_active ? mfm_byte_sel
-					          : (ism_fifo_pos == 0) ? 8'h00 : ism_fifo[0][7:0];
-				3'h1:
-					dataOutLo = ism_read_active ? mfm_byte_sel
-					          : (ism_fifo_pos == 0) ? 8'h00 : ism_fifo[0][7:0];
+				// Data ($0) / Mark ($1): head of the real 2-entry FIFO. The pop
+				// side-effect commits at access end (acc_end), so the value is
+				// stable for the whole CPU access. Empty pop floats FF (Snow
+				// ism.rs; the underrun error is raised in the pop transaction).
+				// With ACTION clear this is a disarmed probe, not a pop: return
+				// FF and leave the FIFO/error alone (Snow ism.rs:228). See the
+				// ism_pop_req comment — a spurious error here poisons the ROM's
+				// `d5 & 0x22` field verdict through Handshake b5.
+				3'h0, 3'h1:
+					dataOutLo = (!ism_mode_reg[3] || ism_fifo_pos == 0)
+					            ? 8'hFF : ism_fifo[0][7:0];
 				3'h2: // Error register
 					dataOutLo = ism_error;
 				3'h3: // Param[idx]
 					dataOutLo = ism_param[ism_param_idx];
-				3'h4: // Phases
-					dataOutLo = {4'b0000, lstrb, ca2, ca1, ca0};
+				3'h4: // Phases: all 8 written bits read back (low nibble = the
+				      // live phase lines, high nibble = latched output enables).
+				      // The ROM's SWIM self-test walks F5,F6,..F0 through here. F2.
+					dataOutLo = {ism_phase_oe, lstrb, ca2, ca1, ca0};
 				3'h5: // Setup register
 					dataOutLo = ism_setup;
 				3'h6: // Mode register
 					dataOutLo = ism_mode_reg;
-				// Handshake ($7), MAME swim1.cpp: b7 data-avail, b6 full, b5 error,
-				// b3/b2 sense/wprot (SWIM1 drives both), b1 CRC (0=good), b0 mark.
-				// In MFM read a byte is always ready, so b7/b6=1.
+				// Handshake ($7) — MAME swim1.cpp:224-250. Read mode: b7 = FIFO
+				// not-empty (data available), b6 = full; write mode inverts to
+				// space-available. b5 = error pending, b3 = drive sense (b2 is
+				// rddata, not sense — 0.264 correction). b1/b0 describe the
+				// NEWEST fifo entry (0.264 groundtruth): b1 = 0 when its
+				// running CRC == 0 (good), b0 = it is a MARK; both read 0 with
+				// an empty FIFO. b7=0 between fields is the hunt-loop poll.
 				3'h7:
-					dataOutLo = ism_read_active
-						? {1'b1, 1'b1, (ism_error != 0), 1'b0,
-						   mfm_sense, mfm_sense, ~mfm_crc0_sel, mfm_mark_sel}
-						: {(ism_fifo_pos != 0), (ism_fifo_pos < 2), (ism_error != 0),
-						   1'b0, mfm_sense, 3'b000};
+					dataOutLo = {
+						ism_mode_reg[4] ? (ism_fifo_pos <= 1) : (ism_fifo_pos != 0),
+						ism_mode_reg[4] ? (ism_fifo_pos == 0) : (ism_fifo_pos == 2),
+						(ism_error != 0),
+						1'b0,
+						ism_sense,
+						1'b0,
+						(ism_fifo_pos != 0) && ~ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_CRC0],
+						(ism_fifo_pos != 0) &&  ism_fifo[(ism_fifo_pos == 2'd2) ? 1 : 0][FIFO_B_MARK]};
 			endcase
 		end
 		else begin
@@ -396,6 +780,7 @@ module swim
 			ism_error <= 0;
 			ism_param_idx <= 0;
 			ism_fifo_pos <= 0;
+			ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
 			iwm_to_ism_counter <= 0;
 			ism_fifo[0] <= 0;
 			ism_fifo[1] <= 0;
@@ -409,8 +794,13 @@ module swim
 			selectExternalDrive <= 0;
 			q6 <= 0;
 			q7 <= 0;
-			mfm_advance <= 1'b0;
-			ism_rd_armed <= 1'b1;
+			swim_acc_d <= 1'b0;
+			acc_addr_l <= 4'h0;
+			acc_rw_l <= 1'b1;
+			acc_data_l <= 8'h00;
+			ism_phase_oe <= 4'h0;
+			mfm_synced <= 1'b0;
+			ism_arm_d <= 1'b0;
 		end
 		else if(cen) begin
 			// Default: update IWM bit registers from combinational next-state
@@ -424,162 +814,240 @@ module swim
 			q6 <= q6Next;
 			q7 <= q7Next;
 
-			if (_cpuRW == 0 && selectSWIM == 1'b1 && _cpuUDS == 1'b0) begin
-				if (ism_mode) begin
-					// ============================================
-					// ISM mode writes
-					// ============================================
-					case (ism_reg_addr)
-						3'h0: begin // Push data to FIFO
-							if (ism_fifo_pos < 2) begin
-								ism_fifo[ism_fifo_pos] <= {8'h00, dataInLo};
-								ism_fifo_pos <= ism_fifo_pos + 1'b1;
-							end else begin
-								ism_error[0] <= 1'b1; // FIFO overflow
-							end
-						end
-						3'h1: begin // Push data + mark to FIFO
-							if (ism_fifo_pos < 2) begin
-								ism_fifo[ism_fifo_pos] <= {FIFO_MARK, dataInLo};
-								ism_fifo_pos <= ism_fifo_pos + 1'b1;
-							end else begin
-								ism_error[0] <= 1'b1;
-							end
-						end
-						3'h2: begin // Push CRC to FIFO
-							if (ism_fifo_pos < 2) begin
-								ism_fifo[ism_fifo_pos] <= {FIFO_CRC, 8'h00};
-								ism_fifo_pos <= ism_fifo_pos + 1'b1;
-							end else begin
-								ism_error[0] <= 1'b1;
-							end
-						end
-						3'h3: begin // Write param[idx], auto-increment
-							ism_param[ism_param_idx] <= dataInLo;
+			// IWM-mode writes (level-held across the access, idempotent; all
+			// ISM register semantics commit once per access at acc_end below).
+			// Mode-vs-data dispatch matches MAME: with {q7,q6}=11 a write goes
+			// to the data register if a drive is enabled, else to the IWM mode
+			// register. The IWM->ISM switch detector no longer lives here —
+			// it keys on offset-0xF accesses (F1), see below.
+			if (_cpuRW == 0 && selectSWIM == 1'b1 && _cpuUDS == 1'b0 && !ism_mode) begin
+				if ({q7Next,q6Next} == 2'b11) begin
+					if (diskEnableExt | diskEnableInt)
+						writeData <= dataInLo;
+					else
+						iwmMode <= dataInLo[4:0];
+				end
+			end
+
+			// --- SWIM access bookkeeping: latch the access while UDS is low;
+			// side effects commit once, at the deassert edge (acc_end).
+			swim_acc_d <= swim_acc;
+			if (swim_acc) begin
+				acc_addr_l <= cpuAddrRegHi;
+				acc_rw_l   <= _cpuRW;
+				acc_data_l <= dataInLo;
+
+				// MAME's "any non-0xF SWIM access resets the switch counter" is
+				// applied LEVEL-wise, not at acc_end: cen is clk_sys/4, so two
+				// back-to-back CPU accesses can share a single sampled UDS-low
+				// window and merge into one acc_end. A missed reset is the one
+				// error that matters here — it lets an unrelated run of mode
+				// register writes complete the 1,0,1,1 pattern and drop us into
+				// ISM behind the driver's back. Resetting early is harmless: the
+				// deliberate switch sequence is four consecutive 0xF writes.
+				if (!ism_mode && cpuAddrRegHi != 4'hF) iwm_to_ism_counter <= 0;
+			end
+
+			// ============================================================
+			// ISM FIFO transactions. Generator deliveries land in the
+			// staging ring; the drain refills the 2-entry CPU FIFO on
+			// cycles without CPU FIFO events (those only fire at acc_end),
+			// so every CPU-visible semantic (pop order, handshake bits,
+			// self-test full-at-2) is unchanged. A reg0 pop of a MARK byte
+			// flags Error b1; pop-empty / cpu-push-full flag Error b2;
+			// a delivery with the STAGE full drops the byte and flags
+			// Error b0 (read overrun) exactly as the 2-deep design did —
+			// the threshold just moved from ~49us of poll stall to ~290us.
+			// ============================================================
+			// stage_cnt arithmetic first: any FIFO-clear later in this
+			// block overrides it (last nonblocking write wins).
+			ism_stage_cnt <= ism_stage_cnt + {4'd0, stage_push} - {4'd0, stage_drain};
+			if (stage_push) begin
+				ism_stage[ism_stage_wr] <= ism_gen_word;
+				ism_stage_wr <= ism_stage_wr + 4'd1;
+			end
+			if (ism_gen_push && ism_stage_cnt == 5'd16)
+				ism_error[0] <= 1'b1;          // overrun: delivered byte lost
+				                               // (MAME swim1 read-side push-full
+				                               // = error 0x01, byte dropped;
+				                               // CPU-side push-full stays 0x04)
+			if (stage_drain) begin
+				ism_fifo[ism_fifo_pos[0]] <= ism_stage[ism_stage_rd];
+				ism_fifo_pos <= ism_fifo_pos + 2'd1;
+				ism_stage_rd <= ism_stage_rd + 4'd1;
+			end
+			if (ism_pop_req) begin
+				if (ism_fifo_pos != 0) begin
+					ism_fifo[0]  <= ism_fifo[1];
+					ism_fifo_pos <= ism_fifo_pos - 2'd1;
+					if (acc_addr_l[2:0] == 3'h0 && ism_fifo[0][FIFO_B_MARK]) ism_error[1] <= 1'b1;
+				end else
+					ism_error[2] <= 1'b1;          // underrun
+			end
+			else if (ism_cpu_push) begin
+				if (ism_fifo_pos < 2'd2) begin
+					ism_fifo[ism_fifo_pos[0]] <= ism_cpu_word;
+					ism_fifo_pos <= ism_fifo_pos + 2'd1;
+				end else
+					ism_error[2] <= 1'b1;
+			end
+
+			// Mark-hunt: the first delivered A1 after a read-arm sets sync;
+			// bytes before it (gaps, partial fields) are dropped, which is
+			// what makes Handshake b7 read 0 between fields while hunting.
+			if (ism_read_active && mfm_stb_sel && !mfm_synced && mfm_mark_sel)
+				mfm_synced <= 1'b1;
+
+			// ============================================================
+			// ISM register side effects — once per CPU access, at acc_end
+			// ============================================================
+			if (acc_end && ism_mode) begin
+				if (!acc_rw_l) begin
+					case (acc_addr_l[2:0])
+						// 0/1/2 (FIFO pushes) are in the transaction above
+						3'h3: begin // Param[idx] write, auto-increment
+							ism_param[ism_param_idx] <= acc_data_l;
 							ism_param_idx <= ism_param_idx + 1'b1;
 						end
-						3'h4: begin // Set phases
-							ca0 <= dataInLo[0];
-							ca1 <= dataInLo[1];
-							ca2 <= dataInLo[2];
-							lstrb <= dataInLo[3];
+						3'h4: begin // Phases: low nibble drives the lines (the
+						            // shared lstrb edge in floppy.v serves ISM
+						            // strobes too); high nibble latched for the
+						            // 8-bit readback the ROM self-test needs. F2.
+							ca0   <= acc_data_l[0];
+							ca1   <= acc_data_l[1];
+							ca2   <= acc_data_l[2];
+							lstrb <= acc_data_l[3];
+							ism_phase_oe <= acc_data_l[7:4];
 						end
-						3'h5: // Set setup register
-							ism_setup <= dataInLo;
+						3'h5:
+							ism_setup <= acc_data_l;
 						3'h6: begin // Mode clear (AND ~data)
-							ism_mode_reg <= ism_mode_reg & ~dataInLo;
-							// If bit 6 is cleared, switch back to IWM mode
-							if (dataInLo[6]) begin
-								ism_mode <= 0;
+							ism_mode_reg  <= ism_mode_reg & ~acc_data_l;
+							ism_param_idx <= 0;  // MAME: ModeClr always resets param idx
+							if (acc_data_l[6]) begin
+								ism_mode <= 0;   // bit6 cleared -> back to IWM
 								iwm_to_ism_counter <= 0;
+`ifdef SIMULATION
+								$display("SWIM: ISM -> IWM (ModeClr %02x) @%0t", acc_data_l, $time);
+`endif
 							end
-							// If bit 0 (clear) is set after write, clear FIFO
-							if ((ism_mode_reg & ~dataInLo) & 8'h01) begin
+							if ((ism_mode_reg & ~acc_data_l) & 8'h01) begin
 								ism_fifo_pos <= 0;
+								ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
 							end
 						end
 						3'h7: begin // Mode set (OR data)
-							ism_mode_reg <= ism_mode_reg | dataInLo;
-							// If bit 0 (clear) is set, clear FIFO
-							if ((ism_mode_reg | dataInLo) & 8'h01) begin
+							ism_mode_reg <= ism_mode_reg | acc_data_l;
+							if ((ism_mode_reg | acc_data_l) & 8'h01) begin
 								ism_fifo_pos <= 0;
+								ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
 							end
 						end
+						default: ;
 					endcase
 				end
 				else begin
-					// ============================================
-					// IWM mode writes
-					// ============================================
-					case ({q7Next,q6Next})
-						2'b11: begin
-							if (diskEnableExt | diskEnableInt) begin
-								writeData <= dataInLo;
+					// read side effects (FIFO pops are in the transaction above)
+					if (acc_addr_l[2:0] == 3'h2) ism_error <= 0;
+					if (acc_addr_l[2:0] == 3'h3) ism_param_idx <= ism_param_idx + 1'b1;
+				end
+			end
 
-								// IWM-to-ISM mode switch detector
-								// Sequence: bit6=1, bit6=0, bit6=1, bit6=1
-								// Reference: MAME swim1.cpp lines 554-579
-								case (iwm_to_ism_counter)
-									2'd0: begin
-										if (dataInLo[6])
-											iwm_to_ism_counter <= 2'd1;
-									end
-									2'd1: begin
-										if (!dataInLo[6])
-											iwm_to_ism_counter <= 2'd2;
-										else
-											iwm_to_ism_counter <= 2'd0;
-									end
-									2'd2: begin
-										if (dataInLo[6])
-											iwm_to_ism_counter <= 2'd3;
-										else
-											iwm_to_ism_counter <= 2'd0;
-									end
-									2'd3: begin
-										if (dataInLo[6]) begin
-											// Switch to ISM mode!
-											ism_mode <= 1;
-											ism_mode_reg <= 8'h40; // bit 6 = ISM mode active
-											ism_error <= 0;
-											ism_fifo_pos <= 0;
-											ism_param_idx <= 0;
-											iwm_to_ism_counter <= 0;
+			// ============================================================
+			// IWM->ISM switch detector — MAME swim1.cpp: the counter runs
+			// ONLY on offset-0xF accesses (write: data bit6, pattern
+			// 1,0,1,1; a read acts as data=0); ANY other SWIM access resets
+			// it. Drive enables are irrelevant — the LC ROM performs the
+			// switch with all drives disabled (and GCR sector-write data,
+			// which false-fired the old data-keyed detector, goes to offset
+			// 0xD, which now resets instead). F1.
+			// ============================================================
+			if (acc_end && !ism_mode) begin
+				if (acc_addr_l == 4'hF) begin
+					if (acc_rw_l ? 1'b0 : acc_data_l[6]) begin
+						case (iwm_to_ism_counter)
+							2'd0: iwm_to_ism_counter <= 2'd1;
+							2'd1: iwm_to_ism_counter <= 2'd0;
+							2'd2: iwm_to_ism_counter <= 2'd3;
+							2'd3: begin // 1,0,1,1 complete -> enter ISM
+								ism_mode      <= 1;
+								ism_mode_reg  <= 8'h40;
+								ism_error     <= 0;
+								ism_fifo_pos  <= 0;
+								ism_param_idx <= 0;
+								mfm_synced    <= 1'b0;
+								iwm_to_ism_counter <= 0;
 `ifdef SIMULATION
-											$display("SWIM: Switched to ISM mode @%0t", $time);
+								$display("SWIM: switched to ISM mode @%0t", $time);
 `endif
-										end
-										else
-											iwm_to_ism_counter <= 2'd0;
-									end
-								endcase
 							end
-							else begin
-								iwmMode <= dataInLo[4:0];
-								iwm_to_ism_counter <= 0; // reset counter when not enabled
-							end
-						end
-						default: begin
-							iwm_to_ism_counter <= 0; // reset on non-Q7Q6 writes
-						end
-					endcase
+						endcase
+					end else
+						iwm_to_ism_counter <= (iwm_to_ism_counter == 2'd1) ? 2'd2 : 2'd0;
 				end
+				else
+					iwm_to_ism_counter <= 0;
 			end
 
-			// ISM mode: clear error register on read
-			if (ism_mode && _cpuRW == 1 && selectSWIM == 1'b1 && _cpuUDS == 1'b0) begin
-				if (ism_reg_addr == 3'h2) begin
-					ism_error <= 0;
-				end
-				// Auto-increment param index on read
-				if (ism_reg_addr == 3'h3) begin
-					ism_param_idx <= ism_param_idx + 1'b1;
-				end
-				// FIFO pop on data or mark read
-				if (ism_reg_addr == 3'h0 || ism_reg_addr == 3'h1) begin
-					if (ism_fifo_pos > 0) begin
-						ism_fifo[0] <= ism_fifo[1];
-						ism_fifo[1] <= 0;
-						ism_fifo_pos <= ism_fifo_pos - 1'b1;
+			// F8: entering read mode ((mode & 0x18) == 0x08 rising) restarts
+			// the mark hunt and empties the FIFO — the per-field re-arm the
+			// driver performs 18+ times per revolution.
+			ism_arm_d <= ism_arm;
+			if (ism_arm && !ism_arm_d) begin
+				mfm_synced   <= 1'b0;
+				ism_fifo_pos <= 0;
+				ism_stage_rd <= 0; ism_stage_wr <= 0; ism_stage_cnt <= 0;
+			end
+
+`ifdef SIMULATION
+			if (ism_arm && !ism_arm_d && dbg_arm_cnt < 8'd80) begin
+				dbg_arm_cnt <= dbg_arm_cnt + 1'd1;
+				$display("SWIM-ISM: read ARM mode=%02x setup=%02x dev={e%b,i%b} @%0t",
+				         ism_mode_reg, ism_setup, ism_devsel_ext, ism_devsel_int, $time);
+			end
+			if (ism_read_active && mfm_stb_sel && !mfm_synced && mfm_mark_sel && dbg_arm_cnt < 8'd80)
+				$display("SWIM-ISM: mark-sync @%0t", $time);
+			if (ism_pop_req && ism_fifo_pos != 0 && dbg_pop_cnt < 16'd4000) begin
+				dbg_pop_cnt <= dbg_pop_cnt + 1'd1;
+				$display("SWIM-ISM: pop %02x m=%b c0=%b pos=%0d",
+				         ism_fifo[0][7:0], ism_fifo[0][FIFO_B_MARK], ism_fifo[0][FIFO_B_CRC0], ism_fifo_pos);
+			end
+			if (ism_pop_req && ism_fifo_pos == 0 && dbg_err_cnt < 8'd60) begin
+				dbg_err_cnt <= dbg_err_cnt + 1'd1;
+				$display("SWIM-ISM: POP-EMPTY (underrun) @%0t", $time);
+			end
+			if (acc_end && ism_mode && acc_rw_l && acc_addr_l[2:0] == 3'h4)
+				$display("SWIM-ISM: phases rd -> %02x", {ism_phase_oe, lstrb, ca2, ca1, ca0});
+			// Handshake reads, run-length compressed (the hunt loop polls ~2000x
+			// per sector gap; log transitions + a repeat count, hard-capped).
+			if (acc_end && ism_mode && acc_rw_l && acc_addr_l[2:0] == 3'h7) begin
+				if (dbg_hs_now != dbg_hs_last) begin
+					if (dbg_hs_cnt < 16'd20000) begin
+						dbg_hs_cnt <= dbg_hs_cnt + 1'd1;
+						$display("SWIM-ISM: HS %02x (x%0d) -> %02x pos=%0d @%0t",
+						         dbg_hs_last, dbg_hs_rpt, dbg_hs_now, ism_fifo_pos, $time);
 					end
-				end
+					dbg_hs_last <= dbg_hs_now;
+					dbg_hs_rpt  <= 16'd1;
+				end else if (dbg_hs_rpt != 16'hFFFF)
+					dbg_hs_rpt <= dbg_hs_rpt + 1'd1;
 			end
-
-			// ISM MFM-read: advance the generator once per reg0/1 read access (one-
-			// shot, re-armed between accesses). A reg0 read of a mark byte flags
-			// Error bit1 (mark-read-from-data), per MAME swim1.cpp.
-			if (ism_read_active && _cpuRW && selectSWIM && (_cpuUDS == 1'b0) &&
-			    (ism_reg_addr == 3'h0 || ism_reg_addr == 3'h1)) begin
-				if (ism_rd_armed) begin
-					ism_rd_armed <= 1'b0;
-					mfm_advance  <= 1'b1;
-					if (ism_reg_addr == 3'h0 && mfm_mark_sel) ism_error[1] <= 1'b1;
-				end else
-					mfm_advance <= 1'b0;
-			end else begin
-				ism_rd_armed <= 1'b1;
-				mfm_advance  <= 1'b0;
+			// Mode register writes (set/clear) — the per-sector re-arm fingerprint
+			if (acc_end && ism_mode && !acc_rw_l &&
+			    (acc_addr_l[2:0] == 3'h6 || acc_addr_l[2:0] == 3'h7) && dbg_mode_cnt < 16'd1200) begin
+				dbg_mode_cnt <= dbg_mode_cnt + 1'd1;
+				$display("SWIM-ISM: Mode%s %02x -> mode=%02x @%0t",
+				         (acc_addr_l[2:0] == 3'h6) ? "Clr" : "Set", acc_data_l,
+				         (acc_addr_l[2:0] == 3'h6) ? (ism_mode_reg & ~acc_data_l)
+				                                   : (ism_mode_reg | acc_data_l), $time);
 			end
+			if (acc_end && ism_mode && !acc_rw_l && acc_addr_l[2:0] == 3'h5)
+				$display("SWIM-ISM: Setup <= %02x @%0t", acc_data_l, $time);
+			if (acc_end && ism_mode && acc_rw_l && acc_addr_l[2:0] == 3'h2 && ism_error != 0 && dbg_err_cnt < 8'd60) begin
+				dbg_err_cnt <= dbg_err_cnt + 1'd1;
+				$display("SWIM-ISM: Error rd -> %02x (cleared) @%0t", ism_error, $time);
+			end
+`endif
 		end
 	end
 
@@ -587,6 +1055,12 @@ module swim
 	// IWM read data latch (unchanged from original)
 	// ================================================================
 	wire iwmRead = (_cpuRW == 1'b1 && selectSWIM == 1'b1 && _cpuUDS == 1'b0 && !ism_mode);
+	// Access-END edge, so the latch-clear one-shot fires once per read instead
+	// of being retriggered for the whole (E-paced, ~10 cen) VPA access — see
+	// the readLatchClearTimer comment below.
+	reg  iwmRead_d = 1'b0;
+	always @(posedge clk) if (cen) iwmRead_d <= iwmRead;
+	wire iwmReadEnd = iwmRead_d && !iwmRead;
 	wire anyDiskEnable = diskEnableExt | diskEnableInt;
 	reg [3:0] readLatchClearTimer;
 	reg [11:0] readDataArmDelay;   // post-enable squelch (~126 us at 8.125 MHz cen)
@@ -620,9 +1094,26 @@ module swim
 				readDataArmDelay <= 12'h400;
 			end
 
-			// the conclusion of a valid CPU read from the IWM will start the timer to clear the latch
-			else if (iwmRead && readDataLatch[7]) begin
-				readLatchClearTimer <= 4'hD; // clear latch 14 clocks after the conclusion of a valid read
+			// The conclusion of a valid CPU read starts the one-shot that clears
+			// the latch 14 clocks later.
+			//
+			// ★ MUST be edge-triggered on the END of the access (2026-08-05).
+			// `iwmRead` is a LEVEL, true for the whole access. On the Mac Plus
+			// an IWM access is a few cycles, so reloading the timer throughout
+			// it was harmless. On the LC the SWIM sits in VPA space and every
+			// access lasts ~1.23 us (~10 cen) — longer than the 13-cen reload —
+			// and the ROM's GCR poll loop (a6e1a0: VIA1 ORA read, a6e1a6: IWM
+			// data read, both E-paced) comes back every ~2.5 us with only ~11
+			// cen between accesses. Reloading from the level therefore meant the
+			// timer NEVER reached 0: the latch never cleared, and the CPU re-read
+			// the same disk byte ~6 times before the next one overwrote it. The
+			// duplicated bytes shift every following byte in a field, so the
+			// address-field checksum fails -> -69 badCksmErr -> "This disk is
+			// unreadable". Measured in verilator/tb_gcr_read.v: at the realistic
+			// acclen=40/pollgap=40 the reader recovered ONE address field out of
+			// a whole track, and that one had a bad checksum.
+			else if (iwmReadEnd && readDataLatch[7]) begin
+				readLatchClearTimer <= 4'hD;
 			end
 
 			// when the drive indicates that a new byte is ready, latch it (only

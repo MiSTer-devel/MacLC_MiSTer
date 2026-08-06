@@ -1,16 +1,37 @@
 # SWIM ISM-mode MFM READ — register-level reference (for 1.44 MB support)
 
+> **Companion doc:** this file covers the SWIM **hardware** registers (from
+> MAME). For what the boot ROM's **Sony driver** does with them — the read-path
+> routine map, what each error code the guest sees actually means, and the list
+> of theories already tested and refuted — see
+> [`sony_driver_mfm_read_reference.md`](sony_driver_mfm_read_reference.md).
+
 *Ground truth: MAME `swim1.cpp` (the Mac LC instantiates **SWIM1** @ C15M, drive
 `35hd`/`mfd75w` — `src/mame/apple/maclc.cpp`) + Apple SWIM Chip User's Reference.
 Compiled 2026-06-13 from a MAME-source research pass. Use this to implement the
 ISM read path in `rtl/swim.v` + a new MFM track generator. The existing GCR
 (IWM-mode) path in `floppy.v`/`floppy_track_encoder.v` is unrelated and stays.*
 
+> ⚠ **Corrections applied 2026-08-03** (this file was compiled from a MAME
+> *source*-reading pass on 06-13; two claims were later overturned by the MAME
+> 0.264 **runtime** capture in `findings_mame_floppy_groundtruth_2026-07-02.md`,
+> and both had already cost a session each):
+> - **§C: SWIM1 does NOT drive sense on both handshake b2 and b3 — b3 only.**
+>   `swim1.cpp:224-250` (0.264) never sets 0x04; b2 is rddata. Verified against
+>   the source this session.
+> - **§H / below: the SuperDrive identify nibble for an HD disk is `0011`, not
+>   `1011`.** `is_2m` is **1 for DD, 0 for HD** — inverted from what a plain
+>   reading of `floppy.cpp` suggests. `rtl/floppy.v` implements the *correct*
+>   (runtime-verified) polarity; do not "fix" it to match the old text.
+
 ## Key takeaways (why 1.44 MB doesn't work today)
 
 1. **Drive must report SuperDrive.** The OS reads drive **sense reg 0x5** =
    `m_has_mfm`; our `floppy.v` returns `SUPERDR=0`, so the OS never tries MFM.
-   The f..c sense nibble must read **`1011`** for SuperDrive + HD disk.
+   The f..c sense nibble must read **`0011`** for SuperDrive + HD disk
+   (`1011` for SuperDrive + DD). *(Status 2026-08-03: implemented and verified —
+   `verilator/tb_sense.v` sweeps all 16 sense registers against the runtime
+   capture and the identify nibble reads `0011` for an HD disk.)*
 2. **ISM read datapath is unimplemented.** `swim.v`'s ISM FIFO is only filled by
    CPU writes; nothing feeds decoded disk bytes in. Reads return empty.
 3. **Timing is NOT the blocker.** The driver polls Handshake bit7; deliver bytes
@@ -76,7 +97,8 @@ side. **For an MFM read: bit2=0, bit5=1 (IBM).** Those two are load-bearing.
 |----|----|----|----|
 | 0 | 0x01 | top FIFO word has M_MARK | **next byte is a MARK** (A1 sync) |
 | 1 | 0x02 | `!(word & M_CRC0)` | **CRC**: reads **0 when CRC good (==0)**, else 1 |
-| 2,3 | 0x0c | wprot/sense (SWIM1 sets BOTH) | SENSE / write-protect |
+| 2 | 0x04 | **rddata — never set by SWIM1** | (not sense; see correction at top) |
+| 3 | 0x08 | `!m_floppy \|\| m_floppy->wpt_r()` | **SENSE** (the phase-addressed drive register) |
 | 5 | 0x20 | `ism_error != 0` | error pending |
 | 6 | 0x40 | FIFO-full (read: pos==2) | "2 bytes ready" |
 | 7 | 0x80 | FIFO-not-empty (read: pos>=1) | **data available** |
@@ -85,7 +107,22 @@ Bits 7:6 are direction-dependent: in **read** mode pos==2→0xc0, pos==1→0x80,
 pos==0→none (so b7=data-ready, b6=full); in write mode it's inverted
 (space-available). **Read loop:** poll reg7; b7 set → read reg0; b0 tells you the
 byte is a mark; b5 = error; b1 = CRC-good-at-this-byte (0=good). SWIM1 drives
-sense on **both b2 and b3** (SWIM2 only b3).
+sense on **b3 only** — b2 is rddata and is never set (0.264 source, re-verified
+2026-08-03; the earlier "both b2 and b3" claim was wrong).
+
+**b0/b1 describe the NEWEST FIFO entry** (`m_ism_fifo[pos-1]`) and both read 0
+when the FIFO is empty — the guard matters, an empty FIFO must not report a
+stale mark/CRC.
+
+⚠ **b3 is the phase-addressed sense line, so during an MFM read it is the
+INDEX pulse.** The driver parks the phases on RdData0/1 (`Phases = F4`) for the
+whole session, and on a SuperDrive with an MFM disk those sense registers return
+`!index` (MAME `mac_floppy::wpt_r`; Snow `drive.rs`:
+`RDDATA0 | RDDATA1 if mfm && motor => !at_index()`). The Sony driver polls it
+millions of times per session to bound its sector searches, so a floppy model
+that never pulses the index will hang the mount even if every delivered byte is
+correct. Our track generator emits a real once-per-revolution preamble
+(gap4a 80×4E + sync + IAM + gap1 50×4E) and derives the index from it.
 
 ## D) MARK semantics — swim1.cpp:1159-1196
 
@@ -181,8 +218,11 @@ Detection sequence the OS runs:
    zoned CLV).
 4. Program SWIM Setup (bit2=0, bit5=1) + Mode (ISM, read, ACTION) and read.
 
-The f..c sense nibble must read **`1011`** for SuperDrive + HD disk
-(`0011` for SuperDrive + DD).
+The f..c sense nibble must read **`0011`** for SuperDrive + **HD** disk and
+**`1011`** for SuperDrive + **DD** — i.e. `is_2m` is **1 for DD, 0 for HD**.
+(The opposite is written elsewhere in older notes and is WRONG; settled by the
+MAME 0.264 runtime capture, where both disks actually mount. Inverting it sends
+800K disks down MFM and 1.44M disks down GCR, and both then fail.)
 
 **Our drive must report:** 0x5=1, 0xF=1 (HD image) / 0 (800K), 0x6=1, 0xD tracks
 the 0x9/0xD strobes, 0x8=0 (disk in), 0xE=1 (ready).

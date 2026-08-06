@@ -484,9 +484,17 @@ module emu
 	assign CE_PIXEL  = v8_ce_pix;   // constant 1 now (pix_ce tied high below)
 
 	// Video Output — straight V8 video, no overlays.
+`ifdef USE_DBG_HUD
+	// Debug HUD (see the USE_DBG_HUD block near the probe deck): binary
+	// pixel-strip overlay, BOTTOM-left corner, video-only (input untouched).
+	assign VGA_R  = hud_on_q ? hud_px : v8_vga_r;
+	assign VGA_G  = hud_on_q ? hud_px : v8_vga_g;
+	assign VGA_B  = hud_on_q ? hud_px : v8_vga_b;
+`else
 	assign VGA_R  = v8_vga_r;
 	assign VGA_G  = v8_vga_g;
 	assign VGA_B  = v8_vga_b;
+`endif
 	assign VGA_DE = v8_de;
 	assign VGA_VS = v8_vsync;
 	assign VGA_HS = v8_hsync;
@@ -701,6 +709,8 @@ module emu
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
 	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w, dbg_wrfb_w;
+	wire [31:0] dbg_ring0_w, dbg_ring1_w;
+	wire [31:0] dbg_ism_flpe_w;  // read-ring bookkeeping (anchor-only)
 	wire [31:0] dbg_cda0_w, dbg_cda1_w, dbg_cda2_w, dbg_cda3_w, dbg_cda4_w;
 	wire [31:0] dbg_cdur_w;
 	wire [23:0] overlay_trigger_addr;
@@ -1162,6 +1172,16 @@ module emu
 	wire        dbg_flp_byte_stb;
 	wire [7:0]  dbg_flp_raw;
 	wire [21:0] dbg_flp_gcr_addr;
+	wire [31:0] dbg_ism_verdict_w;
+	wire [31:0] dbg_ism_unrlatch_w;
+	wire [31:0] dbg_ism_scan_w;
+	wire [23:0] dbg_mfm_stall_w;
+	wire [31:0] dbg_ism_state;
+	wire [15:0] dbg_flp_strb_cnt;
+	wire [15:0] dbg_flp_strb_en_cnt;
+	wire [23:0] dbg_flp_strb_last;
+	wire [8:0]  dbg_flp_rej_step;
+	wire [7:0]  dbg_flp_status;
 
 	// ── Always-on marginality anchor (2026-07-29) ───────────────────────────
 	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
@@ -1181,6 +1201,28 @@ module emu
 	                                   anchor_cda3, anchor_cda4, anchor_cdur;
 	(* preserve, noprune *) reg [31:0] anchor_psdt, anchor_psds, anchor_psd2,
 	                                   anchor_psd3, anchor_wrfb;
+	// (2026-08-03) Extension: the 11-word anchor above proved INSUFFICIENT on
+	// the post-floppy netlist — probes-off SEED-7 fit ccb82d32 corrupted the
+	// Finder colour-icon read path with the anchor present, while the ISSP
+	// deck on the same RTL/seed lineage passed the gate + 3-boot soak. The
+	// recurring failure fingerprint of this class is RING-STALE serving
+	// (f5a3dec, 082dcc4, e66fd82, 2026-08-03): a ring slot served at/past the
+	// rd_hps_blk fill boundary. These two words pin that exact cone — the
+	// stall comparators, fill counter, and look-ahead adder of each disk
+	// target (scsi.v dbg_ring; comparator nets shared with io_busy by
+	// construction). Same law as above: never remove, ifdef, or fold.
+	(* preserve, noprune *) reg [31:0] anchor_ring0, anchor_ring1;
+	// (2026-08-04) Floppy-cone extension. Build 9cd6c878 (SEED 4) passed the
+	// SCSI icon gate + soak yet failed a sustained floppy file copy mid-file
+	// ("disk error") — while the copy-pattern TB (tb_ism_copytest) proves the
+	// RTL serves the identical region byte-exact (756/756 sectors, cyls
+	// 15-35, both heads, real image data). Same per-fit marginality class,
+	// different cone: the icon gate only exercises the SCSI path, and the
+	// floppy fetch cone (SDRAM slot -> dskReadDataLatch -> MFM engine) had
+	// never been pinned. These words load the fetch latch, delivery/starve
+	// counters, head position, and the live fetch address. Same law: never
+	// remove, ifdef, or fold.
+	(* preserve, noprune *) reg [31:0] anchor_flp0, anchor_flp1, anchor_flp2;
 	always @(posedge clk_sys) begin
 		anchor_cda0 <= dbg_cda0_w;
 		anchor_cda1 <= dbg_cda1_w;
@@ -1193,7 +1235,202 @@ module emu
 		anchor_psd2 <= sdma_snap_ncr;
 		anchor_psd3 <= sdma_snap_wr;
 		anchor_wrfb <= dbg_wrfb_w;
+		anchor_ring0 <= dbg_ring0_w;
+		anchor_ring1 <= dbg_ring1_w;
+		anchor_flp0  <= {dbg_flp_byte_cnt, dbg_flp_miss_cnt};
+		anchor_flp1  <= {dbg_flp_step_cnt, dbg_iwm_latch, dbg_flp_raw};
+		anchor_flp2  <= {dbg_flp_byte_stb, dbg_flp_side, dbg_flp_track[6:0],
+		                 1'b0, dskReadAddrInt[21:0]};
 	end
+
+`ifdef USE_DBG_HUD
+	// ── On-screen floppy debug HUD (2026-08-04 copy-error hunt) ─────────────
+	// The JTAG hub's name table is corrupt on this board (21 nodes, names
+	// match no deck — see b9b5f5d), so the FLPA-E probes can't be read.
+	// This renders the same forensics as PIXELS: 8 rows of 32 cells at the
+	// top-left corner, each cell 8px wide x 8 lines tall, MSB first,
+	// white=1 / black=0. Read from a screenshot (scripts/parse_hud.py);
+	// row 0 is a constant marker for geometry/polarity self-calibration.
+	//   row 0  32'hA5C3F00F                          marker
+	//   row 1  {byte_cnt[15:0], miss_cnt[15:0]}      delivered / starved
+	//   row 2  {side, track[6:0], step_cnt[15:0], 5'b0, ism_error[2:0]}
+	//   row 3  {10'b0, dskReadAddrInt[21:0]}         live fetch address
+	//   row 4  {err_onset_cnt[7:0], arm_cnt[7:0], ovr_cnt[7:0], unr_cnt[7:0]}
+	//   row 5  {e142_first[15:0], e142_last[15:0]} — FIRST and LAST nonzero
+	//           result code the Sony driver posted to low-mem $142 (a6ea60:
+	//           movew d0,$142). 0xFFBE=-66 noNyb, 0xFFBD=-67 noAdrMk,
+	//           0xFFBB=-69 IDcksm, 0xFFB9=-71 noDtaMk, 0xFFB8=-72 Dcksm,
+	//           0xFFB3=-77. THE exact failure the guest saw, no inference.
+	//   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]} — error completions /
+	//           ALL word-writes to $142 (every driver-op completion)
+	//   row 7  SCAN-WITNESS latched at the LAST -81 post (the exact cycle the
+	//           driver word-writes 0xFFAF to $142):
+	//             [31:24] run    = consecutive delivered ID fields since the
+	//                              last CONSUMED data field. The -81 budget
+	//                              seed is 64 (SonyVars+46 = 0x40, MAME-
+	//                              measured; healthy MAME never passed 17 =
+	//                              one revolution). ~64 here = the scan model
+	//                              holds and the target was skipped on >= 3
+	//                              consecutive revolutions; ~17 = model wrong.
+	//             [23:16] hunt_ms = duration of the last ARMED window (ms).
+	//                              <1 = normal per-ID windows; ~100+ = a dry
+	//                              hunt, which contradicts -81 (that path
+	//                              posts -67) -> re-derive.
+	//             [15:14] par    = {odd R seen, even R seen} since the last
+	//                              consumed data field. ONE bit set across a
+	//                              64-ID burn = the stride-2 stroboscope
+	//                              (timer-paced re-arm vs 11.1 ms disk slots
+	//                              always lands past the next ID; 18 sectors
+	//                              even => 9-sector cycle, target parity
+	//                              never sampled). Both set = longer-cycle
+	//                              alias or a different mechanism.
+	//             [13:0]  gap_us = us since the last delivery inside an
+	//                              armed+synced window (held over disarm):
+	//                              served-side starvation at the failure.
+	//   row 8  LIVE {stall_us[15:0], stall_cnt[7:0], e81_cnt[7:0]}: worst
+	//           single MFM delivery stall (floppy.v byte-cell timer held at 0
+	//           waiting for the SDRAM fetch — a real drive never stalls), how
+	//           many deliveries stalled >= ~1 us, and how many -81 posts the
+	//           row-7 latch has seen. stall_us ~2 with -81s present kills the
+	//           SDRAM-contention suspect; ms-scale stall_us revives it.
+	//   (retired: hs_b1/hs_b5 verdict counters — the b5 theory was falsified
+	//    on 08-05, unr onsets stayed flat across failing dialogs; the
+	//    UNR-FORENSIC latch, which answered: first event = mount self-test;
+	//    and the ID-WITNESS CHRN capture + ID:DATA ratio, whose job ended
+	//    when hardware measured ratio 1.12 vs 3.15 and killed the interleave
+	//    theory — see mfm_track_encoder.v.)
+	//   row 11 LIVE {status, 6'b0, ins_int, ins_ext, disk_data, raw_byte}
+	//   row 10 latch @ FIRST nonzero $142: {side, track[6:0], 2'b0, addr[21:0]}
+	//           — where the head/fetch was when the first error was POSTED
+	//   row 9  {ism_mode_reg[7:0], ism_setup[7:0], 8'b0, diskEnableInt,
+	//           driveSel, devsel_int, devsel_ext, selonly_int, ism_mode,
+	//           diskEnableExt, 0} — what the driver PROGRAMMED
+	// CDC note: rows are sampled from clk_sys into clk_vid once per frame
+	// with no handshake — acceptable for a HUD (the values of interest are
+	// static once the Finder error dialog is up, floppy quiesced).
+	// Video-only overlay: input/choreography pixels underneath still work.
+
+	// clk_sys side. The ism_error onset counter stays (row 4) — with the 08-05
+	// teardown-probe finding (the Sony driver READS the data/mark registers
+	// with an empty FIFO in its session teardown, ROM a6ea9e/a6eaf0/a6eb64,
+	// setting error b2 exactly as MAME does) it now serves to CONFIRM that
+	// unr events are that benign noise, uncorrelated with real failures.
+	wire [2:0] hud_err_live = dbg_ism_flpe_w[26:24];
+	reg  [2:0] hud_err_d = 3'd0;
+	reg  [7:0] hud_onset_cnt = 8'd0;
+	always @(posedge clk_sys) begin
+		hud_err_d <= hud_err_live;
+		if ((hud_err_d == 3'd0) && (hud_err_live != 3'd0)) begin
+			if (hud_onset_cnt != 8'hFF) hud_onset_cnt <= hud_onset_cnt + 1'd1;
+		end
+	end
+
+	// ── Sony driver result-code watcher ────────────────────────────────────
+	// The ROM MFM read path posts every operation's result as a WORD write to
+	// low-mem $142 (a6ea60: movew %d0,$142; the retry wrapper reads it back at
+	// a6f0c8). Watching that address captures the EXACT Mac error code of
+	// every failed sector read — the number the "disk error" dialog is made
+	// of — with zero inference. Byte writes ($142 'st' done-flag) are
+	// excluded by requiring both strobes (word write). One latch per AS
+	// assertion (write cycles hold the bus for many clk_sys cycles).
+	reg        hud_e142_armed = 1'b1;
+	reg [15:0] hud_e142_first = 16'd0, hud_e142_last = 16'd0;
+	reg [15:0] hud_e142_nz_cnt = 16'd0, hud_e142_all_cnt = 16'd0;
+	reg [31:0] hud_e142_pos = 32'd0;
+	// -81 (0xFFAF) snapshot: freeze the swim SCAN-WITNESS word on the exact
+	// bus cycle the driver posts sectNFErr, and count the posts. dbg_ism_scan_w
+	// is clk_sys-domain (swim runs on clk_sys/cen), so this is a clean sample.
+	reg [7:0]  hud_e81_cnt  = 8'd0;
+	reg [31:0] hud_e81_scan = 32'd0;
+	wire hud_e142_hit = !_cpuAS && !_cpuRW && !_cpuUDS && !_cpuLDS &&
+	                    (cpuAddr[23:0] == 24'h000142);
+	always @(posedge clk_sys) begin
+		if (_cpuAS) hud_e142_armed <= 1'b1;
+		else if (hud_e142_hit && hud_e142_armed) begin
+			hud_e142_armed <= 1'b0;
+			if (hud_e142_all_cnt != 16'hFFFF)
+				hud_e142_all_cnt <= hud_e142_all_cnt + 1'd1;
+			if (cpuDataOut != 16'h0000) begin
+				if (hud_e142_nz_cnt != 16'hFFFF)
+					hud_e142_nz_cnt <= hud_e142_nz_cnt + 1'd1;
+				hud_e142_last <= cpuDataOut;
+				if (hud_e142_first == 16'd0) begin
+					hud_e142_first <= cpuDataOut;
+					hud_e142_pos   <= {dbg_flp_side, dbg_flp_track[6:0],
+					                   2'b00, dskReadAddrInt[21:0]};
+				end
+				if (cpuDataOut == 16'hFFAF) begin
+					if (hud_e81_cnt != 8'hFF) hud_e81_cnt <= hud_e81_cnt + 1'd1;
+					hud_e81_scan <= dbg_ism_scan_w;
+				end
+			end
+		end
+	end
+
+	// clk_vid side: pixel position from DE/VBlank, per-frame word snapshot,
+	// registered 2:1 pixel mux (one pipeline stage keeps the VGA cone short;
+	// the 1px right-shift is absorbed by the marker calibration).
+	reg [9:0] hud_x = 10'd0, hud_y = 10'd0;
+	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
+	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
+	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
+	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0;
+	// ── Geometry (2026-08-05 pm): 4x4 cells at the BOTTOM-LEFT ─────────────
+	// Was 8x8 cells at the top-left, which covered the Mac MENU BAR — that
+	// cost real bench time (the Special-menu shutdown choreography walked
+	// blind under the black block and had to be re-derived by trial). The
+	// deck is now 128x48 px in the bottom-left corner: menu bar clear, and a
+	// quarter of the former area.
+	// Bottom-alignment is MODE-INDEPENDENT: hud_h latches the previous
+	// frame's active line count (hud_y at vblank), so 512x384 / 640x480 /
+	// any other v8 mode all place the deck against the true last line
+	// without a hard-coded height.
+	localparam [9:0] HUD_W  = 10'd128;   // 32 cells x 4 px
+	localparam [9:0] HUD_HT = 10'd48;    // 12 rows  x 4 lines
+	reg  [9:0] hud_h = 10'd480;          // measured active lines (prev frame)
+	wire [9:0] hud_ytop  = (hud_h > HUD_HT) ? (hud_h - HUD_HT) : 10'd0;
+	wire       hud_vband = (hud_y >= hud_ytop) && (hud_y < hud_h);
+	wire [9:0] hud_yrel  = hud_y - hud_ytop;
+	wire [3:0] hud_rowsel = hud_yrel[5:2];
+	wire [31:0] hud_wmux =
+		(hud_rowsel == 4'd11) ? hud_w11 :
+		(hud_rowsel == 4'd10) ? hud_w10 :
+		(hud_rowsel == 4'd9) ? hud_w9 :
+		(hud_rowsel == 4'd8) ? hud_w8 :
+		(hud_rowsel == 4'd0) ? 32'hA5C3F00F :
+		(hud_rowsel == 4'd1) ? hud_w1 :
+		(hud_rowsel == 4'd2) ? hud_w2 :
+		(hud_rowsel == 4'd3) ? hud_w3 :
+		(hud_rowsel == 4'd4) ? hud_w4 :
+		(hud_rowsel == 4'd5) ? hud_w5 :
+		(hud_rowsel == 4'd6) ? hud_w6 : hud_w7;
+	reg hud_on_q = 1'b0, hud_white_q = 1'b0;
+	wire [7:0] hud_px = hud_white_q ? 8'hFF : 8'h00;
+	always @(posedge clk_vid) begin
+		hud_de_d  <= v8_de;
+		hud_vbl_d <= v8_vblank;
+		if (v8_de) hud_x <= hud_x + 1'd1; else hud_x <= 10'd0;
+		if (hud_de_d & ~v8_de) hud_y <= hud_y + 1'd1;
+		if (~hud_vbl_d & v8_vblank) begin
+			hud_h <= hud_y;          // active line count -> bottom alignment
+			hud_y <= 10'd0;
+			hud_w1 <= {dbg_flp_byte_cnt, dbg_flp_miss_cnt};
+			hud_w2 <= {dbg_flp_side, dbg_flp_track[6:0], dbg_flp_step_cnt, 5'b0, hud_err_live};
+			hud_w3 <= {10'b0, dskReadAddrInt[21:0]};
+			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
+			hud_w5 <= {hud_e142_first, hud_e142_last};
+			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
+			hud_w7 <= hud_e81_scan;
+			hud_w8 <= {dbg_mfm_stall_w, hud_e81_cnt};
+			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
+			hud_w10 <= hud_e142_pos;
+			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
+			             dbg_flp_disk_data, dbg_flp_raw};
+		end
+		hud_on_q    <= hud_vband && (hud_x < HUD_W) && v8_de;
+		hud_white_q <= hud_wmux[5'd31 - hud_x[6:2]];
+	end
+`endif // USE_DBG_HUD
 
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
@@ -1287,6 +1524,37 @@ module emu
 	// Recover from git history if either resurfaces. The trim also frees the
 	// ring's M10K and returns the JTAG deck below the ~20-node hub ceiling
 	// whose name table read back corrupted at ~40 nodes.)
+	// Floppy copy-error deck (2026-08-04). The copy dies bit-identically at
+	// 44% of the file on every fit AND with the staging ring, while the TB
+	// (perfect SDRAM model) serves the whole geometry byte-exact + CRC-clean.
+	// These three discriminate what the TB abstracts away:
+	//   FLPA {side, track, step_cnt, last raw fetched byte} — head POSITION
+	//        (a lost/doubled step = driver can't find its sector = disk error)
+	//   FLPB {byte_cnt, miss_cnt} — miss_cnt counts byte slots that expired
+	//        with nothing to deliver = SDRAM refill STARVATION
+	//   FLPC live dskReadAddrInt — is the fetch address sane at the failure?
+	altsource_probe #(
+		.instance_id ("FLPA"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpa (.probe({dbg_flp_side, dbg_flp_track[6:0], dbg_flp_step_cnt[15:0], dbg_flp_raw[7:0]}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("FLPB"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpb (.probe({dbg_flp_byte_cnt, dbg_flp_miss_cnt}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("FLPC"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpc (.probe({10'b0, dskReadAddrInt}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	// FLPE: floppy ISM error forensics (2026-08-04 copy-error hunt) —
+	// [7:0]=underrun/CPU-side cnt [15:8]=read-overrun cnt [23:16]=arm cnt
+	// [26:24]=live ism_error
+	altsource_probe #(
+		.instance_id ("FLPE"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_flpe (.probe(dbg_ism_flpe_w), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 `endif // USE_DBG_PROBES
 
 `ifdef USE_DBG_OBSERVER
@@ -1541,6 +1809,9 @@ module emu
 		.dbg_ncr2(dbg_ncr2_w),
 		.dbg_wr(dbg_wr_w),
 		.dbg_wrfb(dbg_wrfb_w),
+		.dbg_ism_flpe(dbg_ism_flpe_w),
+		.dbg_ring0(dbg_ring0_w),
+		.dbg_ring1(dbg_ring1_w),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),
@@ -1649,7 +1920,17 @@ module emu
 		.dbg_iwm_latch(dbg_iwm_latch),
 		.dbg_flp_byte_stb(dbg_flp_byte_stb),
 		.dbg_flp_raw(dbg_flp_raw),
-		.dbg_flp_gcr_addr(dbg_flp_gcr_addr)
+		.dbg_flp_gcr_addr(dbg_flp_gcr_addr),
+		.dbg_ism_verdict(dbg_ism_verdict_w),
+		.dbg_ism_unrlatch(dbg_ism_unrlatch_w),
+		.dbg_ism_scan(dbg_ism_scan_w),
+		.dbg_mfm_stall(dbg_mfm_stall_w),
+		.dbg_ism_state(dbg_ism_state),
+		.dbg_flp_strb_cnt(dbg_flp_strb_cnt),
+		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
+		.dbg_flp_strb_last(dbg_flp_strb_last),
+		.dbg_flp_rej_step(dbg_flp_rej_step),
+		.dbg_flp_status(dbg_flp_status)
 	);
 
 	reg disk_act;

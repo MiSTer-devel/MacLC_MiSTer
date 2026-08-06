@@ -168,10 +168,17 @@ ghdl synth -fsynopsys -fexplicit --latches --out=verilog
 
 ```bash
 cd verilator && make clean && make
-./obj_dir/Vemu --screenshot 350 --stop-at-frame 351 2>/dev/null 1>/dev/null
+./obj_dir/Vemu --screenshot 450 --stop-at-frame 451 2>/dev/null 1>/dev/null
 ```
 
-Check `screenshot_frame_0350.png` — it must show the grey/black alternating line pattern (memory test). Uniform grey means the SR change broke Egret communication.
+Check `screenshot_frame_0450.png` — it must show the **50% dither grey desktop
+with the arrow cursor top-left** (boot reached cursor-visible state). A uniform
+flat grey at 450 means the boot stalled — Egret communication is the first
+suspect. Corroborate with `bash check_boot.sh` (stages + ADVANCING).
+(Re-calibrated 2026-08-05: the old criterion was the memory-test line pattern
+at frame 350, timed against VIA timers that counted 2× slow — the via6522.sv
+timer fix moved every timer-paced boot delay earlier, so the pattern now
+passes before frame 180 and 350 lands in a featureless VRAM-fill phase.)
 
 **SR edge-detection patterns (history + FPGA caveat):**
 - `cb2_latched` (shift-in: capturing CB2 at the CB1 rising edge) — **removed; do not re-introduce.** Shift-in uses live `cb2_i`. Re-introducing it hung the 4th Egret SR transfer in Verilator (CPU stuck polling IFR bit 2 at `0xA14E5E`).
@@ -181,14 +188,98 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 
 ## Known Limitations
 
-- Floppy disks are read-only
+- Floppy disks are read-only (**no write datapath exists** in `rtl/floppy.v`;
+  the drive reports `WRTPRT=0` = write-protected so the OS never tries. That
+  is load-bearing: the ROM's write primitive polls handshake b7 in an
+  UNBOUNDED loop, so an attempted write would hang the machine, not fail.)
+- **BOOTING FROM FLOPPY WORKS** (user-confirmed on hardware 2026-08-05,
+  bench build `78a46cf2`). The old "Welcome to Macintosh" retry loop and the
+  ~39 KB-then-UNDERRUN freeze are gone. Several fixes contributed and no
+  single one was isolated: the constant-300-RPM MFM tach (`62aee5c`, which
+  targeted the Welcome loop directly), the ISM drive-select fix, the INDEX
+  pulse, VIA1 PA7, and the VIA timer half-rate fix (`33ebdd1` — the driver's
+  install-time drive-speed check is timer-paced, so a 2x timer error would
+  also have corrupted it).
+- **800K GCR disks WORK END-TO-END as of 2026-08-05** — mount, catalog, and
+  **file reads**: on a cold boot a 482K application was launched off an 800K
+  GCR floppy and copied to a SCSI disk with zero driver errors (head seeking,
+  `step_cnt` 1 -> 311). Two fixes got here:
+  1. `2804d02` — "This disk is unreadable" (`-69 badCksmErr`). The IWM
+     read-data latch clear was retriggered from the LEVEL `iwmRead` instead of
+     firing once at the END of the access: the LC's E-paced VPA accesses (~1.23
+     us) plus the ROM's ~2.5 us GCR poll loop left less gap than the 13-cen
+     reload, so the latch never cleared and the CPU re-read each disk byte ~6
+     times — duplicates shift a field and break its checksum.
+  2. Nothing — **and this is the one remaining floppy defect: a disk SWAP is
+     invisible to the guest.** That, not a data problem, is what the "mounts and
+     lists but a file copy fails with NO driver error" report was.
+     `dsk_*_ins` is a pure LEVEL from the image size latched at end-of-download,
+     so mounting image B over image A never moves `CSTIN`; the guest keeps A's
+     VCB and cached catalog while SDRAM holds B. The volume looks mounted (window
+     + desktop icon persist) but every File Manager call fails "…cannot be found"
+     **with zero disk I/O** — a stale `vRefNum`, so no read ever reaches the
+     driver. Only the first mount after reset works, `CSTIN` resetting to 1 being
+     the one genuine edge.
+     - ★★ **WORKAROUND: mount the image, then RESET (OSD "Reset & Apply").**
+       **Ejecting first does NOT work** — tested 2026-08-06 on 7.6.1 / fit
+       `e51a4acd`: drag-to-Trash genuinely ejects (icon disappears), but mounting
+       a *different* image then brings the OLD volume back (mount oracle read
+       "Install Disk 1 RAW" while the desktop still showed "Fetch" listing
+       Fetch's files), and `Special ▸ Eject Disk` / Cmd-E was **greyed out** with
+       the disk's window frontmost in list view. That is more evidence for the
+       SWITCHED theory below: the OS re-mounts its cached volume because nothing
+       tells it the medium changed. Only a reboot clears a stale volume.
+     - ★★ **An attempted fix was REVERTED (`ebbdac6`): it regressed the mount.**
+       Making `CSTIN` drop across a mount (hold the drive empty for ~2 s, plus
+       `CSTIN <= ~insertDisk` in floppy.v so the drop is even visible) gave a
+       clean A/B *failure*: pre-fix ×2 clean, fixed ×2 died at the mount with
+       Finder "bad F-Line" and `-109 nilHandleErr`. Prime suspect for why: the
+       **SWITCHED sense register** (floppy.v reg 6 read) is hardwired `1'b0`, so
+       the OS is told the medium left and returned while the disk-switched flag
+       insists nothing changed. **A second attempt must implement SWITCHED in
+       the same change**, not just toggle `CSTIN`. `verilator/tb_disk_swap.v`
+       covers the four properties involved and already caught one no-op fix
+       before it shipped — run it after any `insertDisk`/`CSTIN` edit.
+  ★ `byte_cnt` frozen + `$142` all-benign means **no read was attempted** — do
+  not read it as "reads returned bad data".
+  The old parked doc `docs/resume_floppy_controller_2026-07-07.md` is RESOLVED;
+  its "SDRAM region != image" theory was never confirmed and its JTAG chain no
+  longer works (dead hub). Offline instruments that settled all of this in
+  minutes: `verilator/tb_gcr_read.v` (`+track/+side/+ncap`, seeks via the real
+  drive-register protocol; **always pass `+acclen=40 +pollgap=40`** or the
+  stream is garbage), `scripts/gcr_census.py` (address fields),
+  `scripts/gcr_data_census.py` (DATA fields verified against the standard 800K
+  layout offset — every zone boundary clean, refuting the `soff` suspicion) and
+  `scripts/hfs_check.py` (walks an image's catalog/extents trees offline so a
+  broken source image can't fake an RTL bug).
+- **1.44 MB MFM read works, and the Finder whole-disk COPY was FIXED
+  2026-08-05** (`33ebdd1`): the real defect was **`rtl/via6522.sv` counting
+  T1/T2 at half rate** — a `/2` prescaler stacked on enables that were already
+  at VIA phi2 rate (`E_div=1'b1`), so every guest VIA-timer interval ran 2.0×
+  long since June. That doubled the Sony driver's Time-Manager sleep between
+  read attempts and phase-locked its re-arm one sector late (stride-2 over 18
+  sectors ⇒ a closed 9-sector cycle ⇒ `-81 sectNFErr`). HW: 5 dialogs → **0,
+  twice**, copy ~2 min → ~55 s. Full write-up + the SCAN-WITNESS evidence in
+  **`docs/sony_driver_mfm_read_reference.md`** — read it before any floppy or
+  VIA-timer work; it also decodes every Sony error code (`-65` is benign
+  polling of the absent second drive) and lists **seven theories tested and
+  refuted**, several of which were built before that page existed.
+  Instruments: `USE_DBG_HUD` + `scripts/parse_hud.py` (rows 7/8 = SCAN-WITNESS),
+  `verilator/mame/floppy/sonyvars_watch.lua` (driver retry budgets from MAME),
+  `verilator/tb_mfm_idcensus.v` (full-disk ID census), `tb_ism_sony +postgap=N`.
+  ★ `USE_DBG_HUD=1` is committed ON in `MacLC.qsf` — turn it OFF for release fits.
 - SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
   (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO
   reference). Release fits no longer carry the JTAG probe decks — an
-  always-on anchor in MacLC.sv (4dfb463) pins the SCSI capture cones; do
+  always-on anchor in MacLC.sv (4dfb463, extended 2026-08-03 with per-disk
+  read-ring words after the 11-word anchor proved insufficient on the
+  post-floppy netlist) pins the SCSI capture + ring-serve cones; do
   not remove it (comment block explains), and gate every new fit in the
-  FINDER on colour icons on colour icons (see the probes-off anchor comment in MacLC.sv).
+  FINDER on colour icons — `scripts/icon_gate.py` on frames captured with
+  `scripts/grab_fresh.sh` (stock grab.sh serves STALE frames when video is
+  dead), plus a >=2-boot Finder soak (see the probes-off anchor comment in
+  MacLC.sv).
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
 - CD-ROM (SCSI ID 3, OSD slot `SC4`): data, mixed-mode, and audio CDs.

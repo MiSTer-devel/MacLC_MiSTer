@@ -48,7 +48,7 @@ set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
-set_global_assignment -name SEED 5
+set_global_assignment -name SEED 2
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -98,6 +98,19 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 #   USE_DBG_OBSERVER = the dbg_probes SCSI/CPU/video deck (PADR..PVID)
 # set_global_assignment -name VERILOG_MACRO "USE_DBG_PROBES=1"
 # set_global_assignment -name VERILOG_MACRO "USE_DBG_OBSERVER=1"
+
+# DEBUG (screen): on-screen floppy HUD — renders the FLPA-E forensics as a
+# binary pixel strip in the BOTTOM-LEFT corner (12 rows x 32 cells of 4x4 px,
+# layout in the MacLC.sv USE_DBG_HUD block; parse screenshots with
+# scripts/parse_hud.py, which auto-detects both this and the older top-left 8x8
+# geometry). Built 2026-08-04 because this board's JTAG hub name table is
+# corrupt and the ISSP probes can't be read. Needs NO JTAG.
+# ★ COMMENTED for release (2026-08-06): the strip is drawn over real picture.
+# Uncomment for any floppy/VIA-timer investigation — it is the only working
+# forensic channel on this board. HUD-on and HUD-off are DIFFERENT netlists and
+# re-roll the fit lottery independently, so re-gate after flipping it (icon gate
+# + >= 2-boot Finder soak).
+# set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"

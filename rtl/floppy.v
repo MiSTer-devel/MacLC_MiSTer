@@ -87,13 +87,21 @@ module floppy
 	input dskReadAck,
 	input [7:0] dskReadData,
 
-	// MFM (ISM/SWIM) read path — 720K/1.44MB
-	input        mfm_disk,   // this disk is MFM (use the MFM generator for fetch+bytes)
-	input        mfm_hd,     // 1.44MB HD (18 spt) vs 720K DD (9 spt)
-	input        mfm_pull,   // SWIM ISM read: advance one decoded byte
-	output [7:0] mfm_byte,   // current decoded MFM byte
-	output       mfm_mark,   // current byte is an address-mark (A1)
-	output       mfm_crc0,   // current byte completes a valid CRC field
+	// MFM (ISM/SWIM) read path — 720K/1.44MB. The disk spins on its own: while
+	// an MFM disk is in and the motor runs, a decoded byte falls off the head
+	// every 16 us (HD) / 32 us (DD). Each delivery latches the encoder's output
+	// and strobes mfm_stb for one cep period (the SWIM samples it on cen).
+	input            ism_active, // SWIM is in ISM mode: the phase lines are ISM
+	input            ism_action, // ISM Mode b3 (ACTION): the read/write engine runs
+	                             // register traffic, not IWM drive commands
+	input            ism_sel,    // ISM has THIS drive selected with Mode b7
+	                             // (motor on) set — the ISM-mode motor command
+	input            mfm_disk,   // this disk is MFM (use the MFM generator for fetch+bytes)
+	input            mfm_hd,     // 1.44MB HD (18 spt) vs 720K DD (9 spt)
+	output reg [7:0] mfm_byte,   // delivered decoded MFM byte
+	output reg       mfm_mark,   // delivered byte is an address-mark (A1)
+	output reg       mfm_crc0,   // delivered byte completes a valid CRC field
+	output reg       mfm_stb,    // 1-cep-period delivery strobe
 
 	// --- diagnostic ports (PFLP probes; safe to leave dangling when unused) ---
 	// Ported from lbmactwo_MiSTer ac44312 (the debug deck that root-caused its
@@ -112,7 +120,43 @@ module floppy
 	                                         // (diskImageData is handed over AND
 	                                         // cleared on this edge — sample it now)
 	output wire [7:0]  dbg_raw_byte,         // pre-encoder SDRAM fetch latch (idata)
-	output wire [21:0] dbg_gcr_addr          // live GCR encoder fetch address
+	output wire [21:0] dbg_gcr_addr,         // live GCR encoder fetch address
+	// Phase-strobe forensics (2026-08-04): dbg_step_cnt reading 0 on hardware
+	// during a whole ISM/MFM session cannot distinguish "the driver never
+	// strobed a step" from "our decode rejected the strobe" — both leave the
+	// counter at 0. These record EVERY lstrb falling edge unconditionally,
+	// with the address pattern presented at that edge, so the two cases
+	// separate: strb_cnt==0 => the driver never strobes; strb_cnt>0 with
+	// step_cnt==0 => we are rejecting the pattern it does send (and
+	// strb_last shows exactly which qualifier fails).
+	output reg  [15:0] dbg_strb_cnt,         // ALL lstrb falling edges seen
+	output reg  [15:0] dbg_strb_en_cnt,      // ...of those, with _enable low
+	output reg  [23:0] dbg_strb_last,        // last 4 edges, 6 bits each, newest low:
+	                                         // {_enable, ca2, ca1, ca0, SEL, ism_active}
+	// Latched when a PERFECTLY FORMED step is REJECTED (step pattern present
+	// but _enable high). dbg_strb_last keeps only the last 4 edges, which on a
+	// one-floppy machine are usually the driver idly polling the empty external
+	// drive — so the mode register sampled 'now' need not be the mode in force
+	// when a seek was actually dropped. This flags THAT instant.
+	// [7:0] = rejected-step count (saturating), [8] = ever happened.
+	output reg  [8:0]  dbg_rej_step,
+	// Live drive status, so an underrun can be attributed: is the media even
+	// spinning, and which term is holding it up? (2026-08-04: once the
+	// drive-select fix let register writes land, MOTORON writes land too and
+	// can stop the disk — mfm_spinning = mfm_disk && (motor||ism_sel) && !CSTIN.)
+	output wire [7:0]  dbg_status,
+	// MFM delivery-stall witness (2026-08-05 pm, the -81 hunt). A payload byte
+	// whose SDRAM fetch has not landed stalls the byte-cell timer at zero (the
+	// `!mfm_needs_data || mfm_fresh` gate in the delivery block below). A real
+	// drive never stalls — data flies under the head regardless — so any stall
+	// here is emulation artifact stretching the rotation. dbg_byte_cnt/miss_cnt
+	// above are GCR-path-only (they count on diskDataByteTimer), so before this
+	// the MFM fetch path was entirely uninstrumented and "miss_cnt=0" said
+	// nothing about it. Max single stall (~us units, saturating) + number of
+	// deliveries that stalled at all: settles the "SDRAM contention at track
+	// boundaries" suspect with numbers.
+	output reg  [15:0] dbg_mfm_stall_us,
+	output reg  [7:0]  dbg_mfm_stall_cnt
 );
 	assign dbg_disk_image_data = diskImageData;
 	assign dbg_drive_track     = driveTrack;
@@ -121,6 +165,9 @@ module floppy
 	assign dbg_gcr_addr        = gcrReadAddr;
 
 	assign motor = ~driveRegs[`DRIVE_REG_MOTORON];
+	assign dbg_status = {mfm_spinning, motor, ism_sel,
+	                     driveRegs[`DRIVE_REG_MOTORON], driveSide, ism_active,
+	                     ism_action, ~driveRegs[`DRIVE_REG_CSTIN]};
 	assign act = lstrbEdge;
 
 	reg [15:0] driveRegs;
@@ -133,9 +180,17 @@ module floppy
 	// same wires as MAME's m_reg = {ss,ca2,ca1,ca0} (floppy.cpp mac_floppy::wpt_r).
 	// THE OS IDENTIFIES THE DRIVE by reading sense regs 0xC,0xD,0xE,0xF and matching
 	// a 4-bit pattern (wpt_r comment "Initial state of bits f-c = 2M,ready,MFM,rd1"):
-	//   0000=400K GCR, 1010=800K GCR, x011=SuperDrive (x=HD hole of inserted disk).
-	// => SuperDrive+HD = 1011, SuperDrive+DD = 0011. So we must report:
-	//   reg 0xF (our [15] DRVIN)     = is_2m  = mfm_hd   (1 = 1.44MB HD disk)
+	//   0000=400K GCR, 1010=800K GCR, x011=SuperDrive (x=is_2m of inserted disk).
+	// ★ POLARITY (settled by the MAME 0.264 RUNTIME capture, which watched both
+	// disks actually mount — findings_mame_floppy_groundtruth_2026-07-02.md §4;
+	// it OVERTURNED the earlier source-reading guess that HD reports 1):
+	//   is_2m = 1 -> DD disk -> the OS mounts via GCR/IWM  => SuperDrive+DD = 1011
+	//   is_2m = 0 -> HD disk -> the OS mounts via MFM/ISM  => SuperDrive+HD = 0011
+	// Do NOT "fix" this back; inverting it sends 800K disks down MFM and 1.44M
+	// disks down GCR, and both then fail. HW-confirmed 2026-08-03: with is_2m=0
+	// a 1.44M disk takes the ISM path (its dialog differs from the GCR one).
+	// So we must report:
+	//   reg 0xF (our [15] DRVIN)     = is_2m  = ~mfm_hd  (1 = DD disk, 0 = HD)
 	//   reg 0xE (our [13] READY)     = 0      (0 = ready, Apple active-low)
 	//   reg 0xD (our [11] MFMModeOn) = 1      (m_mfm dflt = has_mfm on a SuperDrive)
 	//   reg 0xC (our [9]  RDDATA1)   = 1      (motor-off RdData reads 1)
@@ -219,30 +274,196 @@ module floppy
 		.odata   ( dskReadDataEnc )
 	);
 
-	// MFM (ISM-mode) track encoder — 720K/1.44MB. Advances one decoded byte each
-	// time the SWIM pulls (mfm_pull rising edge); shares the same SDRAM fetch latch
-	// (dskReadDataLatch) and head position (driveTrack/driveSide) as the GCR path.
-	reg mfm_pull_d;
-	always @(posedge clk) mfm_pull_d <= mfm_pull;
-	wire mfm_adv = mfm_pull & ~mfm_pull_d;
+	// MFM (ISM-mode) track encoder — 720K/1.44MB. Free-runs at the byte-cell
+	// rate below; shares the same SDRAM fetch latch (dskReadDataLatch) and head
+	// position (driveTrack/driveSide) as the GCR path.
+	wire [7:0] mfm_odata;
+	wire       mfm_omark, mfm_ocrc0, mfm_needs_data, mfm_index;
+	reg        mfm_ready_pulse;
 
 	mfm_track_encoder menc
 	(
-		.clk   ( clk ),
-		.ready ( mfm_adv ),
-		.rst   ( !_reset ),
-		.side  ( driveSide ),
-		.track ( driveTrack ),
-		.hd    ( mfm_hd ),
-		.addr  ( mfmReadAddr ),
-		.idata ( dskReadDataLatch ),
-		.odata ( mfm_byte ),
-		.omark ( mfm_mark ),
-		.ocrc0 ( mfm_crc0 )
+		.clk    ( clk ),
+		.ready  ( mfm_ready_pulse ),
+		.rst    ( !_reset ),
+		.side   ( driveSide ),
+		.track  ( driveTrack ),
+		.hd     ( mfm_hd ),
+		.addr   ( mfmReadAddr ),
+		.idata  ( dskReadDataLatch ),
+		.odata  ( mfm_odata ),
+		.omark  ( mfm_omark ),
+		.ocrc0  ( mfm_ocrc0 ),
+		.oneeds ( mfm_needs_data ),
+		.oindex ( mfm_index )
 	);
+
+	// ---- MFM byte-cell delivery timer -----------------------------------
+	// HD MFM = 500 kbit/s = 16 us/byte = 130 cep ticks @8.125 MHz; DD = 260.
+	// Payload bytes (oneeds) additionally wait for a post-advance SDRAM fetch:
+	// mfm_fresh means idata belongs to the encoder's CURRENT addr. One ack is
+	// skipped after each advance so an in-flight pre-advance ack can't hand us
+	// the previous byte's data. The internal-drive extra slot acks every ~2 us,
+	// so a stall only stretches the odd byte (the driver is poll-driven).
+	// The motor runs if EITHER path commanded it. In IWM mode that is the
+	// MOTORON drive register (an LSTRB strobe); in ISM mode the driver spins the
+	// drive with **Mode register bit 7 = motor on** (swim_ism_read_reference.md
+	// §B) and need never touch MOTORON — so keying spinning on MOTORON alone
+	// left the byte engine parked for the whole MFM session, the FIFO never
+	// filled, Handshake b7 never set, and the driver saw an empty disk.
+	wire       mfm_spinning = mfm_disk && (motor || ism_sel) &&
+	                          ~driveRegs[`DRIVE_REG_CSTIN];
+	wire [8:0] mfm_period   = mfm_hd ? 9'd129 : 9'd259;
+	reg  [8:0] mfm_timer;
+	reg        mfm_fresh;
+	reg        mfm_ack_skip;
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			mfm_timer       <= 9'd0;
+			mfm_fresh       <= 1'b0;
+			mfm_ack_skip    <= 1'b0;
+			mfm_ready_pulse <= 1'b0;
+			mfm_stb         <= 1'b0;
+			mfm_byte        <= 8'h00;
+			mfm_mark        <= 1'b0;
+			mfm_crc0        <= 1'b0;
+		end else begin
+			mfm_ready_pulse <= 1'b0;   // 1-clk advance pulse to the encoder
+			if (cep) begin
+				mfm_stb <= 1'b0;
+				// idata freshness: the fetch latch lands on cep && dskReadAckD
+				if (dskReadAckD) begin
+					if (mfm_ack_skip) mfm_ack_skip <= 1'b0;
+					else              mfm_fresh    <= 1'b1;
+				end
+				if (!mfm_spinning) begin
+					mfm_timer <= mfm_period;
+				end
+				else if (mfm_timer != 0) begin
+					mfm_timer <= mfm_timer - 9'd1;
+				end
+				else if (!mfm_needs_data || mfm_fresh) begin
+					// deliver the current byte, then advance the encoder
+					mfm_byte        <= mfm_odata;
+					mfm_mark        <= mfm_omark;
+					mfm_crc0        <= mfm_ocrc0;
+					mfm_stb         <= 1'b1;
+					mfm_ready_pulse <= 1'b1;
+					mfm_fresh       <= 1'b0;
+					mfm_ack_skip    <= 1'b1;
+					mfm_timer       <= mfm_period;
+				end
+				// else: payload byte not fetched yet — stall until an ack lands
+			end
+		end
+	end
+
+	// --- MFM delivery-stall witness (see the port comment). Own always block
+	// (Quartus single-driver law); observation-only. ~1 us = 8 cep ticks at
+	// 8.125 MHz. dbg_mfm_stall_cnt increments when a stall crosses ~1 us so
+	// sub-us fetch latency (the normal case) is not counted.
+	wire mfm_stalled = mfm_spinning && (mfm_timer == 9'd0) &&
+	                   mfm_needs_data && !mfm_fresh;
+	reg [2:0]  mfm_stall_pre;
+	reg [15:0] mfm_stall_run;
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			mfm_stall_pre    <= 3'd0;
+			mfm_stall_run    <= 16'd0;
+			dbg_mfm_stall_us  <= 16'd0;
+			dbg_mfm_stall_cnt <= 8'd0;
+		end
+		else if (cep) begin
+			if (mfm_stalled) begin
+				mfm_stall_pre <= mfm_stall_pre + 3'd1;
+				if (mfm_stall_pre == 3'd7 && mfm_stall_run != 16'hFFFF) begin
+					mfm_stall_run <= mfm_stall_run + 16'd1;
+					if (mfm_stall_run == 16'd0 && dbg_mfm_stall_cnt != 8'hFF)
+						dbg_mfm_stall_cnt <= dbg_mfm_stall_cnt + 8'd1;
+					if (mfm_stall_run >= dbg_mfm_stall_us)
+						dbg_mfm_stall_us <= mfm_stall_run + 16'd1;
+				end
+			end
+			else begin
+				mfm_stall_pre <= 3'd0;
+				mfm_stall_run <= 16'd0;
+			end
+		end
+	end
+
+`ifdef SIMULATION
+	// --- MFM/ISM protocol trace (diff against the MAME 0.264 runtime capture,
+	// scratch/mame_floppy_0702/decoded_1440k_v3.txt) ---
+	reg [13:0] dbgsim_strobe_cnt = 0;
+	reg [13:0] dbgsim_dlv_cnt = 0;
+	reg        dbgsim_spin_d = 0;
+	reg        dbgsim_idx_d = 0;
+	// Sense-register reads, run-length compressed on (addr,value): the driver
+	// polls one register thousands of times (e.g. NoReady until 0), so only
+	// transitions are interesting. Compare with the MAME capture's SENSE TRUTH
+	// TABLE. Our index is {ca2,ca1,ca0,SEL}; MAME's is {ss,ca2,ca1,ca0}.
+	reg [3:0]  dbgsim_sns_addr = 4'hF;
+	reg        dbgsim_sns_val = 1'b1;
+	reg [15:0] dbgsim_sns_rpt = 0;
+	reg [11:0] dbgsim_sns_cnt = 0;
+	wire       dbgsim_sns_now = readData[7];
+	always @(posedge clk) begin
+		if (cep && _enable == 1'b0) begin
+			if (driveReadAddr != dbgsim_sns_addr || dbgsim_sns_now != dbgsim_sns_val) begin
+				if (dbgsim_sns_cnt < 12'd800) begin
+					dbgsim_sns_cnt <= dbgsim_sns_cnt + 1'd1;
+					$display("FLOPPY %m sense[%x]=%b (prev[%x]=%b x%0d) SEL=%b @%0t",
+					         driveReadAddr, dbgsim_sns_now, dbgsim_sns_addr,
+					         dbgsim_sns_val, dbgsim_sns_rpt, SEL, $time);
+				end
+				dbgsim_sns_addr <= driveReadAddr;
+				dbgsim_sns_val  <= dbgsim_sns_now;
+				dbgsim_sns_rpt  <= 16'd1;
+			end else if (dbgsim_sns_rpt != 16'hFFFF)
+				dbgsim_sns_rpt <= dbgsim_sns_rpt + 1'd1;
+		end
+	end
+	always @(posedge clk) begin
+		if (cep && _enable == 1'b0 && lstrbEdge && dbgsim_strobe_cnt < 14'd8000) begin
+			dbgsim_strobe_cnt <= dbgsim_strobe_cnt + 1'd1;
+			$display("FLOPPY %m strobe(fall) cmd=%x track=%0d mfm=%b motor(reg)=%b @%0t",
+			         {SEL, ca2, ca1, ca0}, driveTrack, m_mfm, driveRegs[`DRIVE_REG_MOTORON], $time);
+		end
+		// MAME latches the command on the LSTRB RISING edge; we act on falling.
+		// Log both so a mid-pulse SEL/phase change shows up as a cmd mismatch.
+		if (cep && _enable == 1'b0 && lstrb && !lstrbPrev && dbgsim_strobe_cnt < 14'd8000)
+			$display("FLOPPY %m strobe(rise) cmd=%x track=%0d @%0t",
+			         {SEL, ca2, ca1, ca0}, driveTrack, $time);
+		if (cep) begin
+			dbgsim_spin_d <= mfm_spinning;
+			if (mfm_spinning != dbgsim_spin_d)
+				$display("FLOPPY %m mfm_spinning -> %b (motor=%b ism_sel=%b cstin=%b) trk=%0d side=%b @%0t",
+				         mfm_spinning, motor, ism_sel, driveRegs[`DRIVE_REG_CSTIN], driveTrack, driveSide, $time);
+			dbgsim_idx_d <= mfm_index;
+			if (mfm_spinning && mfm_index && !dbgsim_idx_d)
+				$display("FLOPPY %m index pulse trk=%0d side=%b @%0t", driveTrack, driveSide, $time);
+			if (mfm_stb && dbgsim_dlv_cnt < 14'd8000) begin
+				dbgsim_dlv_cnt <= dbgsim_dlv_cnt + 1'd1;
+				$display("FLOPPY %m mfm dlv %02x m=%b c0=%b trk=%0d side=%b needs=%b addr=%0d latch=%02x @%0t",
+				         mfm_byte, mfm_mark, mfm_crc0, driveTrack, driveSide,
+				         mfm_needs_data, mfmReadAddr, dskReadDataLatch, $time);
+			end
+		end
+	end
+`endif
 
 	// SDRAM fetch address: the MFM generator for MFM disks, else the GCR encoder.
 	assign dskReadAddr = mfm_disk ? mfmReadAddr : gcrReadAddr;
+
+	// MFM index sense. On a SuperDrive with an MFM disk, sense regs 0x4/0xC
+	// (RdData0/1) read the index: 1 with motor off / no disk, else !idx (MAME
+	// mac_floppy wpt_r). The MAME 0.264 runtime capture shows the Sony driver
+	// polling this 7M times during the MFM session (through ISM Handshake bit3
+	// with phases parked on RdData) with 0.70% of reads low — the once-per-rev
+	// index pulse that bounds its sector searches. The GCR byte-stream register
+	// must NOT appear here for MFM disks (its GCR alphabet is MSB-set, which
+	// reads as a permanent "no index" 1).
+	wire mfm_idx_sense = mfm_spinning ? ~mfm_index : 1'b1;
 	
 	// TODO: auto-detect doubleSidedDisk from image file size
 	wire doubleSidedDisk = diskSides;
@@ -296,13 +517,38 @@ module floppy
 				end
 			end
 
-			// switch drive sides if DRIVE_REG_RDDATA0 or DRIVE_REG_RDDATA1 are read
-			// TODO: we don't know if this is a true read, since we don't know if IWM is selected or 
-			// could be bad if we use this test to flush a cache of encoded disk data
-			if (driveReadAddr == `DRIVE_REG_RDDATA0 && lstrb == 1'b0)
-				driveSide <= 0;
-			if (driveReadAddr == `DRIVE_REG_RDDATA1 && lstrb == 1'b0)
-				driveSide <= 1;	
+			// Head (side) select — the RDDATA0/RDDATA1 sense address.
+			// IWM/GCR: latch continuously while the address is parked there
+			// (Plus Too lineage; the phase lines are dedicated to the sense
+			// address during GCR reads, so any parked value is authoritative).
+			// ISM: the SAME lines double as drive-command strobes and SEL
+			// doubles as the strobe-bank selector, so transient combinations
+			// lie about the head. The Welcome-time re-init raises SEL for the
+			// MFMModeOn strobe while the phases still park on F4 (RdData0)
+			// from the previous field — {F4,SEL=1} reads as RdData1 and
+			// silently flipped the head to side 1; every later read served
+			// wrong-side bytes and System 6.0.8's floppy boot looped at
+			// "Welcome to Macintosh" retrying forever (HW 2026-08-03; MAME
+			// F623 ground truth + tb_ism_reinit fetch trace addr 9368 =
+			// side 1 byte 152). In ISM, sample the head only while ACTION is
+			// set: the driver parks F4/SEL BEFORE arming and never touches
+			// them mid-read, so the armed window is the authoritative one.
+			if (ism_active ? ism_action : 1'b1) begin
+				if (driveReadAddr == `DRIVE_REG_RDDATA0 && lstrb == 1'b0) begin
+`ifdef SIMULATION
+					if (driveSide != 1'b0)
+						$display("FLOPPY %m driveSide 1->0 (ism=%b act=%b) @%0t", ism_active, ism_action, $time);
+`endif
+					driveSide <= 0;
+				end
+				if (driveReadAddr == `DRIVE_REG_RDDATA1 && lstrb == 1'b0) begin
+`ifdef SIMULATION
+					if (driveSide != 1'b1)
+						$display("FLOPPY %m driveSide 0->1 (ism=%b act=%b) @%0t", ism_active, ism_action, $time);
+`endif
+					driveSide <= 1;
+				end
+			end
 		end
 	end
 	end
@@ -341,8 +587,33 @@ module floppy
 
 	wire lstrbEdge = lstrb == 1'b0 && lstrbPrev == 1'b1;
 
+	// Unconditional strobe recorder — see the dbg_strb_* port comments. Note
+	// this samples the SAME lstrbEdge the register writes use, so a zero count
+	// here also exonerates the edge detector itself.
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			dbg_strb_cnt    <= 16'd0;
+			dbg_strb_en_cnt <= 16'd0;
+			dbg_strb_last   <= 24'd0;
+			dbg_rej_step    <= 9'd0;
+		end else if (cep && lstrbEdge) begin
+			if (_enable == 1'b1 && ca2 == 1'b0 &&
+			    {ca1, ca0, SEL} == `DRIVE_REG_STEP) begin
+				dbg_rej_step[8] <= 1'b1;
+				if (dbg_rej_step[7:0] != 8'hFF)
+					dbg_rej_step[7:0] <= dbg_rej_step[7:0] + 8'd1;
+			end
+			if (dbg_strb_cnt != 16'hFFFF) dbg_strb_cnt <= dbg_strb_cnt + 16'd1;
+			if (_enable == 1'b0 && dbg_strb_en_cnt != 16'hFFFF)
+				dbg_strb_en_cnt <= dbg_strb_en_cnt + 16'd1;
+			dbg_strb_last <= {dbg_strb_last[17:0],
+			                  _enable, ca2, ca1, ca0, SEL, ism_active};
+		end
+	end
+
 	assign readData = _enable ? 8'hFF :
-	                  (driveReadAddr == `DRIVE_REG_RDDATA0 || driveReadAddr == `DRIVE_REG_RDDATA1) ? diskDataIn :
+	                  (driveReadAddr == `DRIVE_REG_RDDATA0 || driveReadAddr == `DRIVE_REG_RDDATA1) ?
+	                      (mfm_disk ? {mfm_idx_sense, 7'h00} : diskDataIn) :
 							{ driveRegsAsRead[driveReadAddr], 7'h00 };
 		
 	// write drive registers
@@ -371,7 +642,18 @@ module floppy
 			ejectIndicatorTimer <= 24'd0;
 		end 
 		else if(cep) begin
-			if (_enable == 1'b0 && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1) begin
+			// EJECT is ignored while the SWIM is in ISM mode. The ISM Phases
+			// register drives the SAME ca0-2/LSTRB lines as the IWM soft
+			// switches, and the register walks the driver/ROM perform there
+			// pass through $FF = {LSTRB=1, ca2=1, ca1=1, ca0=1}, which this
+			// layer decodes as driveWriteAddr 6 (EJECT) + ca2=1 = "eject the
+			// disk". With a drive selected by ISM devsel that silently ejected
+			// the just-inserted image on every per-mount ISM probe, so the
+			// internal drive could never hold a disk (2026-08-03: the primary
+			// drive stopped reacting to mounts entirely; the external drive was
+			// unaffected because it is not the drive ISM selects). An ISM read
+			// session never needs to eject.
+			if (_enable == 1'b0 && !ism_active && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1) begin
 				// eject the disk
 				driveRegs[`DRIVE_REG_CSTIN] <= 1'b1;
 				ejectIndicatorTimer <= 24'hFFFFFF;
@@ -396,6 +678,16 @@ module floppy
 		end
 		else if(cep && _enable == 1'b0 && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_STEP && ca2 == 1'b0) begin
 			dbg_step_cnt <= dbg_step_cnt + 16'd1;  // PFLP: seek activity meter
+			// DIRTN polarity: 0 = toward track 79, 1 = toward track 0, per the
+			// register table at the top of this file. Briefly inverted on
+			// 2026-08-04 and REVERTED the same day: the inversion was justified
+			// by a 79-step run to the outer stop, but that measurement was taken
+			// with the image mounted to the SECONDARY slot, so the internal drive
+			// was empty and the driver was flailing at a disk that was not there
+			// — an invalid reference. With the disk correctly in the internal
+			// drive the inverted build could not move the head outward at all
+			// (step_cnt=2, driveTrack=0, clamped), so the catalog past cylinder 0
+			// was unreachable and the volume mounted then failed.
 			if (driveRegs[`DRIVE_REG_DIRTN] == 1'b0 && driveTrack != 7'h4F) begin
 				driveTrack <= driveTrack + 1'b1;
 			end
@@ -433,11 +725,24 @@ module floppy
 					6634					$1A56 (6742)
 	*/
 	
-	reg [13:0] driveTachTimer; 
-	reg [13:0] driveTachPeriod;
-	
+	reg [14:0] driveTachTimer;
+	reg [14:0] driveTachPeriod;
+
 	always @(*) begin
-		case (driveTrack[6:4])
+		if (mfm_disk) begin
+			// SuperDrive MFM media (720K DD and 1.44MB HD) spin a CONSTANT
+			// 300 RPM regardless of track (500 kbit/s CAV — swim_ism_read
+			// reference §"MFM mode on"). The zoned table below is GCR-only.
+			// Scaled from the experimentally-calibrated track-0 row:
+			// 9996 clks @500 RPM -> x(500/300) = 16660 clks @300 RPM.
+			// Without this the Welcome-time Sony driver install measured the
+			// zoned GCR rate (500 RPM at track 0, 66% out of spec), failed
+			// its drive-speed check, and System 6.0.8's floppy boot looped
+			// at "Welcome to Macintosh" retrying the install (HW 2026-08-03;
+			// MAME F616 tach-poll window is exactly this measurement).
+			driveTachPeriod <= 15'd16660;
+		end
+		else case (driveTrack[6:4])
 			0: // tracks 0-15
 				driveTachPeriod <= 9996;
 			1: // tracks 16-31
@@ -447,7 +752,7 @@ module floppy
 			3: // tracks 48-63
 				driveTachPeriod <= 7463;
 			default: // tracks 64-79
-				driveTachPeriod <= 6634;	
+				driveTachPeriod <= 6634;
 		endcase
 	end
 	

@@ -79,6 +79,13 @@ void SimBus::BeforeEval()
 				ioctl_file = NULL;
 				*ioctl_download = 0;
 				*ioctl_wr = 0;
+				// hps_io leaves ioctl_addr one-past-the-end when download
+				// deasserts (= total bytes transferred). The cores' end-of-
+				// download size checks (MacLC.sv / sim.v dsk_int_* flags:
+				// dio_addr == 737280 words for a 1.44MB image) key on that
+				// value; leaving the last word's address here made every
+				// floppy size check miss by one word in simulation.
+				*ioctl_addr = ioctl_next_addr;
 				console.AddLog("ioctl_download complete %d", ioctl_next_addr);
 			}
 			if (ioctl_file) {
