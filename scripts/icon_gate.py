@@ -12,6 +12,17 @@ NOT a gate. Boot lands in MacAtrium (auto-start); reach the Finder via
 Application menu > Hide MacAtrium, and PARK THE CURSOR TOP-LEFT (12x
 mouseMove:-60,-60) before capturing — it contaminates the volume-icon cell.
 
+★★ STALE AS OF 2026-08-06 — RE-CALIBRATE BEFORE TRUSTING A VERDICT. The cells
+below are fixed screen coordinates tied to the bench desktop as it looked on
+2026-08-03. That layout has since drifted (an extra list-view window; the
+BlueSCSI Toolbox window moved and grew to 15 items), so the TestGame and Tools
+cells no longer land on icons at all and the script reports colour_px=0 ->
+"FAIL" on a perfectly healthy Finder. A FAIL from this script is therefore not
+evidence of corruption until the cells are re-derived against the current
+desktop. What it proxies for is visual: colour icons crisp, folder tints
+present, no pixel noise — check that on the frame (zoom the icon cluster) and
+compare two boots, which should render pixel-identically.
+
 Requires the standard bench guest (MacAtrium_Sys window at its default boot
 spot, 640x480). Cells + validated readings (good = releases/MacLC_20260802-era
 Finder, bad = probes-off fit ccb82d32, both captured 2026-08-03):
