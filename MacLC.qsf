@@ -107,11 +107,11 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # corrupt and the ISSP probes can't be read. Needs NO JTAG.
 # ★ Uncomment for any floppy/VIA-timer investigation — it is the only working
 # forensic channel on this board. HUD-on and HUD-off are DIFFERENT netlists and
-# re-roll the fit lottery independently, so re-gate after flipping it (icon gate
-# + >= 2-boot Finder soak). COMMENT AGAIN for release fits.
-# ON 2026-08-06: disk-swap mission — HUD row 7 is the media-change witness
-# (floppy.v dbg_media; layout at its port comment).
-set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
+# re-roll the fit lottery independently, so re-gate after flipping it (colour
+# icons by eye + >= 2-boot Finder soak). COMMENT AGAIN for release fits.
+# HUD row 7 = the media-change witness (floppy.v dbg_media; port comment).
+# OFF 2026-08-06 pm: disk-swap mission complete — release configuration.
+# set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"
