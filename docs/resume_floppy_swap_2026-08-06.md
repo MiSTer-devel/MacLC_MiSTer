@@ -1,3 +1,25 @@
+> # ✅ RESOLVED 2026-08-06 — MISSION COMPLETE
+>
+> **The System 6.0.8 install from two 1.44 MB floppies ran end to end on
+> hardware** (build `1c52ade1` = commit `887ebba`): disk 1 mounted at the
+> flashing-`?` screen and booted, the installer ejected each disk itself (the
+> re-enabled ISM eject), both OSD swaps were picked up (2 ejects, 2 guest
+> DskchgClear strobes, 5 clean CSTIN edges on the HUD witness), "Installation
+> on MacHd was successful", and the installed system cold-boots from the vhd.
+> Fix = the §5 design landed as one protocol: SWITCHED sense reg (MAME
+> `!m_dskchg` semantics) + `CSTIN <= ~insertDisk` + empty-hold + ISM eject
+> under `(!ism_active || ism_sel)`. The §3 reverted-fix mystery is explained
+> by MAME runtime: a swap under a live volume bombs a REAL Mac too — the
+> missing SWITCHED flag made even benign transitions incoherent, and the
+> Mac-authentic flow (guest ejects first) was structurally impossible while
+> ISM eject was gated off. Bonus root cause found en route (`dbb736e`): Main
+> packs the matched EXTENSION into the upper `ioctl_index` bits, so every
+> `.img` floppy mount had been a silent no-op since day one — the §11 "eject
+> then mount D2.img" test could never have worked regardless of RTL.
+> Ground-truth captures: `verilator/mame/floppy/swap_tap.lua` + `run_swap.sh`
+> (WSL `~/maclc_run/tap_swapB.txt`, `tap_qscreen.txt`). Historical content
+> below is kept as written.
+
 # Resume — make floppy MEDIA CHANGES visible to the guest
 
 **Mission: unblock a System 6.0.8 install from floppy.** Branch `fix-quicktime`,

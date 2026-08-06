@@ -36,9 +36,6 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 ### Not working yet
 
 - **Floppy writes** (disks mount locked/write-protected)
-- **Hot-swapping floppy images** — a running Mac does not notice that you mounted a
-  different image; reset after a swap, see
-  [Swapping floppies](#-swapping-floppies--reset-the-mac-after-a-swap)
 
 ## Usage
 
@@ -208,49 +205,38 @@ Both common image formats are auto-detected — no conversion needed:
 
 720K images are for PC/FAT disks and need PC Exchange installed in the guest.
 
-### ★ Swapping floppies — reset the Mac after a swap
+### Swapping floppies — works like a real Mac
 
-**A running Mac does not notice that you changed floppy images.** Mount one image per
-session and you will have no trouble; the moment you mount a *second* image while the
-machine is running, the Mac keeps using the first disk's directory while the drive is
-really serving the second disk's data.
+**Media changes are fully reported to the Mac** (verified on hardware, August 2026):
+the drive now presents both the "disk in place" transition and the SuperDrive's
+"disk switched" flag exactly the way a real drive does, so a running Mac notices
+ejects, inserts, and swaps on its own — no reset needed.
 
-**The reliable procedure:** mount the image you want in the OSD, then **reset the
-machine** — OSD ▸ **"Reset & Apply"**. The Mac re-reads the drive from scratch on
-startup, so it always picks up whatever is mounted at that moment. This is also how to
-work through a multi-disk installer: mount the next disk, reset, continue.
+The natural flow is the real-Mac one:
 
-**Ejecting inside the Mac first may or may not help — it is not a reliable
-workaround.** Dragging the floppy icon to the Trash does eject it (the icon
-disappears), but whether the Mac then picks up a newly mounted image has not been
-confirmed, and `Special ▸ Eject Disk` / **⌘E** is often greyed out depending on the
-System version and the window's view mode. Resetting is the procedure that is known to
-work.
+- **Multi-disk installers just work.** The installer ejects the disk itself and asks
+  for the next one; mount the requested image in the OSD and the installation
+  continues. A complete **System 6.0.8 install from its two 1.44 MB floppies**
+  (including the installer's back-and-forth disk swaps) has been run end to end this
+  way on hardware.
+- **In the Finder, eject first** — drag the floppy to the Trash (the Mac ejects it and
+  the drive really empties), then mount the next image in the OSD. The new disk is
+  picked up within a couple of seconds and mounts as itself.
+- Mounting a *different* image over a still-mounted one (no eject) is the equivalent
+  of yanking a disk out of a real drive mid-use: the Mac sees its volume vanish. It
+  copes, but may complain — real Macs never experience this (their drives only eject
+  under software control), so prefer the eject-first flow.
 
-The symptom, if you do end up with a stale volume: the desktop icon and window look
-perfectly normal and still list the *old* disk's files, but every operation on it fails
-with an error like
-
-> You cannot copy "Some File" onto the disk "Whatever", because it cannot be found.
-
-or, opening the floppy itself:
-
-> The disk "Whatever" could not be opened, because it cannot be found.
-
-**Cure: reset the machine from the OSD** ("Reset & Apply"). The stale volume lives in
-the Mac's own volume list and only a restart clears it — re-mounting or ejecting will
-not. Nothing is damaged and the image on your SD card is untouched; after the reset the
-disk mounts correctly.
-
-> This is a core limitation, not a Mac OS one: the drive's "disk in place" and "disk
-> switched" signals do not yet report a media change. It is a known open issue.
+Mount floppies through **"Mount Pri Floppy"** — that is the internal SuperDrive, the
+drive the Mac boots from and the only one that can read 1.44 MB MFM disks. The
+Sec slot emulates a second, external 800K-class drive.
 
 ### Booting from a floppy
 
-Booting from floppy works (verified on hardware, August 2026). Mount the image, then
-reset the machine via the OSD's **"Reset & Apply"** entry so the ROM sees the disk at
-startup — mounting a floppy at the flashing-`?` screen is not currently picked up, so
-the disk has to be in the drive when the machine resets.
+Booting from floppy works (verified on hardware, August 2026). Mount a bootable image
+at the flashing-`?` screen and the ROM picks it up within a few seconds and boots from
+it — this is also how to start a floppy-based OS installation onto a fresh hard-disk
+image. Mounting before a reset ("Reset & Apply") works too.
 
 ## PRAM / NVRAM
 

@@ -210,43 +210,49 @@ Re-verify boot (the screenshot check above) after ANY SR change.
      us) plus the ROM's ~2.5 us GCR poll loop left less gap than the 13-cen
      reload, so the latch never cleared and the CPU re-read each disk byte ~6
      times — duplicates shift a field and break its checksum.
-  2. Nothing — **and this is the one remaining floppy defect: a disk SWAP is
-     invisible to the guest.** That, not a data problem, is what the "mounts and
-     lists but a file copy fails with NO driver error" report was.
-     `dsk_*_ins` is a pure LEVEL from the image size latched at end-of-download,
-     so mounting image B over image A never moves `CSTIN`; the guest keeps A's
-     VCB and cached catalog while SDRAM holds B. The volume looks mounted (window
-     + desktop icon persist) but every File Manager call fails "…cannot be found"
-     **with zero disk I/O** — a stale `vRefNum`, so no read ever reaches the
-     driver. Only the first mount after reset works, `CSTIN` resetting to 1 being
-     the one genuine edge.
-     - ★★ **WORKAROUND: mount the image, then RESET (OSD "Reset & Apply").** Only a
-       reboot clears a stale volume. **Whether ejecting first helps is UNVERIFIED** —
-       drag-to-Trash genuinely ejects (icon disappears) and `Special ▸ Eject Disk` /
-       Cmd-E is often greyed out, but the one test that appeared to prove ejecting
-       useless was **invalid**: its second image was `Install Disk 1 RAW.dsk` at
-       1,301,504 B, not a recognised floppy size, so no disk was ever presented.
-       ★ An unrecognised size makes `dsk_*_ins` stay 0 and the drive silently keep
-       the previous disk — check byte sizes before drawing any conclusion.
-    - ★★ **MISSION DOC: [`docs/resume_floppy_swap_2026-08-06.md`](docs/resume_floppy_swap_2026-08-06.md)**
-       — the media-change fix, scoped to unblocking a System 6.0.8 install from two
-       1.44 MB floppies. Includes the ISM-mode eject gate (`floppy.v:656` disables
-       eject while `ism_active`, so an MFM installer may be unable to eject at all),
-       the SWITCHED sense-register design, the MAME ground-truth step, and the
-       ordered gate that catches the regression the reverted attempt caused.
-     - ★★ **An attempted fix was REVERTED (`ebbdac6`): it regressed the mount.**
-       Making `CSTIN` drop across a mount (hold the drive empty for ~2 s, plus
-       `CSTIN <= ~insertDisk` in floppy.v so the drop is even visible) gave a
-       clean A/B *failure*: pre-fix ×2 clean, fixed ×2 died at the mount with
-       Finder "bad F-Line" and `-109 nilHandleErr`. Prime suspect for why: the
-       **SWITCHED sense register** (floppy.v reg 6 read) is hardwired `1'b0`, so
-       the OS is told the medium left and returned while the disk-switched flag
-       insists nothing changed. **A second attempt must implement SWITCHED in
-       the same change**, not just toggle `CSTIN`. `verilator/tb_disk_swap.v`
-       covers the four properties involved and already caught one no-op fix
-       before it shipped — run it after any `insertDisk`/`CSTIN` edit.
+  2. **MEDIA CHANGES — FIXED AND HW-VALIDATED 2026-08-06** (`887ebba` +
+     `dbb736e`; MISSION COMPLETE: a full System 6.0.8 install from its two
+     1.44 MB floppies ran end to end — installer ejects, both OSD disk swaps,
+     install onto a fresh SCSI vhd, installed system boots). The ghost-volume
+     class ("mounts and lists but every call fails with NO driver error and
+     zero disk I/O") was the guest never being told the medium changed. Three
+     inseparable pieces, all MAME-runtime-grounded (tap_swapB/tap_qscreen):
+     - **SWITCHED sense reg** (read reg 6 = MAME DiskChg = `!m_dskchg`):
+       reset 0, SET on any media removal (fall of `insertDisk`), survives the
+       next insert, cleared ONLY by the guest's DskchgClear strobe
+       (`strobeCmd == 4'hC`). The Sony driver polls NoDiskInPl+DiskChg as a
+       PAIR every ~0.8 s and strobes the clear itself — watched live on HW
+       (HUD w7 `dskchg_clears` increments). Landing the CSTIN transition
+       WITHOUT this register was the reverted-`ebbdac6` regression.
+     - **CSTIN reports `~insertDisk`** + the MacLC.sv/sim.v empty-hold (drop
+       media at download START, hold 2.06 s past the end).
+     - **ISM eject re-enabled** under `(!ism_active || ism_sel)` — the MAME
+       devsel-forwarding condition. The old blanket `!ism_active` gate made an
+       MFM installer structurally unable to eject; the phases-walk phantom
+       ejects it guarded against all run with Mode b7 CLEAR, so the qualifier
+       blocks them and passes genuine ejects (installer ejects seen on HW).
+     ALSO fixed en route (`dbb736e`): **Main packs the matched extension of a
+     multi-extension F entry into the upper `ioctl_index` bits** (.dsk = 8'h01,
+     .img = 8'h41); the flag latches compared the full byte, so every `.img`
+     mount was a silent no-op (downloaded, never presented) since day one —
+     compare `dio_index[5:0]` only. `verilator/tb_disk_swap.v` covers the full
+     protocol (incl. walk-must-not-eject and the 8'h41-index mount) — run it
+     after any `insertDisk`/`CSTIN`/eject edit. HUD row 7 = the media witness
+     (`floppy.v` dbg_media; decode in `scripts/parse_hud.py`).
+     ★ Swap-under-a-live-volume (no eject) is HOSTILE ON A REAL MAC TOO —
+     MAME 6.0.8 bombs ("Disk Initialization package not present") when the
+     boot floppy is yanked: drives only eject under software control, so the
+     OS has no graceful path. The Mac-authentic flow is guest-eject-first
+     (or the installer's own eject), THEN mount the next image.
+     ★ OSD/bench lore from the validation (ops crib additions): the in-core
+     OSD opens with the cursor ON "Mount Pri Floppy" after a FRESH CORE LOAD
+     but remembers its row and browser position across opens within a
+     session; the screenshot-filename oracle names the LAST file downloaded
+     this core session — it proves a pick happened, NOT which slot took it.
   ★ `byte_cnt` frozen + `$142` all-benign means **no read was attempted** — do
-  not read it as "reads returned bad data".
+  not read it as "reads returned bad data". (And `byte_cnt` alone is NOT proof
+  of internal-drive reads — the GCR delivery counter also churns on garbage
+  with no disk in; corroborate with w7 `insertDisk`/`CSTIN`.)
   The old parked doc `docs/resume_floppy_controller_2026-07-07.md` is RESOLVED;
   its "SDRAM region != image" theory was never confirmed and its JTAG chain no
   longer works (dead hub). Offline instruments that settled all of this in
