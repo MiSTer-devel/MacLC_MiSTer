@@ -220,10 +220,15 @@ Re-verify boot (the screenshot check above) after ANY SR change.
      **with zero disk I/O** — a stale `vRefNum`, so no read ever reaches the
      driver. Only the first mount after reset works, `CSTIN` resetting to 1 being
      the one genuine edge.
-     - ★ **WORKAROUND until this is fixed: eject in the guest (Special ▸ Eject
-       Disk, or Cmd-E) BEFORE mounting a different image.** If a volume has
-       already gone stale, only a guest **reboot** clears it — an eject +
-       re-mount does not.
+     - ★★ **WORKAROUND: mount the image, then RESET (OSD "Reset & Apply").**
+       **Ejecting first does NOT work** — tested 2026-08-06 on 7.6.1 / fit
+       `e51a4acd`: drag-to-Trash genuinely ejects (icon disappears), but mounting
+       a *different* image then brings the OLD volume back (mount oracle read
+       "Install Disk 1 RAW" while the desktop still showed "Fetch" listing
+       Fetch's files), and `Special ▸ Eject Disk` / Cmd-E was **greyed out** with
+       the disk's window frontmost in list view. That is more evidence for the
+       SWITCHED theory below: the OS re-mounts its cached volume because nothing
+       tells it the medium changed. Only a reboot clears a stale volume.
      - ★★ **An attempted fix was REVERTED (`ebbdac6`): it regressed the mount.**
        Making `CSTIN` drop across a mount (hold the drive empty for ~2 s, plus
        `CSTIN <= ~insertDisk` in floppy.v so the drop is even visible) gave a
