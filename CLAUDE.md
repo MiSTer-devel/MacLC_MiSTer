@@ -210,17 +210,31 @@ Re-verify boot (the screenshot check above) after ANY SR change.
      us) plus the ROM's ~2.5 us GCR poll loop left less gap than the 13-cen
      reload, so the latch never cleared and the CPU re-read each disk byte ~6
      times — duplicates shift a field and break its checksum.
-  2. `ef430a2` — **a disk SWAP was invisible to the guest**, which is what the
-     "mounts and lists but a file copy fails with NO driver error" report
-     actually was. `dsk_*_ins` was a pure LEVEL from the image size latched at
-     end-of-download, so mounting image B over image A never moved `CSTIN`; the
-     guest kept A's VCB and cached catalog while SDRAM held B. The volume looked
-     mounted (window + desktop icon persisted) but every File Manager call
-     failed "…cannot be found" **with zero disk I/O** — a stale `vRefNum`, so no
-     read ever reached the driver. Fix: hold the drive EMPTY from download start
-     until `DSK_EMPTY_CY` (2.06 s) after it ends, so the guest sees eject then
-     insert. ★ A ghost volume **persists until a guest reboot** — an eject +
-     re-mount does not clear it, so cold-boot before judging any floppy fix.
+  2. Nothing — **and this is the one remaining floppy defect: a disk SWAP is
+     invisible to the guest.** That, not a data problem, is what the "mounts and
+     lists but a file copy fails with NO driver error" report was.
+     `dsk_*_ins` is a pure LEVEL from the image size latched at end-of-download,
+     so mounting image B over image A never moves `CSTIN`; the guest keeps A's
+     VCB and cached catalog while SDRAM holds B. The volume looks mounted (window
+     + desktop icon persist) but every File Manager call fails "…cannot be found"
+     **with zero disk I/O** — a stale `vRefNum`, so no read ever reaches the
+     driver. Only the first mount after reset works, `CSTIN` resetting to 1 being
+     the one genuine edge.
+     - ★ **WORKAROUND until this is fixed: eject in the guest (Special ▸ Eject
+       Disk, or Cmd-E) BEFORE mounting a different image.** If a volume has
+       already gone stale, only a guest **reboot** clears it — an eject +
+       re-mount does not.
+     - ★★ **An attempted fix was REVERTED (`ebbdac6`): it regressed the mount.**
+       Making `CSTIN` drop across a mount (hold the drive empty for ~2 s, plus
+       `CSTIN <= ~insertDisk` in floppy.v so the drop is even visible) gave a
+       clean A/B *failure*: pre-fix ×2 clean, fixed ×2 died at the mount with
+       Finder "bad F-Line" and `-109 nilHandleErr`. Prime suspect for why: the
+       **SWITCHED sense register** (floppy.v reg 6 read) is hardwired `1'b0`, so
+       the OS is told the medium left and returned while the disk-switched flag
+       insists nothing changed. **A second attempt must implement SWITCHED in
+       the same change**, not just toggle `CSTIN`. `verilator/tb_disk_swap.v`
+       covers the four properties involved and already caught one no-op fix
+       before it shipped — run it after any `insertDisk`/`CSTIN` edit.
   ★ `byte_cnt` frozen + `$142` all-benign means **no read was attempted** — do
   not read it as "reads returned bad data".
   The old parked doc `docs/resume_floppy_controller_2026-07-07.md` is RESOLVED;
