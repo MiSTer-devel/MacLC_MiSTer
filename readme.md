@@ -220,12 +220,12 @@ machine** — OSD ▸ **"Reset & Apply"**. The Mac re-reads the drive from scrat
 startup, so it always picks up whatever is mounted at that moment. This is also how to
 work through a multi-disk installer: mount the next disk, reset, continue.
 
-**Ejecting inside the Mac is *not* enough** (tested August 2026). Dragging the floppy
-icon to the Trash does eject it — the icon disappears — but if you then mount a
-different image, the Mac brings the *old* volume back rather than reading the new one,
-because the drive cannot yet tell the Mac that the medium was swapped. `Special ▸ Eject
-Disk` / **⌘E** may also be greyed out depending on the System version and the window's
-view mode.
+**Ejecting inside the Mac first may or may not help — it is not a reliable
+workaround.** Dragging the floppy icon to the Trash does eject it (the icon
+disappears), but whether the Mac then picks up a newly mounted image has not been
+confirmed, and `Special ▸ Eject Disk` / **⌘E** is often greyed out depending on the
+System version and the window's view mode. Resetting is the procedure that is known to
+work.
 
 The symptom, if you do end up with a stale volume: the desktop icon and window look
 perfectly normal and still list the *old* disk's files, but every operation on it fails

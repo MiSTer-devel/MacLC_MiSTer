@@ -220,15 +220,20 @@ Re-verify boot (the screenshot check above) after ANY SR change.
      **with zero disk I/O** — a stale `vRefNum`, so no read ever reaches the
      driver. Only the first mount after reset works, `CSTIN` resetting to 1 being
      the one genuine edge.
-     - ★★ **WORKAROUND: mount the image, then RESET (OSD "Reset & Apply").**
-       **Ejecting first does NOT work** — tested 2026-08-06 on 7.6.1 / fit
-       `e51a4acd`: drag-to-Trash genuinely ejects (icon disappears), but mounting
-       a *different* image then brings the OLD volume back (mount oracle read
-       "Install Disk 1 RAW" while the desktop still showed "Fetch" listing
-       Fetch's files), and `Special ▸ Eject Disk` / Cmd-E was **greyed out** with
-       the disk's window frontmost in list view. That is more evidence for the
-       SWITCHED theory below: the OS re-mounts its cached volume because nothing
-       tells it the medium changed. Only a reboot clears a stale volume.
+     - ★★ **WORKAROUND: mount the image, then RESET (OSD "Reset & Apply").** Only a
+       reboot clears a stale volume. **Whether ejecting first helps is UNVERIFIED** —
+       drag-to-Trash genuinely ejects (icon disappears) and `Special ▸ Eject Disk` /
+       Cmd-E is often greyed out, but the one test that appeared to prove ejecting
+       useless was **invalid**: its second image was `Install Disk 1 RAW.dsk` at
+       1,301,504 B, not a recognised floppy size, so no disk was ever presented.
+       ★ An unrecognised size makes `dsk_*_ins` stay 0 and the drive silently keep
+       the previous disk — check byte sizes before drawing any conclusion.
+    - ★★ **MISSION DOC: [`docs/resume_floppy_swap_2026-08-06.md`](docs/resume_floppy_swap_2026-08-06.md)**
+       — the media-change fix, scoped to unblocking a System 6.0.8 install from two
+       1.44 MB floppies. Includes the ISM-mode eject gate (`floppy.v:656` disables
+       eject while `ism_active`, so an MFM installer may be unable to eject at all),
+       the SWITCHED sense-register design, the MAME ground-truth step, and the
+       ordered gate that catches the regression the reverted attempt caused.
      - ★★ **An attempted fix was REVERTED (`ebbdac6`): it regressed the mount.**
        Making `CSTIN` drop across a mount (hold the drive empty for ~2 s, plus
        `CSTIN <= ~insertDisk` in floppy.v so the drop is even visible) gave a
