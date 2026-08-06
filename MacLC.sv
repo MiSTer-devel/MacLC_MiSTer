@@ -1973,54 +1973,14 @@ module emu
 	reg dc42_skip;
 	reg [7:0] dc42_disk_format;  // DC42 byte 0x50: 0=400K GCR,1=800K GCR,2=720K MFM,3=1440K MFM
 
-	// ── Disk CHANGE must be presented as a TRANSITION (2026-08-05) ─────────
-	// The guest learns about media only by polling the drive's CSTIN sense line
-	// (floppy.v `DRIVE_REG_CSTIN`), so "a disk is present" is not enough — it
-	// must see no-disk and THEN disk to run its unmount/mount machinery.
-	// Until now dsk_*_ins was a pure LEVEL derived from the image size latched
-	// at end-of-download, so mounting image B while image A was in the drive
-	// never moved CSTIN: the guest kept image A's VCB and cached catalog while
-	// SDRAM already held image B. The volume then LOOKED mounted (its window
-	// and desktop icon persisted, listing A's catalog) but every File Manager
-	// call failed "…cannot be found" with ZERO disk I/O, because the Finder was
-	// resolving a stale vRefNum — no read ever reached the driver, which is why
-	// the Sony driver posted no error code and the byte counter never moved.
-	// Only the first mount after reset worked, CSTIN resetting to 1 being the
-	// one genuine edge. (Measured on hardware: after a swap, three separate
-	// mounts of the same good image produced 0 delivered bytes and 0 driver
-	// completions, while an explicit guest eject + mount read the volume fine.)
-	// So hold the drive EMPTY from the start of a download until DSK_EMPTY_CY
-	// after it ends: the guest sees the disk leave, unmounts cleanly, then sees
-	// a fresh insert. The hold must outlast the guest's drive poll — 2.06 s at
-	// clk_sys ≈ 32.5 MHz — and costs nothing, the upload already takes seconds.
-	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
-	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
-	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
-	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
-
 	// any known type of disk image inserted?
-	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
+	wire dsk_int_ins = dsk_int_ds || dsk_int_ss || dsk_int_mfm;
+	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm;
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
-		// Download START = the mount event: drop the media immediately and hold
-		// the timer at 0 for the whole upload (SDRAM is being overwritten, so
-		// the old geometry is meaningless the moment the transfer begins).
-		if(~old_down && dio_download && dio_index == 1) begin
-			dsk_int_ds  <= 0;
-			dsk_int_ss  <= 0;
-			dsk_int_mfm <= 0;
-			dsk_int_hd  <= 0;
-			dsk_int_empty_cy <= 26'd0;
-		end
-		else if(dio_download && dio_index == 1)
-			dsk_int_empty_cy <= 26'd0;
-		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
-			dsk_int_empty_cy <= dsk_int_empty_cy + 26'd1;
-
 		if(old_down && ~dio_download && dio_index == 1) begin
 			// GCR (IWM path) — raw word count, or DC42 disk_format byte (rusty-backup
 			// dc42.rs: 0x50 = 0/1/2/3 = 400G/800G/720M/1440M, authoritative + tag-agnostic).
@@ -2044,19 +2004,6 @@ module emu
 		reg old_down;
 
 		old_down <= dio_download;
-		// see the dsk_int_* block above: a swap must present as eject -> insert
-		if(~old_down && dio_download && dio_index == 2) begin
-			dsk_ext_ds  <= 0;
-			dsk_ext_ss  <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd  <= 0;
-			dsk_ext_empty_cy <= 26'd0;
-		end
-		else if(dio_download && dio_index == 2)
-			dsk_ext_empty_cy <= 26'd0;
-		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
-			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
-
 		if(old_down && ~dio_download && dio_index == 2) begin
 			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
 			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
