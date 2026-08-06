@@ -92,11 +92,8 @@ Images use a raw SCSI format (same as the SCSI2SD project, documented
 persisted to the image file.
 
 Cold boots of System 6.0.8, 7.1, and 7.5.5 to the Finder desktop have been verified, and
-SCSI writes were validated byte-exact on hardware (July 2026) after a series of reliability
-fixes: a registered CPU status-read path, DREQ data-settle pacing to stop byte slip,
-read-prefetch/completion-IRQ fixes, and a write word-pairing fix. A blank 20 MB image with
-a partition table and SCSI driver is included as `releases/empty_hdd.zip`; a matching image is
-also available from the
+SCSI writes were validated. A blank 20 MB image with a partition table and SCSI driver is 
+included as `releases/empty_hdd.zip`; a matching image is also available from the
 [MacPlus core releases](https://github.com/MiSTer-devel/MacPlus_MiSTer/tree/master/releases).
 A tool to create hard-disk images (with driver and partition table) is available
 [here](https://diskjockey.onegeekarmy.eu/).
@@ -114,18 +111,14 @@ The core emulates an Apple-compatible CD-ROM drive on **SCSI ID 3**:
 
 **The guest System must have a CD driver installed** — the stock Apple *CD-ROM* extension
 works: the drive presents an AppleCD-family identity (`CD-ROM CDU-8004`, the AppleCD 300
-mechanism), which the stock driver requires — a generic identity was tried and the driver
-refuses to attach. The driver then speaks its standard SCSI-2 dialect (READ TOC incl. the
-old-style full-TOC/BCD control-byte forms, PLAY MSF/TRACK, READ SUB-CHANNEL) — all served
-byte-exact against BlueSCSI and Snow as references. Third-party CD drivers should also
-work. Without a driver the disc mounts nothing on the desktop.
+mechanism).
 
 Image format support:
 
 | Format | Status |
 |---|---|
-| `.iso` / `.toast` / `.bin` (2048-byte sectors) | **Working** — verified on hardware, stock MiSTer Main |
-| `.cue`+`.bin` (2352-byte raw), `.chd` | **Working** — verified on hardware (July 2026); needs an updated Main_MiSTer, see [Updating Main_MiSTer](#updating-main_mister) |
+| `.iso` / `.toast` / `.bin` (2048-byte sectors) | stock MiSTer Main |
+| `.cue`+`.bin` (2352-byte raw), `.chd` | needs an updated Main_MiSTer, see [Updating Main_MiSTer](#updating-main_mister) |
 
 **CD audio is fully supported** (July 2026): audio and mixed-mode discs mount correctly
 (pure-audio discs reject data reads like a real drive — the Audio CD Access extension
@@ -162,8 +155,7 @@ commands and MiSTer's Main serves a folder on the SD card as shared storage.
    **Download** copies a file to the Mac, and **File → Upload File** copies one
    back to the SD card.
 
-Both directions are verified byte-exact on hardware for multi-megabyte files
-(August 2026), at roughly 120 KB/s down and 170 KB/s up.
+Both directions are verified and perform at roughly 120 KB/s down and 170 KB/s up.
 
 This requires the updated Main_MiSTer — see [Updating Main_MiSTer](#updating-main_mister).
 Stock Main has no Toolbox handler; the core degrades gracefully without it, and Toolbox
@@ -171,29 +163,36 @@ commands simply report that no shared folder is available.
 
 *BlueSCSI Toolbox files distributed with permission from Eric Helgeson (c) 2026*
 
-## Updating Main_MiSTer
+## CD Swapping (BlueSCSI Toolbox)
+
+To use CD Swapping via BlueSCSI toolbox, Create a folder in `/media/fat/games/MacLC` called `CD3` and place CD images into that folder.
+
+The updated Main_MiSTer must be running.
+
+Note- this has not been fully tested yet.
+
+
+## Using custom MiSTer Binary for this core
 
 Two features — **file transfer** and **CUE/BIN + CHD CD images** — need support in
 MiSTer's main executable. The changes are **merged upstream**
 ([PR #1255](https://github.com/MiSTer-devel/Main_MiSTer/pull/1255)) but have not
 appeared in a released MiSTer binary yet, so `update_all` / the standard updater will
-not give you them. Until a release includes them, install the binary by hand:
+not give you them. Until a release includes them, perform this task:
 
 1. Back up the existing one: `cp /media/fat/MiSTer /media/fat/MiSTer.orig`
 2. cp `/media/fat/games/MacLC/MiSTer /media/fat/MiSTer` and make it executable (`chmod +x /media/fat/MiSTer`).
 3. Reboot the MiSTer.
 
-Note that the normal MiSTer updater will overwrite this file with the current official
+Note that the normal MiSTer updater may overwrite this file with the current official
 build, which silently removes both features — re-copy it after running an update, until
 a release ships with the merged support. Once one does, the updater is all you need and
 this step goes away.
 
 ## Floppy disk support
 
-**Floppy reading works** — 800 KB GCR and 1.44 MB MFM alike (verified on hardware,
-August 2026: disks mount, applications launch straight off a floppy, and files copy
-from a floppy to a hard disk). Mount images through the OSD's **"Mount Pri Floppy"**
-slot — the Pri slot is the Mac's internal SuperDrive. Disks are **read-only** for now:
+**Floppy reading works** — 800 KB GCR and 1.44 MB MFM 
+Mount images through the OSD's **"Mount Pri Floppy"** slot. Disks are **read-only** for now:
 they mount write-protected, exactly like a locked physical floppy.
 
 Both common image formats are auto-detected — no conversion needed:
@@ -263,8 +262,8 @@ The boot ROM runs a destructive RAM test (the "memory march") on cold boot, whic
 a 10 MB cold boot slow. You can optionally patch the ROM to skip this test and take the ROM's
 fast warm-start path instead.
 
-> Both the stock and the patched ROM have been verified booting System 7.5.5 to the desktop on
-> current builds (July 2026). The stock ROM remains the reference configuration — if you hit
+> Both the stock and the patched ROM have been verified booting System 7.5.5 to the desktop.
+> The stock ROM remains the reference configuration — if you hit
 > boot problems, retest with a stock, unpatched ROM before reporting.
 
 A patcher is provided at
@@ -282,12 +281,12 @@ passes. Back up your original ROM, then copy the patched file to your `MACLC` fo
 
 ## Display
 
-The core supports two monitors, selectable in the OSD:
+The core supports two monitors/resolutions, selectable in the OSD:
 
-- **640×480 VGA**
+- **640×480 VGA** (supports 256-colors only)
 - **512×384 12" RGB** (the LC's "Macintosh 12-inch RGB Display")
 
-All the LC's colour depths render — 1, 2, 4, 8 and 16bpp. Aspect ratio and scaling
+All the LC's colour depths render — 1, 2, 4, 8 and 16bpp* (only available on 512x384 resolution, due to VRAM limtations- . Aspect ratio and scaling
 options are available in the OSD.
 
 ## Keyboard & mouse
@@ -323,6 +322,21 @@ make
 
 See [CLAUDE.md](CLAUDE.md) and the `docs/` directory for architecture notes and the
 development workflow.
+
+## AI Disclaimer
+Please be aware this core was developed with heavy use of AI tooling, including Claude (Fable, Opus, Sonnet Models) and GPT (Codex), and does borrow for MAME. That said, a physical Macintosh LC computer was also used to assist with the development of this core.
+
+## Known Inaccuracies
+- VRAM is limited to 384KB which cannot exist on a physical Macintosh LC (only 256KB or 512KB sticks are available)
+- TG68K CPU is not cycle accurate, however the CPU test suite included in this repository was used to verify CPU instruction accuracy on the physical hardware
+
+## MAME Sourced Components
+- SCSI subsystem
+- EGRET (this core does uses the original EGRET firmware which is baked into core) this includes ADB connectivity
+- Floppy (SWIM)
+- CD-ROM & CD-ROM Audio
+- V8 (video subsystem)
+- ASC (sound subsystem)* Personally I could not notice sound differences between the mame core for the Macintosh LC sound system and my physical Macintosh LC
 
 ## Credits
 
