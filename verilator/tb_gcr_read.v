@@ -25,6 +25,20 @@
  * A stream that is clean fast and dirty slow is a delivery/latch timing bug,
  * not an encoder bug.
  *
+ * TRACK/SIDE SWEEP (2026-08-05 pm, the "mounts but file content fails" hunt):
+ *   +track=N  step the head to track N through the real drive-register
+ *             protocol (DIRTN + N STEP strobes on the phase lines) before
+ *             reading — this also exercises floppy.v's driveTrack counter.
+ *   +side=N   park the phases on RDDATA1 (side 1) instead of RDDATA0.
+ *   +ncap=N   capture N bytes (default 6000; use 14000 for a full 12-spt
+ *             track cycle).
+ * The image model is a full 819200-byte self-addressing pattern: 512-byte
+ * block B holds [B.lo, B.hi, (B+j)&0xFF ...], so a decoded DATA field
+ * identifies exactly which image offset the encoder actually fetched.
+ * scripts/gcr_data_census.py decodes address AND data fields and verifies
+ * each sector's payload against the offset the standard 800K GCR layout
+ * demands — wrong-but-checksum-valid serving is exactly what it catches.
+ *
  * Build + run (Verilator 5.x, from verilator/):
  *   verilator --binary -j 0 -Wno-fatal --timescale 1ns/1ps +define+SIMULATION \
  *     -I../rtl --Mdir /tmp/obj_gcr --top-module tb_gcr_read tb_gcr_read.v \
@@ -58,16 +72,18 @@ module tb_gcr_read;
 	reg        driveSel = 1;     // internal drive select (IWM _enable term)
 	wire [15:0] dataOut;
 
-	// ---- disk image model. The ADDRESS fields under test are generated from
-	// geometry, not from image content, so the payload only needs to be
-	// non-degenerate. Track 0 both sides = 12 sectors * 512 * 2 = 12288 B.
-	localparam IMG_BYTES = 16384;
+	// ---- disk image model. Full 800K so every track/side/zone is addressable.
+	// Self-addressing pattern (see header): block number in bytes 0-1, then
+	// (B+j)&0xFF — any mis-mapped fetch is identifiable from the payload.
+	localparam IMG_BYTES = 819200;
 	reg [7:0] img [0:IMG_BYTES-1];
 
 	wire [21:0] dskReadAddrInt, dskReadAddrExt;
 	reg         dskReadAckInt = 0;
 	wire        dskReadAckExt = 1'b0;
 	wire [7:0]  dskReadData = (dskReadAddrInt < IMG_BYTES) ? img[dskReadAddrInt] : 8'hE5;
+	wire [6:0]  dbg_track;
+	wire        dbg_side;
 
 	// Periodic fetch ack, mimicking addrController's extra bus slot (~2 us).
 	integer ack_div = 0;
@@ -106,7 +122,7 @@ module tb_gcr_read;
 		.dskReadData(dskReadData),
 		.dbg_ism_flpe(),
 		.dbg_flp_byte_cnt(), .dbg_flp_miss_cnt(), .dbg_flp_disk_data(),
-		.dbg_flp_track(), .dbg_flp_side(), .dbg_flp_step_cnt(),
+		.dbg_flp_track(dbg_track), .dbg_flp_side(dbg_side), .dbg_flp_step_cnt(),
 		.dbg_iwm_latch(), .dbg_flp_byte_stb(), .dbg_flp_raw(),
 		.dbg_ism_state(),
 		.dbg_flp_strb_cnt(), .dbg_flp_strb_en_cnt(), .dbg_flp_strb_last(),
@@ -128,6 +144,9 @@ module tb_gcr_read;
 	//   +pollgap=N clocks between accesses           (default 40 = the VIA read)
 	integer pollgap = 0;
 	integer acclen  = 10;
+	integer req_track = 0;
+	integer req_side  = 0;
+	integer ncap_want = 6000;
 
 	task swim_wr(input [3:0] a, input [7:0] d);
 	begin
@@ -153,19 +172,43 @@ module tb_gcr_read;
 	end
 	endtask
 
-	localparam NCAP = 6000;
-	reg [7:0] cap [0:NCAP-1];
+	localparam NCAP_MAX = 20000;
+	reg [7:0] cap [0:NCAP_MAX-1];
 	integer   ncap = 0;
 
+	// Drive-register write through the phase lines, the way the ROM does it:
+	// {ca1,ca0,SEL} = register address, ca2 = data bit, committed on the
+	// LSTRB falling edge (floppy.v lstrbEdge). SEL is a direct wire (VIA PA5),
+	// not an IWM soft switch, so the caller sets it before this task.
+	task drive_wr(input rca1, input rca0, input dat);
+	begin
+		swim_wr(rca1 ? 4'd3 : 4'd2, 8'h00);  // ca1
+		swim_wr(rca0 ? 4'd1 : 4'd0, 8'h00);  // ca0
+		swim_wr(dat  ? 4'd5 : 4'd4, 8'h00);  // ca2 = data value
+		swim_wr(4'd7, 8'h00);                // LSTRB on
+		swim_wr(4'd6, 8'h00);                // LSTRB off -> falling edge commits
+		repeat (200) @(posedge clk);         // drive settle
+	end
+	endtask
+
 	reg [7:0] v;
-	integer   i, guard;
+	integer   i, guard, blk;
 
 	initial begin
-		for (i = 0; i < IMG_BYTES; i = i + 1)
-			img[i] = i[7:0] ^ 8'h5A;     // non-degenerate payload
+		// self-addressing image: block number in bytes 0/1, then (B+j)&0xFF
+		for (i = 0; i < IMG_BYTES; i = i + 1) begin
+			blk = i >> 9;
+			img[i] = ((i & 511) == 0) ? (blk & 255) :
+			         ((i & 511) == 1) ? ((blk >> 8) & 255) :
+			         ((blk + (i & 511)) & 255);
+		end
 
 		if (!$value$plusargs("pollgap=%d", pollgap)) pollgap = 0;
 		if (!$value$plusargs("acclen=%d", acclen))  acclen  = 10;
+		if (!$value$plusargs("track=%d", req_track)) req_track = 0;
+		if (!$value$plusargs("side=%d", req_side))   req_side  = 0;
+		if (!$value$plusargs("ncap=%d", ncap_want))  ncap_want = 6000;
+		if (ncap_want > NCAP_MAX) ncap_want = NCAP_MAX;
 
 		_reset = 0;
 		repeat (40) @(posedge clk);
@@ -177,18 +220,30 @@ module tb_gcr_read;
 		swim_wr(4'd9,  8'h00);   // disk enable ON  (motor)
 		swim_wr(4'd14, 8'h00);   // q7 = 0
 		swim_wr(4'd12, 8'h00);   // q6 = 0  -> read data register
-		// park the phases on RDDATA0 = {ca2,ca1,ca0,SEL} = 4'b1000
-		swim_wr(4'd5,  8'h00);   // ca2 = 1
+
+		// ---- seek: DIRTN=0 (toward 79), then req_track STEP strobes ----
+		SEL = 1'b0;              // register addressing needs SEL low
+		if (req_track > 0) begin
+			drive_wr(1'b0, 1'b0, 1'b0);            // DIRTN = 0: step inward
+			for (i = 0; i < req_track; i = i + 1)
+				drive_wr(1'b0, 1'b1, 1'b0);        // STEP (write 0 = do step)
+		end
+
+		// park the phases on RDDATA0/1 = {ca2,ca1,ca0,SEL} = 100,side
 		swim_wr(4'd2,  8'h00);   // ca1 = 0
 		swim_wr(4'd0,  8'h00);   // ca0 = 0
-		SEL = 1'b0;              // side 0
+		SEL = req_side[0];       // head select BEFORE ca2 raises the read addr
+		swim_wr(4'd5,  8'h00);   // ca2 = 1
 
 		// the post-enable squelch in swim.v is ~126 us; wait it out
 		repeat (200000) @(posedge clk);
 
+		$display("# tb_gcr_read seek done: driveTrack=%0d driveSide=%0d (want %0d/%0d)",
+		         dbg_track, dbg_side, req_track, req_side);
+
 		// ---- poll the data register; MSB set = a valid byte (ROM's rule) ----
 		guard = 0;
-		while (ncap < NCAP && guard < 40000000) begin
+		while (ncap < ncap_want && guard < 40000000) begin
 			swim_rd(4'd12, v);
 			if (v[7]) begin
 				cap[ncap] = v;
@@ -197,7 +252,8 @@ module tb_gcr_read;
 			guard = guard + 1;
 		end
 
-		$display("# tb_gcr_read pollgap=%0d captured=%0d", pollgap, ncap);
+		$display("# tb_gcr_read pollgap=%0d acclen=%0d track=%0d side=%0d captured=%0d",
+		         pollgap, acclen, req_track, req_side, ncap);
 		for (i = 0; i < ncap; i = i + 1)
 			$write("%02x%s", cap[i], ((i % 16) == 15) ? "\n" : " ");
 		$write("\n");
