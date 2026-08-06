@@ -200,19 +200,39 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   pulse, VIA1 PA7, and the VIA timer half-rate fix (`33ebdd1` — the driver's
   install-time drive-speed check is timer-paced, so a 2x timer error would
   also have corrupted it).
-- **800K GCR disks WORK as of 2026-08-05** (`2804d02`). They previously threw
-  "This disk is unreadable" (`-69 badCksmErr`). Root cause was the IWM
-  read-data latch clear being retriggered from the LEVEL `iwmRead` instead of
-  firing once at the END of the access: the LC's E-paced VPA accesses (~1.23
-  us) plus the ROM's ~2.5 us GCR poll loop left less gap than the 13-cen
-  reload, so the latch never cleared and the CPU re-read each disk byte ~6
-  times — duplicates shift a field and break its checksum. HW: 5,040 bytes
-  read and stuck on track 0 -> 47,674 bytes, head stepping, volume mounts and
-  the catalog lists. The old parked doc
-  `docs/resume_floppy_controller_2026-07-07.md` is marked RESOLVED; its
-  "SDRAM region != image" theory was never confirmed and its JTAG instrument
-  chain no longer works (dead hub) — use `verilator/tb_gcr_read.v` +
-  `scripts/gcr_census.py`, which found this offline in minutes.
+- **800K GCR disks WORK END-TO-END as of 2026-08-05** — mount, catalog, and
+  **file reads**: on a cold boot a 482K application was launched off an 800K
+  GCR floppy and copied to a SCSI disk with zero driver errors (head seeking,
+  `step_cnt` 1 -> 311). Two fixes got here:
+  1. `2804d02` — "This disk is unreadable" (`-69 badCksmErr`). The IWM
+     read-data latch clear was retriggered from the LEVEL `iwmRead` instead of
+     firing once at the END of the access: the LC's E-paced VPA accesses (~1.23
+     us) plus the ROM's ~2.5 us GCR poll loop left less gap than the 13-cen
+     reload, so the latch never cleared and the CPU re-read each disk byte ~6
+     times — duplicates shift a field and break its checksum.
+  2. `ef430a2` — **a disk SWAP was invisible to the guest**, which is what the
+     "mounts and lists but a file copy fails with NO driver error" report
+     actually was. `dsk_*_ins` was a pure LEVEL from the image size latched at
+     end-of-download, so mounting image B over image A never moved `CSTIN`; the
+     guest kept A's VCB and cached catalog while SDRAM held B. The volume looked
+     mounted (window + desktop icon persisted) but every File Manager call
+     failed "…cannot be found" **with zero disk I/O** — a stale `vRefNum`, so no
+     read ever reached the driver. Fix: hold the drive EMPTY from download start
+     until `DSK_EMPTY_CY` (2.06 s) after it ends, so the guest sees eject then
+     insert. ★ A ghost volume **persists until a guest reboot** — an eject +
+     re-mount does not clear it, so cold-boot before judging any floppy fix.
+  ★ `byte_cnt` frozen + `$142` all-benign means **no read was attempted** — do
+  not read it as "reads returned bad data".
+  The old parked doc `docs/resume_floppy_controller_2026-07-07.md` is RESOLVED;
+  its "SDRAM region != image" theory was never confirmed and its JTAG chain no
+  longer works (dead hub). Offline instruments that settled all of this in
+  minutes: `verilator/tb_gcr_read.v` (`+track/+side/+ncap`, seeks via the real
+  drive-register protocol; **always pass `+acclen=40 +pollgap=40`** or the
+  stream is garbage), `scripts/gcr_census.py` (address fields),
+  `scripts/gcr_data_census.py` (DATA fields verified against the standard 800K
+  layout offset — every zone boundary clean, refuting the `soff` suspicion) and
+  `scripts/hfs_check.py` (walks an image's catalog/extents trees offline so a
+  broken source image can't fake an RTL bug).
 - **1.44 MB MFM read works, and the Finder whole-disk COPY was FIXED
   2026-08-05** (`33ebdd1`): the real defect was **`rtl/via6522.sv` counting
   T1/T2 at half rate** — a `/2` prescaler stacked on enables that were already
