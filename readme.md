@@ -37,6 +37,9 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 
 - **QuickTime video playback**
 - **Floppy writes** (disks mount locked/write-protected)
+- **Hot-swapping floppy images** — a running Mac does not notice that you mounted a
+  different image; reset after a swap, see
+  [Swapping floppies](#-swapping-floppies--reset-the-mac-after-a-swap)
 
 ## Usage
 
@@ -191,23 +194,64 @@ this step goes away.
 
 ## Floppy disk support
 
-**1.44 MB floppy reading works** (verified on hardware, August 2026). Mount images through
-the OSD's "Mount Pri Floppy" slot — the Pri slot is the Mac's internal SuperDrive. Disks are
-**read-only** for now: they mount write-protected, exactly like a locked physical floppy.
+**Floppy reading works** — 800 KB GCR and 1.44 MB MFM alike (verified on hardware,
+August 2026: disks mount, applications launch straight off a floppy, and files copy
+from a floppy to a hard disk). Mount images through the OSD's **"Mount Pri Floppy"**
+slot — the Pri slot is the Mac's internal SuperDrive. Disks are **read-only** for now:
+they mount write-protected, exactly like a locked physical floppy.
 
 Both common image formats are auto-detected — no conversion needed:
 
-- **Raw** (`.dsk` / `.img`): 1,474,560 bytes for 1.44 MB, 737,280 bytes for 720K
+- **Raw** (`.dsk` / `.img`): 819,200 bytes for 800K, 1,474,560 for 1.44 MB,
+  409,600 for 400K, 737,280 for 720K
 - **DiskCopy 4.2** (`.dsk` / `.image` / `.dc42`): the 84-byte DC42 header is parsed and
   skipped automatically; the disk geometry comes from the header's format byte
 
-400K/800K GCR images (409,600 / 819,200 bytes, raw or DC42) are recognized and mount, but
-GCR reading still has known issues and is under repair — prefer 1.44 MB images.
+720K images are for PC/FAT disks and need PC Exchange installed in the guest.
 
-Booting from a floppy is supported in the current development builds (a long-standing
-"Welcome to Macintosh" boot loop was fixed in August 2026); final verification is in
-progress. To boot from floppy, mount the image and reset the machine via the OSD's
-"Reset & Apply" entry so the ROM sees the disk at startup.
+### ★ Swapping floppies — reset the Mac after a swap
+
+**A running Mac does not notice that you changed floppy images.** Mount one image per
+session and you will have no trouble; the moment you mount a *second* image while the
+machine is running, the Mac keeps using the first disk's directory while the drive is
+really serving the second disk's data.
+
+**The reliable procedure:** mount the image you want in the OSD, then **reset the
+machine** — OSD ▸ **"Reset & Apply"**. The Mac re-reads the drive from scratch on
+startup, so it always picks up whatever is mounted at that moment. This is also how to
+work through a multi-disk installer: mount the next disk, reset, continue.
+
+**Ejecting inside the Mac is *not* enough** (tested August 2026). Dragging the floppy
+icon to the Trash does eject it — the icon disappears — but if you then mount a
+different image, the Mac brings the *old* volume back rather than reading the new one,
+because the drive cannot yet tell the Mac that the medium was swapped. `Special ▸ Eject
+Disk` / **⌘E** may also be greyed out depending on the System version and the window's
+view mode.
+
+The symptom, if you do end up with a stale volume: the desktop icon and window look
+perfectly normal and still list the *old* disk's files, but every operation on it fails
+with an error like
+
+> You cannot copy "Some File" onto the disk "Whatever", because it cannot be found.
+
+or, opening the floppy itself:
+
+> The disk "Whatever" could not be opened, because it cannot be found.
+
+**Cure: reset the machine from the OSD** ("Reset & Apply"). The stale volume lives in
+the Mac's own volume list and only a restart clears it — re-mounting or ejecting will
+not. Nothing is damaged and the image on your SD card is untouched; after the reset the
+disk mounts correctly.
+
+> This is a core limitation, not a Mac OS one: the drive's "disk in place" and "disk
+> switched" signals do not yet report a media change. It is a known open issue.
+
+### Booting from a floppy
+
+Booting from floppy works (verified on hardware, August 2026). Mount the image, then
+reset the machine via the OSD's **"Reset & Apply"** entry so the ROM sees the disk at
+startup — mounting a floppy at the flashing-`?` screen is not currently picked up, so
+the disk has to be in the drive when the machine resets.
 
 ## PRAM / NVRAM
 
