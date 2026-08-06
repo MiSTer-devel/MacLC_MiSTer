@@ -893,6 +893,9 @@ module emu
 	wire dio_download = ioctl_download;
 	wire [23:0] dio_addr = ioctl_addr[24:1];
 	wire [7:0] dio_index = ioctl_index;
+	// mirror of MacLC.sv: Main packs the matched extension into the upper
+	// ioctl_index bits — compare only the MENU index (see MacLC.sv rationale)
+	wire [5:0] dio_menu = dio_index[5:0];
 
 	// Floppy disk image tracking
 	reg dsk_int_ds, dsk_ext_ds;
@@ -903,13 +906,34 @@ module emu
 	reg dc42_name_ok;
 	reg dc42_skip;
 	reg [7:0] dc42_disk_format;    // DC42 byte 0x50: 0/1/2/3 = 400G/800G/720M/1440M
-	wire dsk_int_ins = dsk_int_ds || dsk_int_ss || dsk_int_mfm;
-	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm;
+	// Disk-change presentation — mirror of MacLC.sv (full rationale there): a
+	// swap must reach the guest as eject THEN insert, because it only learns
+	// about media by polling CSTIN. The sim mounts one image and never swaps,
+	// so this only delays that mount; it is here to keep the two tops from
+	// diverging (docs/verilator_differences.md).
+	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
+	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
+	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
+	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
+	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 1) begin
+		if(~old_down && dio_download && dio_menu == 6'd1) begin
+			dsk_int_ds  <= 0;
+			dsk_int_ss  <= 0;
+			dsk_int_mfm <= 0;
+			dsk_int_hd  <= 0;
+			dsk_int_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd1)
+			dsk_int_empty_cy <= 26'd0;
+		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
+			dsk_int_empty_cy <= dsk_int_empty_cy + 26'd1;
+
+		if(old_down && ~dio_download && dio_menu == 6'd1) begin
 			dsk_int_ds <= (dio_addr == 409600) ||
 			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
 			dsk_int_ss <= (dio_addr == 204800) ||
@@ -936,7 +960,19 @@ module emu
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 2) begin
+		if(~old_down && dio_download && dio_menu == 6'd2) begin
+			dsk_ext_ds  <= 0;
+			dsk_ext_ss  <= 0;
+			dsk_ext_mfm <= 0;
+			dsk_ext_hd  <= 0;
+			dsk_ext_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd2)
+			dsk_ext_empty_cy <= 26'd0;
+		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
+			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
+
+		if(old_down && ~dio_download && dio_menu == 6'd2) begin
 			dsk_ext_ds <= (dio_addr == 409600) ||
 			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
 			dsk_ext_ss <= (dio_addr == 204800) ||

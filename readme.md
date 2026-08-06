@@ -36,9 +36,6 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 ### Not working yet
 
 - **Floppy writes** (disks mount locked/write-protected)
-- **Hot-swapping floppy images** — a running Mac does not notice that you mounted a
-  different image; reset after a swap, see
-  [Swapping floppies](#-swapping-floppies--reset-the-mac-after-a-swap)
 
 ## Usage
 
@@ -207,19 +204,38 @@ Both common image formats are auto-detected — no conversion needed:
 
 720K images are for PC/FAT disks and need PC Exchange installed in the guest.
 
-### Swapping floppies
+### Swapping floppies — works like a real Mac
 
-Eject the disk in the Macintosh LC UI First, then swap the disk to the OSD. 
-To eject the disk from the OS, drop the floppy disk volume into the trash can or click Special -> Eject Disk with the disk highlighted.
+**Media changes are fully reported to the Mac** (verified on hardware, August 2026):
+the drive now presents both the "disk in place" transition and the SuperDrive's
+"disk switched" flag exactly the way a real drive does, so a running Mac notices
+ejects, inserts, and swaps on its own — no reset needed.
 
-If the disk is swapped via the OSD without ejecting the existing media, the new disk will not be read and the core will need to be restarted.
+The natural flow is the real-Mac one:
+
+- **Multi-disk installers just work.** The installer ejects the disk itself and asks
+  for the next one; mount the requested image in the OSD and the installation
+  continues. A complete **System 6.0.8 install from its two 1.44 MB floppies**
+  (including the installer's back-and-forth disk swaps) has been run end to end this
+  way on hardware.
+- **In the Finder, eject first** — drag the floppy to the Trash (the Mac ejects it and
+  the drive really empties), then mount the next image in the OSD. The new disk is
+  picked up within a couple of seconds and mounts as itself.
+- Mounting a *different* image over a still-mounted one (no eject) is the equivalent
+  of yanking a disk out of a real drive mid-use: the Mac sees its volume vanish. It
+  copes, but may complain — real Macs never experience this (their drives only eject
+  under software control), so prefer the eject-first flow.
+
+Mount floppies through **"Mount Pri Floppy"** — that is the internal SuperDrive, the
+drive the Mac boots from and the only one that can read 1.44 MB MFM disks. The
+Sec slot emulates a second, external 800K-class drive.
 
 ### Booting from a floppy
 
-Booting from floppy works but requires a special procedure. Mount the image, then reset the machine via the OSD's 
-**"Reset & Apply"** entry so the ROM sees the disk at
-startup — mounting a floppy at the flashing-`?` screen is not currently picked up, so
-the disk has to be in the drive when the machine resets.
+Booting from floppy works (verified on hardware, August 2026). Mount a bootable image
+at the flashing-`?` screen and the ROM picks it up within a few seconds and boots from
+it — this is also how to start a floppy-based OS installation onto a fresh hard-disk
+image. Mounting before a reset ("Reset & Apply") works too.
 
 ## PRAM / NVRAM
 

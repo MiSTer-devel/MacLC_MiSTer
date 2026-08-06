@@ -12,7 +12,9 @@ white=1 / black=0.
   row 4  {err_onset_cnt[7:0], arm[7:0], ovr[7:0], unr[7:0]}
   row 5  {e142_first[15:0], e142_last[15:0]}   Sony driver result codes
   row 6  {e142_nz_cnt[15:0], e142_all_cnt[15:0]}
-  row 7  SCAN-WITNESS latched at the LAST -81 post:
+  row 7  MEDIA witness (2026-08-06+): {CSTIN,switched,insertDisk,ism,
+         ej[3:0],clr[3:0],edges[3:0],poll1[7:0],poll6[7:0]}
+         (pre-887ebba fits: SCAN-WITNESS latched at the LAST -81 post)
          {run[7:0], hunt_ms[7:0], par[1:0], gap_us[13:0]}
   row 8  LIVE {mfm stall_us[15:0], stall_cnt[7:0], e81_cnt[7:0]}
   row 10 latch @ first nonzero $142 {side, track[6:0], 2'b0, addr[21:0]}
@@ -115,19 +117,18 @@ def decode(words):
     print(f"  w5 $142 FIRST err = {sony_err(w[5] >> 16)}")
     print(f"     $142 LAST  err = {sony_err(w[5] & 0xFFFF)}")
     print(f"  w6 $142 error completions={w[6] >> 16:5d}  ALL completions={w[6] & 0xFFFF:5d}")
-    run7 = (w[7] >> 24) & 0xFF
-    hunt7 = (w[7] >> 16) & 0xFF
-    par7 = (w[7] >> 14) & 0x3
-    gap7 = w[7] & 0x3FFF
+    # w7 = MEDIA-CHANGE WITNESS as of 2026-08-06 (floppy.v dbg_media; the
+    # disk-swap mission). Fits older than 887ebba carried the -81
+    # SCAN-WITNESS here instead — for those read the raw hex.
+    m7 = w[7]
     e81 = w[8] & 0xFF if len(w) > 8 else 0
-    par_s = {0: "none", 1: "EVEN only", 2: "ODD only", 3: "both"}[par7]
-    if e81:
-        print(f"  w7 AT LAST -81: run={run7} IDs since last consumed data, "
-              f"R-parity seen: {par_s}, last armed window {hunt7} ms, "
-              f"last synced delivery gap {gap7} us")
-    else:
-        print(f"  w7 (no -81 posted yet) run={run7} hunt_ms={hunt7} "
-              f"par={par_s} gap_us={gap7}")
+    print(f"  w7 MEDIA: CSTIN={'EMPTY' if (m7 >> 31) & 1 else 'disk-IN'} "
+          f"switched={(m7 >> 30) & 1} insertDisk={(m7 >> 29) & 1} "
+          f"ism={(m7 >> 28) & 1}")
+    print(f"     ejects={(m7 >> 24) & 0xF} dskchg_clears={(m7 >> 20) & 0xF} "
+          f"cstin_edges={(m7 >> 16) & 0xF} "
+          f"poll_CSTIN={(m7 >> 8) & 0xFF} poll_SWITCHED={m7 & 0xFF} "
+          f"(raw {m7:#010x})")
     if len(w) > 8:
         stall_us, stall_cnt = w[8] >> 16, (w[8] >> 8) & 0xFF
         print(f"  w8 LIVE mfm stalls: worst {stall_us} us, {stall_cnt} stalled "

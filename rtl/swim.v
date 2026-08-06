@@ -107,6 +107,10 @@ module swim
 	output [23:0] dbg_flp_strb_last,
 	output [8:0]  dbg_flp_rej_step,
 	output [7:0]  dbg_flp_status,
+	// Media-change witness word from the internal drive (floppy.v dbg_media):
+	// {CSTIN, switched, insertDisk, ism, ej_cnt[3:0], clr_cnt[3:0],
+	//  cstin_edges[3:0], park1_cnt[7:0], park6_cnt[7:0]}
+	output [31:0] dbg_flp_media,
 	output [21:0] dbg_flp_gcr_addr, // live GCR fetch address (internal drive)
 	// {b1_hot[15:0], b5_hot[15:0]} over handshake READS — the two bits the
 	// ROM's `d5 & 0x22` field verdict is made of. See the VERDICT-BIT
@@ -314,6 +318,7 @@ module swim
 		.dbg_strb_last(dbg_flp_strb_last),
 		.dbg_rej_step(dbg_flp_rej_step),
 		.dbg_status(dbg_flp_status),
+		.dbg_media(dbg_flp_media),
 		.dbg_mfm_stall_us(dbg_mfm_stall[23:8]),
 		.dbg_mfm_stall_cnt(dbg_mfm_stall[7:0])
 	);

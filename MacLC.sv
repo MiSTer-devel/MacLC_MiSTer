@@ -1182,6 +1182,7 @@ module emu
 	wire [23:0] dbg_flp_strb_last;
 	wire [8:0]  dbg_flp_rej_step;
 	wire [7:0]  dbg_flp_status;
+	wire [31:0] dbg_flp_media;   // media-change witness (floppy.v dbg_media)
 
 	// ── Always-on marginality anchor (2026-07-29) ───────────────────────────
 	// Probes-OFF fits of this netlist deterministically corrupt the SCSI read
@@ -1420,7 +1421,12 @@ module emu
 			hud_w4 <= {hud_onset_cnt, dbg_ism_flpe_w[23:0]};
 			hud_w5 <= {hud_e142_first, hud_e142_last};
 			hud_w6 <= {hud_e142_nz_cnt, hud_e142_all_cnt};
-			hud_w7 <= hud_e81_scan;
+			// w7 repurposed 2026-08-06 (was hud_e81_scan, the settled -81
+			// SCAN-WITNESS) for the media-change witness — the disk-swap
+			// mission's forensic word. Layout in floppy.v's dbg_media port
+			// comment: {CSTIN, switched, insertDisk, ism, ej[3:0], clr[3:0],
+			// cstin_edges[3:0], park1[7:0], park6[7:0]}.
+			hud_w7 <= dbg_flp_media;
 			hud_w8 <= {dbg_mfm_stall_w, hud_e81_cnt};
 			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
 			hud_w10 <= hud_e142_pos;
@@ -1930,7 +1936,8 @@ module emu
 		.dbg_flp_strb_en_cnt(dbg_flp_strb_en_cnt),
 		.dbg_flp_strb_last(dbg_flp_strb_last),
 		.dbg_flp_rej_step(dbg_flp_rej_step),
-		.dbg_flp_status(dbg_flp_status)
+		.dbg_flp_status(dbg_flp_status),
+		.dbg_flp_media(dbg_flp_media)
 	);
 
 	reg disk_act;
@@ -1954,6 +1961,15 @@ module emu
 	wire dio_download;
 	wire [23:0] dio_addr = ioctl_addr[24:1];  // word address from byte address
 	wire  [7:0] dio_index;
+	// MiSTer Main encodes the MATCHED EXTENSION of a multi-extension F entry
+	// in the upper bits of ioctl_index (menu index in the low bits): an F1
+	// pick of a .dsk arrives as 8'h01 but a .img as 8'h41. The mount-flag
+	// latches below compared the FULL byte, so a .img mount downloaded into
+	// SDRAM (the write path already masks [1:0]) yet never presented a disk —
+	// a silent no-op mount, latent since the beginning. Found 2026-08-06
+	// driving the swap gates: Fetch GCR800K.dsk presented and read while
+	// Install7-1 D1/D2.img downloaded and vanished. Compare the MENU index.
+	wire  [5:0] dio_menu = dio_index[5:0];
 
 	// good floppy image sizes are 819200 bytes and 409600 bytes
 	reg dsk_int_ds, dsk_ext_ds;
@@ -1973,15 +1989,54 @@ module emu
 	reg dc42_skip;
 	reg [7:0] dc42_disk_format;  // DC42 byte 0x50: 0=400K GCR,1=800K GCR,2=720K MFM,3=1440K MFM
 
+	// ── Disk CHANGE must be presented as a TRANSITION (2026-08-05/06) ──────
+	// The guest learns about media only by polling the drive's CSTIN sense
+	// line, so "a disk is present" is not enough — it must see no-disk and
+	// THEN disk to run its unmount/mount machinery. dsk_*_ins used to be a
+	// pure LEVEL from the size latched at end-of-download, so mounting image
+	// B over image A never moved CSTIN: the guest kept A's VCB and cached
+	// catalog over B's SDRAM contents — the ghost volume ("…cannot be found"
+	// with zero disk I/O). Hold the drive EMPTY from download start until
+	// DSK_EMPTY_CY (2.06 s at clk_sys) after it ends: the guest sees the disk
+	// leave, unmounts, then sees a fresh insert. The hold must outlast the
+	// Sony driver's media poll — MAME 0.264 runtime (tap_swapB 2026-08-06)
+	// shows the NoDiskInPl+DiskChg pair polled every ~0.8 s.
+	// ★ Landed together with floppy.v's disk_switched (SWITCHED sense reg) —
+	// this same hold WITHOUT that flag was the reverted ebbdac6 regression:
+	// the transition told the driver the disk left and came back while the
+	// disk-switched flag insisted nothing changed, a state no real machine
+	// produces (MAME asserts m_dskchg on every unload).
+	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
+	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
+	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
+
 	// any known type of disk image inserted?
-	wire dsk_int_ins = dsk_int_ds || dsk_int_ss || dsk_int_mfm;
-	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm;
+	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
+	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 1) begin
+		// Download START = the change event: drop the media immediately and
+		// hold the timer at 0 for the whole upload (SDRAM is being
+		// overwritten, so the old geometry is meaningless the moment the
+		// transfer begins; clearing the regs also means a wrong-sized file
+		// leaves the drive EMPTY instead of re-inserting stale geometry).
+		if(~old_down && dio_download && dio_menu == 6'd1) begin
+			dsk_int_ds  <= 0;
+			dsk_int_ss  <= 0;
+			dsk_int_mfm <= 0;
+			dsk_int_hd  <= 0;
+			dsk_int_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd1)
+			dsk_int_empty_cy <= 26'd0;
+		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
+			dsk_int_empty_cy <= dsk_int_empty_cy + 26'd1;
+
+		if(old_down && ~dio_download && dio_menu == 6'd1) begin
 			// GCR (IWM path) — raw word count, or DC42 disk_format byte (rusty-backup
 			// dc42.rs: 0x50 = 0/1/2/3 = 400G/800G/720M/1440M, authoritative + tag-agnostic).
 			dsk_int_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
@@ -2004,7 +2059,20 @@ module emu
 		reg old_down;
 
 		old_down <= dio_download;
-		if(old_down && ~dio_download && dio_index == 2) begin
+		// see the dsk_int_* block above: a swap must present as leave -> insert
+		if(~old_down && dio_download && dio_menu == 6'd2) begin
+			dsk_ext_ds  <= 0;
+			dsk_ext_ss  <= 0;
+			dsk_ext_mfm <= 0;
+			dsk_ext_hd  <= 0;
+			dsk_ext_empty_cy <= 26'd0;
+		end
+		else if(dio_download && dio_menu == 6'd2)
+			dsk_ext_empty_cy <= 26'd0;
+		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
+			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
+
+		if(old_down && ~dio_download && dio_menu == 6'd2) begin
 			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
 			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
 			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
