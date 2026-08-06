@@ -658,11 +658,25 @@ module floppy
 				driveRegs[`DRIVE_REG_CSTIN] <= 1'b1;
 				ejectIndicatorTimer <= 24'hFFFFFF;
 			end
-			else if (insertDisk) begin
-				// insert a disk
-				driveRegs[`DRIVE_REG_CSTIN] <= 1'b0;
-			end
 			else begin
+				// CSTIN simply REPORTS what the host has mounted. This used to
+				// be `else if (insertDisk) CSTIN <= 0;` with no else — i.e. an
+				// insert latched CSTIN low and only a guest EJECT strobe could
+				// ever raise it again. So when the host withdrew the media
+				// (image swapped, or a mount of a file that is not a valid
+				// floppy size) the drive kept claiming a disk was present, the
+				// guest never ran its unmount/mount machinery, and it went on
+				// using the previous volume's VCB and cached catalog over
+				// completely different SDRAM contents -> "…cannot be found" on
+				// every File Manager call, with no disk I/O at all. The
+				// MacLC.sv side of this fix drops the insert level across a
+				// swap; without this line that drop was invisible here.
+				// (Caught by verilator/tb_disk_swap.v before it ever reached
+				// hardware.) An eject still works: it forces CSTIN high and
+				// starts ejectIndicatorTimer, and MacLC.sv clears the mount
+				// flags while diskEject is asserted (~2 s), so insertDisk is
+				// low long before the timer expires and CSTIN stays high.
+				driveRegs[`DRIVE_REG_CSTIN] <= ~insertDisk;
 				if (ejectIndicatorTimer != 0)
 					ejectIndicatorTimer <= ejectIndicatorTimer - 1'b1;
 			end
