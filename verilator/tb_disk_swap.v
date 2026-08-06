@@ -75,22 +75,28 @@ module tb_disk_swap;
 
 	wire [1:0] diskEject;
 
+	// MacLC.sv mirror: Main packs the matched extension of a multi-extension
+	// F entry into the upper ioctl_index bits (.dsk -> 8'h01, .img -> 8'h41),
+	// so the flag latches must compare only the MENU index. The full-byte
+	// compare made every .img mount a silent no-op (hardware, 2026-08-06).
+	wire [5:0] dio_menu = dio_index[5:0];
+
 	always @(posedge clk) begin
 		reg old_down;
 		old_down <= dio_download;
-		if(~old_down && dio_download && dio_index == 1) begin
+		if(~old_down && dio_download && dio_menu == 6'd1) begin
 			dsk_int_ds  <= 0;
 			dsk_int_ss  <= 0;
 			dsk_int_mfm <= 0;
 			dsk_int_hd  <= 0;
 			dsk_int_empty_cy <= 18'd0;
 		end
-		else if(dio_download && dio_index == 1)
+		else if(dio_download && dio_menu == 6'd1)
 			dsk_int_empty_cy <= 18'd0;
 		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
 			dsk_int_empty_cy <= dsk_int_empty_cy + 18'd1;
 
-		if(old_down && ~dio_download && dio_index == 1) begin
+		if(old_down && ~dio_download && dio_menu == 6'd1) begin
 			dsk_int_ds  <= (dio_addr == 409600);
 			dsk_int_ss  <= (dio_addr == 204800);
 			dsk_int_mfm <= (dio_addr == 368640) || (dio_addr == 737280);
@@ -187,14 +193,22 @@ module tb_disk_swap;
 	endtask
 
 	// Upload an image of `words` words into slot 1, taking `dur` clocks.
-	task mount(input [23:0] words, input integer dur);
+	// idx8 is the RAW 8-bit ioctl_index — pass 8'h41 to model a .img pick
+	// (extension 1 in the upper bits), 8'h01 for a .dsk.
+	task mount_idx(input [7:0] idx8, input [23:0] words, input integer dur);
 	begin
-		dio_index <= 8'd1;
+		dio_index <= idx8;
 		dio_addr  <= words;
 		dio_download <= 1'b1;
 		repeat (dur) @(posedge clk);
 		dio_download <= 1'b0;
 		@(posedge clk);
+	end
+	endtask
+
+	task mount(input [23:0] words, input integer dur);
+	begin
+		mount_idx(8'd1, words, dur);
 	end
 	endtask
 
@@ -241,6 +255,15 @@ module tb_disk_swap;
 		       "first mount held the drive empty for the full hold window");
 		read_switched;
 		chk(switched === 1'b0, "FIRST mount does not set SWITCHED (load never does)");
+
+		repeat (2000) @(posedge clk);
+
+		$display("== 1b. a .img pick (extension bits in ioctl_index) must mount");
+		// Main sends the SECOND extension of "F1,DSKIMG" as 8'h41. The old
+		// full-byte compare silently dropped these mounts on hardware.
+		mount_idx(8'h41, 24'd409600, 2000);
+		repeat (2*DSK_EMPTY_CY) @(posedge clk);
+		chk(cstin === 1'b0, ".img-indexed mount presents a disk (menu-index mask)");
 
 		repeat (2000) @(posedge clk);
 

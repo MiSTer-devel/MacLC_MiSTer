@@ -1961,6 +1961,15 @@ module emu
 	wire dio_download;
 	wire [23:0] dio_addr = ioctl_addr[24:1];  // word address from byte address
 	wire  [7:0] dio_index;
+	// MiSTer Main encodes the MATCHED EXTENSION of a multi-extension F entry
+	// in the upper bits of ioctl_index (menu index in the low bits): an F1
+	// pick of a .dsk arrives as 8'h01 but a .img as 8'h41. The mount-flag
+	// latches below compared the FULL byte, so a .img mount downloaded into
+	// SDRAM (the write path already masks [1:0]) yet never presented a disk —
+	// a silent no-op mount, latent since the beginning. Found 2026-08-06
+	// driving the swap gates: Fetch GCR800K.dsk presented and read while
+	// Install7-1 D1/D2.img downloaded and vanished. Compare the MENU index.
+	wire  [5:0] dio_menu = dio_index[5:0];
 
 	// good floppy image sizes are 819200 bytes and 409600 bytes
 	reg dsk_int_ds, dsk_ext_ds;
@@ -2015,19 +2024,19 @@ module emu
 		// overwritten, so the old geometry is meaningless the moment the
 		// transfer begins; clearing the regs also means a wrong-sized file
 		// leaves the drive EMPTY instead of re-inserting stale geometry).
-		if(~old_down && dio_download && dio_index == 1) begin
+		if(~old_down && dio_download && dio_menu == 6'd1) begin
 			dsk_int_ds  <= 0;
 			dsk_int_ss  <= 0;
 			dsk_int_mfm <= 0;
 			dsk_int_hd  <= 0;
 			dsk_int_empty_cy <= 26'd0;
 		end
-		else if(dio_download && dio_index == 1)
+		else if(dio_download && dio_menu == 6'd1)
 			dsk_int_empty_cy <= 26'd0;
 		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
 			dsk_int_empty_cy <= dsk_int_empty_cy + 26'd1;
 
-		if(old_down && ~dio_download && dio_index == 1) begin
+		if(old_down && ~dio_download && dio_menu == 6'd1) begin
 			// GCR (IWM path) — raw word count, or DC42 disk_format byte (rusty-backup
 			// dc42.rs: 0x50 = 0/1/2/3 = 400G/800G/720M/1440M, authoritative + tag-agnostic).
 			dsk_int_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
@@ -2051,19 +2060,19 @@ module emu
 
 		old_down <= dio_download;
 		// see the dsk_int_* block above: a swap must present as leave -> insert
-		if(~old_down && dio_download && dio_index == 2) begin
+		if(~old_down && dio_download && dio_menu == 6'd2) begin
 			dsk_ext_ds  <= 0;
 			dsk_ext_ss  <= 0;
 			dsk_ext_mfm <= 0;
 			dsk_ext_hd  <= 0;
 			dsk_ext_empty_cy <= 26'd0;
 		end
-		else if(dio_download && dio_index == 2)
+		else if(dio_download && dio_menu == 6'd2)
 			dsk_ext_empty_cy <= 26'd0;
 		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
 			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
 
-		if(old_down && ~dio_download && dio_index == 2) begin
+		if(old_down && ~dio_download && dio_menu == 6'd2) begin
 			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
 			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
 			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
