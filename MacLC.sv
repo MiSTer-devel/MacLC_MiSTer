@@ -486,7 +486,7 @@ module emu
 	// Video Output — straight V8 video, no overlays.
 `ifdef USE_DBG_HUD
 	// Debug HUD (see the USE_DBG_HUD block near the probe deck): binary
-	// pixel-strip overlay, top-left corner, video-only (input untouched).
+	// pixel-strip overlay, BOTTOM-left corner, video-only (input untouched).
 	assign VGA_R  = hud_on_q ? hud_px : v8_vga_r;
 	assign VGA_G  = hud_on_q ? hud_px : v8_vga_g;
 	assign VGA_B  = hud_on_q ? hud_px : v8_vga_b;
