@@ -1,3 +1,44 @@
+# RESOLVED 2026-08-05 — do not re-open (historical record follows)
+
+**800K GCR disks mount and read correctly.** Root cause was NOT the
+"SDRAM region != image" theory this document builds toward — that theory was
+never confirmed, and its one supporting data point is explicitly marked
+inconclusive in §3 below (the mount went to the wrong drive).
+
+**Actual root cause: the IWM read-data latch clear was retriggered from a
+LEVEL.** `swim.v` reloaded `readLatchClearTimer` from `iwmRead`, which is
+asserted for the whole bus access. On a Mac Plus an IWM access is a few
+cycles; on the LC the SWIM is in VPA space so each access is E-paced at
+~1.23 us (~10 cen), and the ROM's GCR poll loop (`a6e1a0` VIA1 ORA read,
+`a6e1a6` IWM data read, both VPA) returns every ~2.5 us leaving only ~11 cen
+between accesses — shorter than the 13-cen reload. The timer never reached 0,
+the latch never cleared, and the CPU re-read the same disk byte ~6 times
+before the next overwrote it. Duplicated bytes shift everything after them in
+a field, so the address checksum failed: **-69 badCksmErr** -> "This disk is
+unreadable". Fix (`2804d02`): edge-trigger the one-shot on the END of the
+access, matching what ISM mode already does via `acc_end`.
+
+Hardware, build `fd1d2c6c`, raw 800K `Fetch GCR800K.dsk`:
+
+| | before | after |
+|---|---|---|
+| bytes read | 5,040 | **47,674** |
+| head stepped off track 0 | no (`step_cnt=0`) | **yes** |
+| `-69 badCksmErr` | yes | **none** |
+| `$142` errors | 174 | 8 (benign) |
+| result | "unreadable" | **volume mounts, catalog lists** |
+
+The catalog listing also proves the DATA fields are intact, since the HFS
+B-tree lives in sector data fields with their own separate checksums.
+
+★ Note for anyone reading the JTAG-based instrument chain below: **it no
+longer works** — the JTAG hub's name table is corrupt on this board. Use
+`USE_DBG_HUD` + `scripts/parse_hud.py` instead, plus the offline
+`verilator/tb_gcr_read.v` + `scripts/gcr_census.py`, which is what actually
+found this (it decodes the delivered stream and validates address fields).
+
+---
+
 # Resume — 800K floppy controller investigation (PARKED 2026-07-07)
 
 **Read this first; it is the single authoritative handoff.** It supersedes the

@@ -200,6 +200,19 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   pulse, VIA1 PA7, and the VIA timer half-rate fix (`33ebdd1` — the driver's
   install-time drive-speed check is timer-paced, so a 2x timer error would
   also have corrupted it).
+- **800K GCR disks WORK as of 2026-08-05** (`2804d02`). They previously threw
+  "This disk is unreadable" (`-69 badCksmErr`). Root cause was the IWM
+  read-data latch clear being retriggered from the LEVEL `iwmRead` instead of
+  firing once at the END of the access: the LC's E-paced VPA accesses (~1.23
+  us) plus the ROM's ~2.5 us GCR poll loop left less gap than the 13-cen
+  reload, so the latch never cleared and the CPU re-read each disk byte ~6
+  times — duplicates shift a field and break its checksum. HW: 5,040 bytes
+  read and stuck on track 0 -> 47,674 bytes, head stepping, volume mounts and
+  the catalog lists. The old parked doc
+  `docs/resume_floppy_controller_2026-07-07.md` is marked RESOLVED; its
+  "SDRAM region != image" theory was never confirmed and its JTAG instrument
+  chain no longer works (dead hub) — use `verilator/tb_gcr_read.v` +
+  `scripts/gcr_census.py`, which found this offline in minutes.
 - **1.44 MB MFM read works, and the Finder whole-disk COPY was FIXED
   2026-08-05** (`33ebdd1`): the real defect was **`rtl/via6522.sv` counting
   T1/T2 at half rate** — a `/2` prescaler stacked on enables that were already
