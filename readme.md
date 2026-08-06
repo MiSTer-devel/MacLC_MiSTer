@@ -29,8 +29,9 @@ the Egret (HC05) system controller, and the LC's other peripherals.
   and clear
 - **SCC serial** is wired in and "usable" but not yet doing anything useful
 
-- **Floppy disks (read-only):** 1.44 MB disks in raw or DiskCopy 4.2 format —
-  see [Floppy disk support](#floppy-disk-support)
+- **Floppy disks (read-only):** 800 KB GCR and 1.44 MB MFM disks in raw or
+  DiskCopy 4.2 format — booting, mounting, launching applications and copying
+  files off a floppy all work. See [Floppy disk support](#floppy-disk-support)
 
 ### Not working yet
 
