@@ -115,9 +115,19 @@ module tb_gcr_read;
 		.dbg_ism_scan(), .dbg_mfm_stall()
 	);
 
-	// ---- CPU access tasks. `pollgap` extra clocks model the real E-paced
-	// VPA access rate (the SWIM sits in VPA space on the LC).
+	// ---- CPU access model. The SWIM sits in VPA space on the LC, so EVERY
+	// register access is E-paced (~1.23 us at E = 812.5 kHz) — about 40
+	// clocks at 32 MHz. The ROM's GCR poll loop (a6e1a0..a6e1b2) is:
+	//     moveb %a5@,%a5@   ; VIA1 ORA (PA7 test)  <- one VPA access
+	//     bmis  ...
+	//     moveb %a4@,%d5    ; IWM data register    <- another VPA access
+	//     dbf / bpls        ; loop while MSB clear
+	// so the data register is re-read about every 2.5 us, and the CPU
+	// latches the value at the END of its bus cycle.
+	//   +acclen=N  clocks the access holds UDS low   (default 40 = 1.25 us)
+	//   +pollgap=N clocks between accesses           (default 40 = the VIA read)
 	integer pollgap = 0;
+	integer acclen  = 10;
 
 	task swim_wr(input [3:0] a, input [7:0] d);
 	begin
@@ -135,10 +145,10 @@ module tb_gcr_read;
 		@(posedge clk);
 		cpuAddrRegHi <= a; _cpuRW <= 1'b1;
 		selectSWIM <= 1'b1; _cpuUDS <= 1'b0;
-		repeat (10) @(posedge clk);
-		d = dataOut[15:8];
+		repeat (acclen) @(posedge clk);
+		d = dataOut[15:8];               // CPU latches at END of the bus cycle
 		selectSWIM <= 1'b0; _cpuUDS <= 1'b1;
-		repeat (10) @(posedge clk);
+		repeat (4) @(posedge clk);
 		if (pollgap > 0) repeat (pollgap) @(posedge clk);
 	end
 	endtask
@@ -155,6 +165,7 @@ module tb_gcr_read;
 			img[i] = i[7:0] ^ 8'h5A;     // non-degenerate payload
 
 		if (!$value$plusargs("pollgap=%d", pollgap)) pollgap = 0;
+		if (!$value$plusargs("acclen=%d", acclen))  acclen  = 10;
 
 		_reset = 0;
 		repeat (40) @(posedge clk);

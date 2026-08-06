@@ -1055,6 +1055,12 @@ module swim
 	// IWM read data latch (unchanged from original)
 	// ================================================================
 	wire iwmRead = (_cpuRW == 1'b1 && selectSWIM == 1'b1 && _cpuUDS == 1'b0 && !ism_mode);
+	// Access-END edge, so the latch-clear one-shot fires once per read instead
+	// of being retriggered for the whole (E-paced, ~10 cen) VPA access — see
+	// the readLatchClearTimer comment below.
+	reg  iwmRead_d = 1'b0;
+	always @(posedge clk) if (cen) iwmRead_d <= iwmRead;
+	wire iwmReadEnd = iwmRead_d && !iwmRead;
 	wire anyDiskEnable = diskEnableExt | diskEnableInt;
 	reg [3:0] readLatchClearTimer;
 	reg [11:0] readDataArmDelay;   // post-enable squelch (~126 us at 8.125 MHz cen)
@@ -1088,9 +1094,26 @@ module swim
 				readDataArmDelay <= 12'h400;
 			end
 
-			// the conclusion of a valid CPU read from the IWM will start the timer to clear the latch
-			else if (iwmRead && readDataLatch[7]) begin
-				readLatchClearTimer <= 4'hD; // clear latch 14 clocks after the conclusion of a valid read
+			// The conclusion of a valid CPU read starts the one-shot that clears
+			// the latch 14 clocks later.
+			//
+			// ★ MUST be edge-triggered on the END of the access (2026-08-05).
+			// `iwmRead` is a LEVEL, true for the whole access. On the Mac Plus
+			// an IWM access is a few cycles, so reloading the timer throughout
+			// it was harmless. On the LC the SWIM sits in VPA space and every
+			// access lasts ~1.23 us (~10 cen) — longer than the 13-cen reload —
+			// and the ROM's GCR poll loop (a6e1a0: VIA1 ORA read, a6e1a6: IWM
+			// data read, both E-paced) comes back every ~2.5 us with only ~11
+			// cen between accesses. Reloading from the level therefore meant the
+			// timer NEVER reached 0: the latch never cleared, and the CPU re-read
+			// the same disk byte ~6 times before the next one overwrote it. The
+			// duplicated bytes shift every following byte in a field, so the
+			// address-field checksum fails -> -69 badCksmErr -> "This disk is
+			// unreadable". Measured in verilator/tb_gcr_read.v: at the realistic
+			// acclen=40/pollgap=40 the reader recovered ONE address field out of
+			// a whole track, and that one had a bad checksum.
+			else if (iwmReadEnd && readDataLatch[7]) begin
+				readLatchClearTimer <= 4'hD;
 			end
 
 			// when the drive indicates that a new byte is ready, latch it (only
