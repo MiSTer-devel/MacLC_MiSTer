@@ -124,7 +124,14 @@ reg  [7:0] pc_out;  // 8 bits for port test (only lower 4 bits used for actual I
 // not). Inference additionally required the PRAM boot-copy below to become a
 // sequential one-byte-per-cycle engine — a 256-parallel-write burst is not a
 // RAM port. Same recipe as m10k-repack tier 1 (2026-07-18).
-(* ramstyle = "MLAB" *) reg  [7:0] intram[0:367];    // Internal RAM: intram[x] = CPU addr 0x90+x (RAM at 0x90-0x1FF)
+// ★ no_rw_check is LOAD-BEARING (2026-08-08 map audit): plain "MLAB" leaves
+// intram UNINFERRED — Info 276009 "unsupported read-during-write behavior"
+// (the merged priority write block defeats the prover). The waiver is safe:
+// the HC05 never reads and writes the same address in one cycle (one bus op
+// per cen), the CPU is frozen (cen gated) for the whole boot-copy, and the
+// mirror block never reads intram. The MacIIvi parent commit shipped plain
+// "MLAB" and its intram silently stayed fabric — same 276009 in their map.
+(* ramstyle = "MLAB, no_rw_check" *) reg  [7:0] intram[0:367];    // Internal RAM: intram[x] = CPU addr 0x90+x (RAM at 0x90-0x1FF)
 reg  [7:0] ram_dout;
 
 // ROM
@@ -132,7 +139,14 @@ reg  [7:0] rom[0:8191];  // 2^13 to match 13-bit rom_addr width (only 4352 bytes
 reg  [7:0] rom_dout;
 
 // PRAM storage (256 bytes loaded from disk)
-(* ramstyle = "MLAB" *) reg  [7:0] pram[0:255];
+// no_rw_check here too: with plain "MLAB", synthesis inferred pram as TWO
+// altsyncram copies (one per async read port) with absorbed/registered
+// reads — legal only via an exotic retime, and AUTO block type risks two
+// M10Ks out of the 91%-full budget. The waiver keeps the literal async-read
+// MLAB form (read-during-write is a non-case: pram_load_wr only fires
+// before pram_ready, the mirror only after pram_loaded, and neither
+// coincides with the copy engine's read).
+(* ramstyle = "MLAB, no_rw_check" *) reg  [7:0] pram[0:255];
 reg        pram_loaded;
 reg        pc_bit3_prev;        // (legacy; PC3 edge no longer gates the boot-copy)
 
