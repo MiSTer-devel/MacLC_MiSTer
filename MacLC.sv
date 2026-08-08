@@ -46,8 +46,17 @@ module emu
 		.VGA_DE_IN(VGA_DE),
 		.VGA_DE(),
 
-		.ARX((!ar) ? 12'd256 : (ar - 1'd1)),
-		.ARY((!ar) ? 12'd171 : 12'd0),
+		// "Original" aspect = true 4:3. Both LC monitor modes are 4:3
+		// (640x480 VGA, monitor ID 6, and 512x384 12" RGB, monitor ID 2).
+		// The previous 256:171 (1.497:1) was the Mac PLUS 512x342 screen,
+		// inherited at the initial import — besides drawing ~12% too wide,
+		// it OVERFLOWED integer scaling on 5:4/4:3 panels (V-Integer at
+		// 1280x1024 requested 960*256/171 = 1437 px on a 1280 px panel →
+		// blank screen; sys/video_freak.sv V-Integer emits htarget itself).
+		// Offline gate: scripts/aspect_check.py (models video_scale_int).
+		// Do NOT "restore" 256:171 for any monitor mode.
+		.ARX((!ar) ? 12'd4 : (ar - 1'd1)),
+		.ARY((!ar) ? 12'd3 : 12'd0),
 		.CROP_SIZE(0),
 		.CROP_OFF(0),
 		.SCALE(status[13:12])

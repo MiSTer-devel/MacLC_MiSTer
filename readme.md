@@ -287,7 +287,9 @@ The core supports two monitors/resolutions, selectable in the OSD:
 - **512×384 12" RGB** (the LC's "Macintosh 12-inch RGB Display")
 
 All the LC's colour depths render — 1, 2, 4, 8 and 16bpp* (only available on 512x384 resolution, due to VRAM limtations- . Aspect ratio and scaling
-options are available in the OSD.
+options are available in the OSD. The "Original" aspect ratio is true **4:3**
+for both monitor modes (both LC screens are 4:3 — 640×480 and 512×384), so
+integer scaling fits every common panel, including 1280×1024 (5:4) displays.
 
 ## Keyboard & mouse
 

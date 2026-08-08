@@ -293,6 +293,12 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   MacLC.sv).
 - Floppy won't read at 16 MHz CPU speed
 - Bus retry via HALT signal not implemented
+- ~~"Original" aspect was 256:171~~ FIXED 2026-08-08: that was the Mac Plus
+  512x342 screen, inherited at import — it drew ~12% wide and OVERFLOWED
+  integer scaling on 1280x1024 panels (V-Integer requested 1437 px → blank
+  screen). Now true 4:3 (both LC monitor modes are 4:3). Offline gate:
+  `scripts/aspect_check.py` (faithful model of sys/video_freak.sv
+  `video_scale_int`; also demos the old failures with `--show-broken`).
 - CD-ROM (SCSI ID 3, OSD slot `SC4`): data, mixed-mode, and audio CDs.
   CD audio + the AppleCD Audio Player (listing, transport, FF/RW scan)
   fully working as of 2026-07-20 (standard SCSI-2 dialect on the
