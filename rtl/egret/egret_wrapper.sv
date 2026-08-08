@@ -117,7 +117,14 @@ reg  [7:0] pa_out, pb_out;
 reg  [7:0] pc_out;  // 8 bits for port test (only lower 4 bits used for actual I/O)
 
 // Memory
-reg  [7:0] intram[0:367];    // Internal RAM: intram[x] = CPU addr 0x90+x (RAM at 0x90-0x1FF)
+// MLAB (ported 2026-08-08 from MacIIvi 9f5d0d3): as plain registers these two
+// arrays cost ~1.5-2k ALMs (368:1 and 256:1 async byte read muxes + write
+// decode) — the bulk of the wrapper's ~4.3k self-ALMs. MLAB keeps the
+// async-read semantics the HC05's combinational RAM path needs (M10K could
+// not). Inference additionally required the PRAM boot-copy below to become a
+// sequential one-byte-per-cycle engine — a 256-parallel-write burst is not a
+// RAM port. Same recipe as m10k-repack tier 1 (2026-07-18).
+(* ramstyle = "MLAB" *) reg  [7:0] intram[0:367];    // Internal RAM: intram[x] = CPU addr 0x90+x (RAM at 0x90-0x1FF)
 reg  [7:0] ram_dout;
 
 // ROM
@@ -125,7 +132,7 @@ reg  [7:0] rom[0:8191];  // 2^13 to match 13-bit rom_addr width (only 4352 bytes
 reg  [7:0] rom_dout;
 
 // PRAM storage (256 bytes loaded from disk)
-reg  [7:0] pram[0:255];
+(* ramstyle = "MLAB" *) reg  [7:0] pram[0:255];
 reg        pram_loaded;
 reg        pc_bit3_prev;        // (legacy; PC3 edge no longer gates the boot-copy)
 
@@ -714,10 +721,24 @@ end
 // Per MAME egret.cpp: write_internal_ram(0x70 + byte, data)
 // intram[x] corresponds to CPU address 0x90 + x (RAM mapped at 0x90-0x1FF)
 // So PRAM goes to intram[0x70-0x16F] = CPU addresses 0x100-0x1FF
-integer pram_idx;
+//
+// ★ SEQUENTIAL boot-copy (ported 2026-08-08 from MacIIvi 9f5d0d3, MLAB
+// conversion): the old for-loop wrote all 256 bytes in ONE clk — 256 parallel
+// write ports, which forced intram[] (and pram[], read 256-wide) to
+// synthesize as registers + giant muxes (~1.5-2k ALMs). Now one byte per clk
+// over 260 cycles (256 PRAM + 4 RTC-seed) ≈ 8 µs at clk32. Atomicity vs the
+// HC05 is preserved by construction: pram_copy_busy gates the HC05 cen (see
+// u_cpu instantiation), so the firmware observes the copy as a single instant
+// exactly like the old one-cycle burst — it cannot read a half-copied PRAM
+// region or land a store mid-copy. The 68020 is separately held in reset
+// until pram_loaded (unchanged).
+reg        pram_copy_busy = 1'b0;
+reg [8:0]  pram_copy_idx;             // 0-255 = PRAM bytes, 256-259 = RTC seed
+wire [7:0] pram_copy_rdata = pram[pram_copy_idx[7:0]];
 always @(posedge clk) begin
     if (reset) begin
-        pram_loaded <= 1'b0;
+        pram_loaded    <= 1'b0;
+        pram_copy_busy <= 1'b0;
     end else begin
         // Boot-copy the saved PRAM into the Egret's working RAM as the LAST write
         // before the 68k runs. Gate it on the HC05 firmware having RELEASED the 68k
@@ -729,23 +750,28 @@ always @(posedge clk) begin
         // require pram_ready (the SD image is in pram[], or no image/timeout). The
         // 68020 is held in reset until pram_loaded (see reset_680x0 above), so it
         // never reads pre-copy PRAM.
-        if (!pram_loaded && !reset_680x0_latched && pram_ready) begin
-            // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
-            // Offset 0x70 = (0x100 - 0x90) to convert CPU address to intram index.
-            // Blocking `=` in the loop (per the sim BLKLOOPINIT lint); each
-            // iteration writes a different index, so behavior matches `<=`.
-            for (pram_idx = 0; pram_idx < 256; pram_idx = pram_idx + 1) begin
-                intram[pram_idx + 16'h70] = pram[pram_idx];
-            end
-            // Seed RTC seconds (CPU 0xAB-0xAE -> intram[0x1B-0x1E]) from the host
-            intram[16'hAB - 16'h90] <= timestamp[31:24];
-            intram[16'hAC - 16'h90] <= timestamp[23:16];
-            intram[16'hAD - 16'h90] <= timestamp[15:8];
-            intram[16'hAE - 16'h90] <= timestamp[7:0];
-            pram_loaded <= 1'b1;
+        if (!pram_loaded && !pram_copy_busy && !reset_680x0_latched && pram_ready) begin
+            pram_copy_busy <= 1'b1;
+            pram_copy_idx  <= 9'd0;
             `ifdef SIMULATION
-            $display("EGRET_PRAM: Loading PRAM and RTC time (post-clear release)");
+            $display("EGRET_PRAM: Loading PRAM and RTC time (post-clear release, sequential)");
             `endif
+        end else if (pram_copy_busy) begin
+            // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
+            // (offset 0x70 = 0x100 - 0x90), then seed RTC seconds
+            // (CPU 0xAB-0xAE -> intram[0x1B-0x1E]) from the host timestamp.
+            case (pram_copy_idx)
+                9'd256:  intram[16'hAB - 16'h90] <= timestamp[31:24];
+                9'd257:  intram[16'hAC - 16'h90] <= timestamp[23:16];
+                9'd258:  intram[16'hAD - 16'h90] <= timestamp[15:8];
+                9'd259:  intram[16'hAE - 16'h90] <= timestamp[7:0];
+                default: intram[pram_copy_idx + 9'h070] <= pram_copy_rdata;
+            endcase
+            if (pram_copy_idx == 9'd259) begin
+                pram_copy_busy <= 1'b0;
+                pram_loaded    <= 1'b1;
+            end else
+                pram_copy_idx <= pram_copy_idx + 9'd1;
         end else if (ram_cs && !cpu_wr && cen) begin  // !cpu_wr means write
             intram[ram_addr] <= cpu_dout;
         `ifdef VERBOSE_TRACE
@@ -901,7 +927,11 @@ end
 // ============================================================================
 m68hc05_core u_cpu (
     .clk(clk),
-    .cen(cen),         // 4 MHz clock enable (32 MHz / 8)
+    // cen gated by pram_copy_busy: the HC05 is frozen for the ~8 µs sequential
+    // PRAM boot-copy so the copy stays atomic from firmware's point of view —
+    // identical observable behavior to the old single-cycle burst copy. The
+    // one-second timer keeps counting (8 µs once per boot is noise).
+    .cen(cen && !pram_copy_busy),  // 4 MHz clock enable (32 MHz / 8)
     .rst(~reset),      // m68hc05_core uses active-low reset
     .irq(combined_irq_n),     // External IRQ (active-low) -> $FFFA
     .timer_irq(timer_irq_n),  // Timer interrupt (active-low) -> $FFF8
