@@ -30,13 +30,14 @@ import numpy as np
 from PIL import Image
 
 MARKER = 0xA5C3F00F
-NROWS = 12
 
-# Two deck geometries are supported so ARCHIVED captures stay readable:
-#   cell 4 px, bottom-left  — current (MacLC.sv, 2026-08-05 pm)
-#   cell 8 px, top-left     — original
-# Each entry is (base_cell_px, where) with where in {'bottom','top'}.
-LAYOUTS = ((4, 'bottom'), (8, 'top'))
+# Deck geometries, newest first, so ARCHIVED captures stay readable:
+#   cell 4 px, bottom-left, 13 rows — current (row 12 = warm-restart witness,
+#                                     2026-08-08)
+#   cell 4 px, bottom-left, 12 rows — 2026-08-05 pm .. 08-08
+#   cell 8 px, top-left,    12 rows — original
+# Each entry is (base_cell_px, where, nrows) with where in {'bottom','top'}.
+LAYOUTS = ((4, 'bottom', 13), (4, 'bottom', 12), (8, 'top', 12))
 
 
 def _row_bits(g, x0, yr, cw):
@@ -52,10 +53,10 @@ def _row_bits(g, x0, yr, cw):
 def find_and_decode(img):
     g = np.array(img.convert('L')) > 128
     H, W = g.shape
-    for base, where in LAYOUTS:
+    for base, where, nrows in LAYOUTS:
         for s in (1, 2, 3, 4):              # integer screenshot scale
             cw = base * s                   # cell width/height in screen px
-            deck_h = NROWS * cw
+            deck_h = nrows * cw
             if deck_h + 2 > H or 32 * cw + 2 > W:
                 continue
             if where == 'bottom':
@@ -68,7 +69,7 @@ def find_and_decode(img):
                     if _row_bits(g, x0, yc, cw) != MARKER:
                         continue
                     words = [_row_bits(g, x0, y0 + r * cw + cw // 2, cw)
-                             for r in range(NROWS)]
+                             for r in range(nrows)]
                     return (x0, y0, s, base, where), words
     return None, None
 
@@ -167,31 +168,28 @@ def decode(words):
             print("      ** image IS mounted to the internal slot but the drive says NO DISK")
         elif ie and not ii:
             print("      ** image landed in the EXTERNAL slot (unreachable in ISM mode)")
+    if len(w) > 12:
+        m12 = w[12]
+        live = m12 & 0xF
+        print(f"  w12 WARM-RESTART: rst_edges={m12 >> 28} "
+              f"rsti_edges={(m12 >> 24) & 0xF} "
+              f"addr_page=${(m12 >> 16) & 0xFF:02X} "
+              f"video_cfg={(m12 >> 8) & 0xFF:#04x} bus_act={(m12 >> 4) & 0xF}")
+        print(f"      LIVE: _cpuReset={'RELEASED' if live & 8 else 'IN-RESET'} "
+              f"egret_rst680={(live >> 2) & 1} overlay={'ON' if live & 2 else 'off'} "
+              f"ram_configured={live & 1}")
+        page = (m12 >> 16) & 0xFF
+        if 0xA0 <= page <= 0xAF:
+            print("      ==> executing ROM ($A00000 window) — early-boot/"
+                  "handshake territory; compare bus_act across two grabs")
+        if not (live & 8):
+            print("      ** CPU HELD IN RESET (egret_rst680 tells whose)")
+    # (The -81/-stride interpretation grid that lived here was retired with
+    # the w7 media repurpose: it read the old w7 SCAN-WITNESS layout, which no
+    # row carries anymore — its run7/par7/hunt7 inputs no longer exist (the
+    # leftover references crashed on any e81>0 capture). For archived
+    # pre-887ebba captures, use this script from git history.)
     nz, unr = w[6] >> 16, w[4] & 0xFF
-    if e81:
-        # Interpretation grid (ground truth: budget seed 64, MAME max healthy
-        # scan 17, -67/-69 own the outage/CRC-bad classes — so -81 = the scan
-        # consumed ~64 CRC-good unwanted IDs).
-        if run7 >= 40:
-            print(f"  ==> -81 MODEL CONFIRMED: {run7} consecutive IDs consumed "
-                  "(budget seed is 64; one revolution is 18) — the target was "
-                  "skipped on 3+ consecutive revolutions.")
-            if par7 in (1, 2):
-                print(f"  ==> STROBOSCOPE CONFIRMED: the whole burn saw {par_s} "
-                      "sector numbers — the timer-paced re-arm lands past every "
-                      "other ID and 18 sectors split into two closed 9-cycles. "
-                      "Fix class: break the wake/rotation phase lock.")
-            else:
-                print("  ==> both parities seen: not a clean stride-2 lock — "
-                      "longer-cycle alias, or the skip is positional. Compare "
-                      "run vs 64 and look at gap/hunt.")
-        elif run7 <= 20 and run7 > 0:
-            print(f"  ==> run={run7} at -81: the budget died within ONE "
-                  "revolution — contradicts the 64-seed model. Re-derive "
-                  "(is +47 being reseeded mid-scan? different caller?).")
-        if hunt7 >= 100:
-            print(f"  ==> last armed window was {hunt7} ms: a DRY HUNT at -81 "
-                  "contradicts the -67 ownership of that class — re-derive.")
     if nz:
         print(f"  ==> VERDICT: driver posted {nz} error completion(s); "
               f"first {sony_err(w[5] >> 16)}, last {sony_err(w[5] & 0xFFFF)}")

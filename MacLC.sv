@@ -1315,6 +1315,10 @@ module emu
 	//   row 9  {ism_mode_reg[7:0], ism_setup[7:0], 8'b0, diskEnableInt,
 	//           driveSel, devsel_int, devsel_ext, selonly_int, ism_mode,
 	//           diskEnableExt, 0} — what the driver PROGRAMMED
+	//   row 12 WARM-RESTART witness (2026-08-08): {rst_edges[3:0],
+	//           rsti_edges[3:0], addr_page[7:0], video_config[7:0],
+	//           bus_act[3:0], _cpuReset, egret_reset_680x0, memoryOverlayOn,
+	//           ram_configured} — see the row-12 comment block below
 	// CDC note: rows are sampled from clk_sys into clk_vid once per frame
 	// with no handshake — acceptable for a HUD (the values of interest are
 	// static once the Finder error dialog is up, floppy quiesced).
@@ -1377,6 +1381,47 @@ module emu
 		end
 	end
 
+	// ── Warm-restart witness (2026-08-08, reboot-black-video hunt) ──────────
+	// Row 12 separates the two guest-restart flavors and localizes a wedged
+	// warm boot from ONE screenshot of a black screen (the HUD is drawn into
+	// scanout, so its very visibility already proves the V8→VGA chain is
+	// alive; compare TWO grabs to tell frozen from advancing):
+	//   rst_edges[3:0]  = _cpuReset ASSERT events (Egret-driven restart adds
+	//                     one; cold-boot baseline expected 0 — firmware's
+	//                     start sequence completes before the first release)
+	//   rsti_edges[3:0] = 68k RESET-instruction executions (_cpuReset_o):
+	//                     the soft-restart flavor; cold boot baseline 1 (the
+	//                     ROM's ~T+4s peripheral RESET). After Special▸
+	//                     Restart the delta pair (rst,rsti) reads:
+	//                     (1,1)/(1,0) = Egret flavor, (0,1) = soft jump,
+	//                     (0,0) = wedged before any reset was issued.
+	//   addr_page[7:0]  = cpuAddr[23:16] at the frame snapshot: $A0-$AF =
+	//                     executing ROM (e.g. Egret-handshake retry loop),
+	//                     $00-$09 = RAM/OS, frozen WITH frozen bus_act =
+	//                     halted (double fault).
+	//   video_cfg[7:0]  = live pseudovia video-config: still the OS value on
+	//                     a black screen = ROM never reached video re-init.
+	//   bus_act[3:0]    = free-running bus-cycle counter (mod 16): liveness.
+	//   live bits       = {_cpuReset, egret_reset_680x0, memoryOverlayOn,
+	//                     ram_configured}: stuck-in-reset / overlay state.
+	reg [3:0] hud_rst_edges = 4'd0, hud_rsti_edges = 4'd0;
+	reg [3:0] hud_bus_act = 4'd0;
+	reg [7:0] hud_addr_page = 8'd0;
+	reg       hud_rst_d = 1'b0, hud_rsti_d = 1'b1, hud_as_d = 1'b1;
+	always @(posedge clk_sys) begin
+		hud_rst_d  <= _cpuReset;
+		hud_rsti_d <= _cpuReset_o;
+		hud_as_d   <= _cpuAS;
+		if (hud_rst_d && !_cpuReset && hud_rst_edges != 4'hF)
+			hud_rst_edges <= hud_rst_edges + 1'd1;
+		if (hud_rsti_d && !_cpuReset_o && hud_rsti_edges != 4'hF)
+			hud_rsti_edges <= hud_rsti_edges + 1'd1;
+		if (hud_as_d && !_cpuAS) begin
+			hud_bus_act   <= hud_bus_act + 1'd1;
+			hud_addr_page <= cpuAddr[23:16];
+		end
+	end
+
 	// clk_vid side: pixel position from DE/VBlank, per-frame word snapshot,
 	// registered 2:1 pixel mux (one pipeline stage keeps the VGA cone short;
 	// the 1px right-shift is absorbed by the marker calibration).
@@ -1384,7 +1429,7 @@ module emu
 	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
 	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
-	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0;
+	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0, hud_w12 = 32'd0;
 	// ── Geometry (2026-08-05 pm): 4x4 cells at the BOTTOM-LEFT ─────────────
 	// Was 8x8 cells at the top-left, which covered the Mac MENU BAR — that
 	// cost real bench time (the Special-menu shutdown choreography walked
@@ -1396,13 +1441,14 @@ module emu
 	// any other v8 mode all place the deck against the true last line
 	// without a hard-coded height.
 	localparam [9:0] HUD_W  = 10'd128;   // 32 cells x 4 px
-	localparam [9:0] HUD_HT = 10'd48;    // 12 rows  x 4 lines
+	localparam [9:0] HUD_HT = 10'd52;    // 13 rows  x 4 lines
 	reg  [9:0] hud_h = 10'd480;          // measured active lines (prev frame)
 	wire [9:0] hud_ytop  = (hud_h > HUD_HT) ? (hud_h - HUD_HT) : 10'd0;
 	wire       hud_vband = (hud_y >= hud_ytop) && (hud_y < hud_h);
 	wire [9:0] hud_yrel  = hud_y - hud_ytop;
 	wire [3:0] hud_rowsel = hud_yrel[5:2];
 	wire [31:0] hud_wmux =
+		(hud_rowsel == 4'd12) ? hud_w12 :
 		(hud_rowsel == 4'd11) ? hud_w11 :
 		(hud_rowsel == 4'd10) ? hud_w10 :
 		(hud_rowsel == 4'd9) ? hud_w9 :
@@ -1441,6 +1487,10 @@ module emu
 			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
 			             dbg_flp_disk_data, dbg_flp_raw};
+			hud_w12 <= {hud_rst_edges, hud_rsti_edges, hud_addr_page,
+			             pvia_video_config, hud_bus_act, _cpuReset,
+			             egret_reset_680x0_w, memoryOverlayOn,
+			             pvia_ram_configured};
 		end
 		hud_on_q    <= hud_vband && (hud_x < HUD_W) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[6:2]];
