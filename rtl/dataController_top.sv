@@ -1069,7 +1069,18 @@ module dataController_top(
 		.clk(clk32),
 		.cep(clk8_en_p),
 		.cen(clk8_en_n),
-		._reset(_cpuReset),
+		// softRst: THE warm-restart black-screen wedge (rows-14/15 witness,
+		// 2026-08-08 + boot0.rom disasm at $A009C8): the early cold-path ROM
+		// runs the ISM→IWM switch-back ($BE/$F8 to the mode-clear reg, poll
+		// rStatus until bit5 clears and low bits == $17). Cold boots pass
+		// because the SWIM is already IWM-idle; the soft restart inherited
+		// the OS's ISM-mode state and our readback never satisfied the exit,
+		// so the ROM looped forever at $A009CE with video still blanked.
+		// The SWIM already resets on the Egret-flavor _cpuReset — the soft
+		// flavor gets the same chip-level reset. Media/mount state lives in
+		// floppy.v and the top-level latches, NOT here — the disk-swap
+		// protocol is untouched (tb_disk_swap gates it).
+		._reset(_cpuReset && !softRst),
 		.selectSWIM(selectIWM),
 		._cpuRW(_cpuRW),
 		._cpuUDS(_cpuUDS),  // LC V8: SWIM is on the upper byte (even addresses)
