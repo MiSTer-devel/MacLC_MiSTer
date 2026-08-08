@@ -278,7 +278,10 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   Instruments: `USE_DBG_HUD` + `scripts/parse_hud.py` (rows 7/8 = SCAN-WITNESS),
   `verilator/mame/floppy/sonyvars_watch.lua` (driver retry budgets from MAME),
   `verilator/tb_mfm_idcensus.v` (full-disk ID census), `tb_ism_sony +postgap=N`.
-  ★ `USE_DBG_HUD=1` is committed ON in `MacLC.qsf` — turn it OFF for release fits.
+  ★ `USE_DBG_HUD=1` toggles per mission in `MacLC.qsf` (check the qsf, not this
+  line: OFF for release fits, ON for investigations — ON since 2026-08-08 for
+  the warm-restart row-12 witness). HUD-on/off are DIFFERENT netlists: re-gate
+  after flipping.
 - SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
   (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO

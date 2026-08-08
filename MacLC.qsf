@@ -110,8 +110,11 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # re-roll the fit lottery independently, so re-gate after flipping it (colour
 # icons by eye + >= 2-boot Finder soak). COMMENT AGAIN for release fits.
 # HUD row 7 = the media-change witness (floppy.v dbg_media; port comment).
+# HUD row 12 = the warm-restart witness (restart flavor + wedge locale; see
+# the MacLC.sv row-12 block and parse_hud.py). 13 rows as of 2026-08-08.
 # OFF 2026-08-06 pm: disk-swap mission complete — release configuration.
-# set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
+# ON  2026-08-08: reboot-black-video investigation needs row 12 on hardware.
+set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"
