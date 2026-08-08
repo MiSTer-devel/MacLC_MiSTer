@@ -114,7 +114,10 @@ set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
 # the MacLC.sv row-12 block and parse_hud.py). 13 rows as of 2026-08-08.
 # OFF 2026-08-06 pm: disk-swap mission complete — release configuration.
 # ON  2026-08-08: reboot-black-video investigation needs row 12 on hardware.
-set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
+# OFF 2026-08-08 pm: warm-restart mission COMPLETE (SWIM fix 2dfcd1a validated
+# 3/3 on 578f140f) — back to release configuration. Rows 12-15 (restart/Egret/
+# address witnesses) remain in MacLC.sv for the next investigation.
+# set_global_assignment -name VERILOG_MACRO "USE_DBG_HUD=1"
 
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"
