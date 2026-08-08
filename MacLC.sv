@@ -1477,6 +1477,19 @@ module emu
 		end
 	end
 
+	// ── Rows 14/15: last two DISTINCT bus addresses (warm-restart hunt
+	// phase 3). The wedge loop's full footprint: three grabs give six
+	// 24-bit address samples — loop PCs land in $A0xxxx, the data addresses
+	// name the device/table (ASC $F148xx, trap table $0004xx, ...). No
+	// inference left after this.
+	reg [23:0] hud_lastaddr = 24'd0, hud_prevaddr = 24'd0;
+	always @(posedge clk_sys) begin
+		if (hud_as_d && !_cpuAS && (cpuAddr[23:0] != hud_lastaddr)) begin
+			hud_prevaddr <= hud_lastaddr;
+			hud_lastaddr <= cpuAddr[23:0];
+		end
+	end
+
 	// clk_vid side: pixel position from DE/VBlank, per-frame word snapshot,
 	// registered 2:1 pixel mux (one pipeline stage keeps the VGA cone short;
 	// the 1px right-shift is absorbed by the marker calibration).
@@ -1485,7 +1498,7 @@ module emu
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
 	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
 	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0, hud_w12 = 32'd0,
-	           hud_w13 = 32'd0;
+	           hud_w13 = 32'd0, hud_w14 = 32'd0, hud_w15 = 32'd0;
 	// ── Geometry (2026-08-05 pm): 4x4 cells at the BOTTOM-LEFT ─────────────
 	// Was 8x8 cells at the top-left, which covered the Mac MENU BAR — that
 	// cost real bench time (the Special-menu shutdown choreography walked
@@ -1497,13 +1510,15 @@ module emu
 	// any other v8 mode all place the deck against the true last line
 	// without a hard-coded height.
 	localparam [9:0] HUD_W  = 10'd128;   // 32 cells x 4 px
-	localparam [9:0] HUD_HT = 10'd56;    // 14 rows  x 4 lines
+	localparam [9:0] HUD_HT = 10'd64;    // 16 rows  x 4 lines
 	reg  [9:0] hud_h = 10'd480;          // measured active lines (prev frame)
 	wire [9:0] hud_ytop  = (hud_h > HUD_HT) ? (hud_h - HUD_HT) : 10'd0;
 	wire       hud_vband = (hud_y >= hud_ytop) && (hud_y < hud_h);
 	wire [9:0] hud_yrel  = hud_y - hud_ytop;
 	wire [3:0] hud_rowsel = hud_yrel[5:2];
 	wire [31:0] hud_wmux =
+		(hud_rowsel == 4'd15) ? hud_w15 :
+		(hud_rowsel == 4'd14) ? hud_w14 :
 		(hud_rowsel == 4'd13) ? hud_w13 :
 		(hud_rowsel == 4'd12) ? hud_w12 :
 		(hud_rowsel == 4'd11) ? hud_w11 :
@@ -1552,6 +1567,8 @@ module emu
 			             2'b00, egret_dbg_running_w, egret_dbg_pt_w,
 			             egret_dbg_hs_w, egret_dbg_treq_w,
 			             egret_dbg_tip_w, egret_dbg_byteack_w};
+			hud_w14 <= {5'b0, _cpuIPL, hud_lastaddr};
+			hud_w15 <= {8'b0, hud_prevaddr};
 		end
 		hud_on_q    <= hud_vband && (hud_x < HUD_W) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[6:2]];

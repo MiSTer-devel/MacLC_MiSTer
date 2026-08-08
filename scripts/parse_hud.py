@@ -38,8 +38,8 @@ MARKER = 0xA5C3F00F
 #   cell 4 px, bottom-left, 12 rows — 2026-08-05 pm .. 08-08
 #   cell 8 px, top-left,    12 rows — original
 # Each entry is (base_cell_px, where, nrows) with where in {'bottom','top'}.
-LAYOUTS = ((4, 'bottom', 14), (4, 'bottom', 13), (4, 'bottom', 12),
-           (8, 'top', 12))
+LAYOUTS = ((4, 'bottom', 16), (4, 'bottom', 14), (4, 'bottom', 13),
+           (4, 'bottom', 12), (8, 'top', 12))
 
 
 def _row_bits(g, x0, yr, cw):
@@ -195,6 +195,11 @@ def decode(words):
               f"tip={(m13 >> 1) & 1} byteack={m13 & 1}")
         print("      (counters clear at the RESET instruction: post-restart "
               "values isolate the warm handshake; compare vs a cold boot)")
+    if len(w) > 15:
+        ipl = (w[14] >> 24) & 0x7
+        print(f"  w14 LAST ADDR ${w[14] & 0xFFFFFF:06X}  IPL={ipl}")
+        print(f"  w15 PREV ADDR ${w[15] & 0xFFFFFF:06X}"
+              "   (two distinct bus addrs per grab — 3 grabs name the loop)")
     # (The -81/-stride interpretation grid that lived here was retired with
     # the w7 media repurpose: it read the old w7 SCAN-WITNESS layout, which no
     # row carries anymore — its run7/par7/hunt7 inputs no longer exist (the
