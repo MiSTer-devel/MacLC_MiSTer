@@ -1782,7 +1782,15 @@ module emu
 	// V8 schematic SND[0:2]/DFAC_CLK/CULTDAC0: see rtl/asc.sv / rtl/ariel_ramdac.sv
 	asc asc_inst(
 		.clk(clk_sys),
-		.reset(~n_reset),
+		// soft_periph_rst: the RESET instruction resets the ASC on a real LC
+		// (it sits on the system reset line). Row-13 witness 2026-08-08: the
+		// warm boot's Egret handshake COMPLETES (treq/tip/pvia_wr counters
+		// freeze at 7/14/41, lines idle) and the ROM then spins quietly in
+		// $A0xxxx before the march/video-config — the chime-phase wait on a
+		// STALE OS-era ASC (FIFO/mode/IRQ state) is the prime suspect; a
+		// freshly-reset ASC behaves exactly as the ROM's chime code expects
+		// on every cold boot.
+		.reset(~n_reset || soft_periph_rst),
 		.cs(selectASC),
 		// cpuAddr[0] is forced 0 in this core, so the ASC register A0 (which
 		// selects MODE/FIFOMODE/CLOCK — the odd-numbered regs) gets dropped and

@@ -647,7 +647,9 @@ module emu
 
 	asc asc_inst(
 		.clk(clk_sys),
-		.reset(~n_reset),
+		// soft_periph_rst: RESET instruction resets the ASC (real reset
+		// line) — keep in sync with MacLC.sv (2026-08-08 warm-restart fix).
+		.reset(~n_reset || soft_periph_rst),
 		.cs(selectASC),
 		// cpuAddr[0] is forced 0; reconstruct the real A0 (tg68_a[0]) so the
 		// odd ASC registers (MODE/FIFOMODE/CLOCK) don't alias onto the even reg
