@@ -128,6 +128,8 @@ module emu
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
 	wire      egret_reset_680x0_w;      // Egret HC05 holding 68k in reset (#3 probe)
+	wire      egret_dbg_running_w, egret_dbg_pt_w, egret_dbg_hs_w;
+	wire      egret_dbg_treq_w, egret_dbg_tip_w, egret_dbg_byteack_w;
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 	always @(posedge clk_sys) begin
 		reg [15:0] rst_cnt;
@@ -1338,6 +1340,10 @@ module emu
 	//           rsti_edges[3:0], addr_page[7:0], video_config[7:0],
 	//           bus_act[3:0], _cpuReset, egret_reset_680x0, memoryOverlayOn,
 	//           ram_configured} — see the row-12 comment block below
+	//   row 13 EGRET-HANDSHAKE liveness (2026-08-08 pm): {treq_edges[7:0],
+	//           tip_edges[7:0], pvia_wr[7:0], 2'b0, running, pt_done,
+	//           hs_done, treq, tip, byteack} — counters clear on the RESET
+	//           instruction (see the row-13 comment block below)
 	// CDC note: rows are sampled from clk_sys into clk_vid once per frame
 	// with no handshake — acceptable for a HUD (the values of interest are
 	// static once the Finder error dialog is up, floppy quiesced).
@@ -1441,6 +1447,36 @@ module emu
 		end
 	end
 
+	// ── Row 13: Egret-handshake liveness (warm-restart hunt phase 2) ────────
+	// The soft-reset fix (6d3922e) removed the instant IER storm, but the
+	// warm boot still wedges BEFORE the ROM's first video-config write —
+	// and on an Egret Mac that write waits on the PRAM handshake. These
+	// counters clear on the RESET instruction, so post-restart values
+	// isolate the WARM handshake alone; compare against the cold profile.
+	//   treq_edges = Egret TREQ asserts (HC05 requesting a transaction)
+	//   tip_edges  = host TIP session opens (ROM answering)
+	//   pvia_wr    = pseudovia write strobes (ROM programming the V8)
+	reg [7:0] hud_treq_edges = 8'd0, hud_tip_edges = 8'd0, hud_pviawr = 8'd0;
+	reg       hud_treq_d = 1'b0, hud_tip_d = 1'b0, hud_pviawr_d = 1'b0;
+	wire      hud_pviawr_stb = selectPseudoVIA && !_cpuRW && cpuBusControl;
+	always @(posedge clk_sys) begin
+		hud_treq_d   <= egret_dbg_treq_w;
+		hud_tip_d    <= egret_dbg_tip_w;
+		hud_pviawr_d <= hud_pviawr_stb;
+		if (soft_periph_rst) begin
+			hud_treq_edges <= 8'd0;
+			hud_tip_edges  <= 8'd0;
+			hud_pviawr     <= 8'd0;
+		end else begin
+			if (!hud_treq_d && egret_dbg_treq_w && hud_treq_edges != 8'hFF)
+				hud_treq_edges <= hud_treq_edges + 1'd1;
+			if (!hud_tip_d && egret_dbg_tip_w && hud_tip_edges != 8'hFF)
+				hud_tip_edges <= hud_tip_edges + 1'd1;
+			if (!hud_pviawr_d && hud_pviawr_stb && hud_pviawr != 8'hFF)
+				hud_pviawr <= hud_pviawr + 1'd1;
+		end
+	end
+
 	// clk_vid side: pixel position from DE/VBlank, per-frame word snapshot,
 	// registered 2:1 pixel mux (one pipeline stage keeps the VGA cone short;
 	// the 1px right-shift is absorbed by the marker calibration).
@@ -1448,7 +1484,8 @@ module emu
 	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
 	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
-	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0, hud_w12 = 32'd0;
+	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0, hud_w12 = 32'd0,
+	           hud_w13 = 32'd0;
 	// ── Geometry (2026-08-05 pm): 4x4 cells at the BOTTOM-LEFT ─────────────
 	// Was 8x8 cells at the top-left, which covered the Mac MENU BAR — that
 	// cost real bench time (the Special-menu shutdown choreography walked
@@ -1460,13 +1497,14 @@ module emu
 	// any other v8 mode all place the deck against the true last line
 	// without a hard-coded height.
 	localparam [9:0] HUD_W  = 10'd128;   // 32 cells x 4 px
-	localparam [9:0] HUD_HT = 10'd52;    // 13 rows  x 4 lines
+	localparam [9:0] HUD_HT = 10'd56;    // 14 rows  x 4 lines
 	reg  [9:0] hud_h = 10'd480;          // measured active lines (prev frame)
 	wire [9:0] hud_ytop  = (hud_h > HUD_HT) ? (hud_h - HUD_HT) : 10'd0;
 	wire       hud_vband = (hud_y >= hud_ytop) && (hud_y < hud_h);
 	wire [9:0] hud_yrel  = hud_y - hud_ytop;
 	wire [3:0] hud_rowsel = hud_yrel[5:2];
 	wire [31:0] hud_wmux =
+		(hud_rowsel == 4'd13) ? hud_w13 :
 		(hud_rowsel == 4'd12) ? hud_w12 :
 		(hud_rowsel == 4'd11) ? hud_w11 :
 		(hud_rowsel == 4'd10) ? hud_w10 :
@@ -1510,6 +1548,10 @@ module emu
 			             pvia_video_config, hud_bus_act, _cpuReset,
 			             egret_reset_680x0_w, memoryOverlayOn,
 			             pvia_ram_configured};
+			hud_w13 <= {hud_treq_edges, hud_tip_edges, hud_pviawr,
+			             2'b00, egret_dbg_running_w, egret_dbg_pt_w,
+			             egret_dbg_hs_w, egret_dbg_treq_w,
+			             egret_dbg_tip_w, egret_dbg_byteack_w};
 		end
 		hud_on_q    <= hud_vband && (hud_x < HUD_W) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[6:2]];
@@ -1995,6 +2037,13 @@ module emu
 		.pram_ready(pram_ready),
 		// #3 reset-source probe: expose the Egret's 68k-reset line (Port C bit 3)
 		.egret_dbg_reset_680x0(egret_reset_680x0_w),
+		// HUD row 13 (warm-restart hunt phase 2): Egret handshake liveness
+		.egret_dbg_running(egret_dbg_running_w),
+		.egret_dbg_port_test_done(egret_dbg_pt_w),
+		.egret_dbg_handshake_done(egret_dbg_hs_w),
+		.egret_dbg_treq(egret_dbg_treq_w),
+		.egret_dbg_tip(egret_dbg_tip_w),
+		.egret_dbg_byteack(egret_dbg_byteack_w),
 		// PFLP floppy diagnostics (internal drive)
 		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),
 		.dbg_flp_miss_cnt(dbg_flp_miss_cnt),

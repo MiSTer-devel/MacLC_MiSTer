@@ -32,12 +32,14 @@ from PIL import Image
 MARKER = 0xA5C3F00F
 
 # Deck geometries, newest first, so ARCHIVED captures stay readable:
-#   cell 4 px, bottom-left, 13 rows — current (row 12 = warm-restart witness,
-#                                     2026-08-08)
+#   cell 4 px, bottom-left, 14 rows — current (row 13 = Egret-handshake
+#                                     liveness, 2026-08-08 pm)
+#   cell 4 px, bottom-left, 13 rows — 2026-08-08 (row 12 warm-restart witness)
 #   cell 4 px, bottom-left, 12 rows — 2026-08-05 pm .. 08-08
 #   cell 8 px, top-left,    12 rows — original
 # Each entry is (base_cell_px, where, nrows) with where in {'bottom','top'}.
-LAYOUTS = ((4, 'bottom', 13), (4, 'bottom', 12), (8, 'top', 12))
+LAYOUTS = ((4, 'bottom', 14), (4, 'bottom', 13), (4, 'bottom', 12),
+           (8, 'top', 12))
 
 
 def _row_bits(g, x0, yr, cw):
@@ -184,6 +186,15 @@ def decode(words):
                   "handshake territory; compare bus_act across two grabs")
         if not (live & 8):
             print("      ** CPU HELD IN RESET (egret_rst680 tells whose)")
+    if len(w) > 13:
+        m13 = w[13]
+        print(f"  w13 EGRET: treq_edges={m13 >> 24} tip_edges={(m13 >> 16) & 0xFF} "
+              f"pvia_wr={(m13 >> 8) & 0xFF}")
+        print(f"      LIVE: running={(m13 >> 5) & 1} pt_done={(m13 >> 4) & 1} "
+              f"hs_done={(m13 >> 3) & 1} treq={(m13 >> 2) & 1} "
+              f"tip={(m13 >> 1) & 1} byteack={m13 & 1}")
+        print("      (counters clear at the RESET instruction: post-restart "
+              "values isolate the warm handshake; compare vs a cold boot)")
     # (The -81/-stride interpretation grid that lived here was retired with
     # the w7 media repurpose: it read the old w7 SCAN-WITNESS layout, which no
     # row carries anymore — its run7/par7/hunt7 inputs no longer exist (the
