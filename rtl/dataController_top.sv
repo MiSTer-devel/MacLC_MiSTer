@@ -9,6 +9,15 @@ module dataController_top(
 
 	// system control:
 	input _systemReset,
+	// RESET-instruction soft peripheral reset (2026-08-08 warm-restart fix):
+	// pulse from the top level when the 68020 executes RESET. On a real LC
+	// that instruction drives the external reset line and resets the VIA;
+	// here it resets via6522 + the TIP latch ONLY. Deliberately NOT the
+	// NCR/SCC (2026-06-12 lesson at the egretReset note: the ROM sets up the
+	// SCSI chip ~T+2.8s, issues RESET ~T+4s, and expects that setup to
+	// survive — resetting the NCR here regressed cold boot to a blinking ?)
+	// and NOT the SWIM/IWM (not implicated; floppy state is precious).
+	input softRst,
 	input pseudovia_irq,  // PseudoVIA interrupt (VBlank, slots)
 
 	// 68000 CPU control:
@@ -715,7 +724,10 @@ module dataController_top(
 		.clock      (clk32),
 		.rising     (E_rising),
 		.falling    (E_falling),
-		.reset      (!_cpuReset),
+		// softRst: the RESET instruction resets the VIA on a real LC (and
+		// the ROM re-establishes VIA state after its own T+4s RESET on
+		// every cold boot — real hardware proves that path safe).
+		.reset      (!_cpuReset || softRst),
 
 		.addr       (cpuAddrRegHi),
 		.wen        (selectVIA && !_cpuVMA && !_cpuRW),
@@ -795,8 +807,10 @@ module dataController_top(
 	// PB5=1 → TIP active (session), PB5=0 → TIP idle
 	reg via_tip_latched;
 	always @(posedge clk32) begin
-		if (!_cpuReset) begin
-			// Reset: TIP idle (0 = no session)
+		if (!_cpuReset || softRst) begin
+			// Reset: TIP idle (0 = no session). softRst: the VIA just reset
+			// (DDRB -> input), so hold the Egret's TIP view at idle rather
+			// than freezing the dying OS session's last value.
 			via_tip_latched <= 1'b0;
 		end else if (clk8_en_p && via_pb_oe[5]) begin
 `ifdef SIMULATION

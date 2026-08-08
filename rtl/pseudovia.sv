@@ -17,6 +17,20 @@
 module pseudovia(
     input clk_sys,
     input reset,
+    // RESET-instruction soft reset (2026-08-08 warm-restart fix): on a real
+    // LC the 68020 RESET instruction drives the external reset line, which
+    // resets the V8's interrupt state. Our soft restart path (Special ▸
+    // Restart / shutdown-screen Restart both execute RESET + jump, NO Egret
+    // reset — HUD row-12 witnessed) left the OS's slot_ier/ier live, and
+    // any_slot_irq re-asserts from vblank EVERY FRAME — so the warm boot,
+    // on first lowering IPL, lived forever in the slot-interrupt handler
+    // probing $F1xxxx (the phantom-PDS space) for a source it could never
+    // silence: the user-visible "black screen after restart" (video still
+    // blanked at cfg $40). Clears INTERRUPT state only — ram_cfg/
+    // ram_configured/video_config survive, exactly as on a real LC (the
+    // ROM's own T+4s cold-boot RESET would otherwise unmap RAM under the
+    // running boot).
+    input soft_rst,
 
     // CPU interface - full offset within $F26000-$F27FFF range
     input [12:0] addr,  // Offset 0x0000-0x1FFF
@@ -115,6 +129,12 @@ always @(posedge clk_sys) begin
         ier <= 8'h00;
         irq_out <= 1'b0;
         video_config <= 8'h03;  // Default to 8bpp mode
+    end else if (soft_rst) begin
+        // RESET instruction: interrupt state only (see the port comment).
+        ifr      <= 8'h00;
+        slot_ier <= 8'h00;
+        ier      <= 8'h00;
+        irq_out  <= 1'b0;
     end else begin
         // Update slot IRQ summary in IFR (bit 1 = any slot)
         if (any_slot_irq)

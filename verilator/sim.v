@@ -335,6 +335,17 @@ module emu
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
+
+	// RESET-instruction soft peripheral reset — keep in sync with MacLC.sv
+	// (2026-08-08 warm-restart fix; full rationale there): stretch
+	// tg68_reset_n into a 16-clk pulse for via6522 + pseudovia interrupt
+	// state. The cold-boot T+4s RESET exercises this in every sim boot.
+	reg [3:0] softrst_cnt = 4'd0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset_o)           softrst_cnt <= 4'hF;
+		else if (softrst_cnt != 0)  softrst_cnt <= softrst_cnt - 1'd1;
+	end
+	wire soft_periph_rst = (softrst_cnt != 0);
 	assign      _cpuRW        = tg68_rw;
 	assign      _cpuAS        = tg68_as_n;
 	assign      _cpuUDS       = tg68_uds_n;
@@ -605,6 +616,7 @@ module emu
 	pseudovia pvia(
 		.clk_sys(clk_sys),
 		.reset(~n_reset),
+		.soft_rst(soft_periph_rst),
 		.addr({cpuAddr[12:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(pseudovia_dout),
@@ -773,6 +785,7 @@ module emu
 		.E_rising(E_rising),
 		.E_falling(E_falling),
 		._systemReset(n_reset),
+		.softRst(soft_periph_rst),
 		._cpuReset(_cpuReset),
 		._cpuIPL(_cpuIPL_dc),
 		.pseudovia_irq(pseudovia_irq),
