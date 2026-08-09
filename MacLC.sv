@@ -563,7 +563,22 @@ module emu
 	wire [31:0] pix_c0 = (v8_monitor_id == 4'h2) ? 32'h00021716 :  // /45 = 15.664 MHz
 	                     (v8_monitor_id == 4'h1) ? 32'h00000606 :  // /12 = 58.742 MHz
 	                                               32'h00000E0E;   // /28 = 25.175 MHz
+	// Reconfig QUIET WINDOW (2026-08-08, the "out of range / V-80 on this
+	// core only" reports): the C0-only retarget never drops PLL lock (the
+	// VCO is untouched), so the lock-watching vidrst below never fired and
+	// scanout STEPPED to the new pixel rate MID-FRAME. Main_MiSTer's
+	// vsync_adjust / vscale_mode>=4 path measures the core's frame time and
+	// retimes the HDMI pixel clock from it (video.cpp video_mode_adjust,
+	// acceptance window a useless 2..300 MHz, refresh_min/max guards default
+	// OFF) — one chimera frame and it programs an out-of-spec HDMI mode that
+	// LATCHES until the next video change. MacLC is the rare core with a
+	// runtime-reconfigurable CLK_VIDEO, which is why only this core showed
+	// it. pix_quiet holds the video reset from retarget-pending through
+	// ~84 ms after the FSM consumes it, so the monitor switch presents as a
+	// clean blank-and-return and Main only ever measures coherent frames.
+	reg pix_quiet = 1'b0;
 	always @(posedge CLK_50M) begin : pix_reconfig
+		reg [21:0] settle = 22'd0;
 		reg [31:0] c0_cur = 32'h00000E0E;  // = the static /28 VGA config: a VGA
 		                                   // boot performs NO reconfig (the boot-
 		                                   // time PLL glitch BERR-stormed the HPS
@@ -573,6 +588,18 @@ module emu
 		reg [2:0]  state = 0;
 		c0_s1 <= pix_c0;                   // settle across clk_sys -> CLK_50M
 		c0_s2 <= c0_s1;
+		// Quiet-window generator: re-arms while a retarget is PENDING (the
+		// condition below persists until state 0 consumes it into c0_cur),
+		// then counts ~84 ms (2^22 / 50 MHz) of settle after the FSM has the
+		// new divider. pix_quiet feeds the clk_vid vidrst 2FF below.
+		if (c0_s2 == c0_s1 && c0_s2 != c0_cur) begin
+			settle    <= 22'h3FFFFF;
+			pix_quiet <= 1'b1;
+		end else if (settle != 0) begin
+			settle    <= settle - 1'd1;
+		end else begin
+			pix_quiet <= 1'b0;
+		end
 		if (!pixcfg_waitrequest) begin
 			pixcfg_write <= 0;
 			if (pll_video_locked) begin
@@ -595,7 +622,9 @@ module emu
 	// MacLC.sdc.)
 	reg vidrst_meta = 1'b1, vidrst_s = 1'b1;
 	always @(posedge clk_vid) begin
-		vidrst_meta <= ~n_reset || ~pll_video_locked;
+		// pix_quiet: CLK_50M-domain level, multi-ms wide — the existing 2FF
+		// chain is its synchronizer (same treatment as ~pll_video_locked).
+		vidrst_meta <= ~n_reset || ~pll_video_locked || pix_quiet;
 		vidrst_s    <= vidrst_meta;
 	end
 
