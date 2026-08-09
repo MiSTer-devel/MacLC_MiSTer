@@ -278,7 +278,8 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   Instruments: `USE_DBG_HUD` + `scripts/parse_hud.py` (rows 7/8 = SCAN-WITNESS),
   `verilator/mame/floppy/sonyvars_watch.lua` (driver retry budgets from MAME),
   `verilator/tb_mfm_idcensus.v` (full-disk ID census), `tb_ism_sony +postgap=N`.
-  ★ `USE_DBG_HUD=1` is committed ON in `MacLC.qsf` — turn it OFF for release fits.
+  ★ `USE_DBG_HUD` is currently OFF (commented out) in `MacLC.qsf` — flip it
+  on for debug fits only; it must be OFF in release fits.
 - SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
   (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO
