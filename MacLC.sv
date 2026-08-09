@@ -82,7 +82,7 @@ module emu
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
-		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
+		"OA,Monitor @Reset,640x480 VGA,512x384 12in;",
 		"-;",
 		"O4,Memory,2MB,10MB;",
 		"-;",
@@ -1126,11 +1126,24 @@ module emu
 							   status[17] ? 3'd4 : 3'd2;       // 16bpp override
 	*/
 
-	// Monitor ID Selection — OSD-selectable between 640x480 VGA (default,
-	// MAME-faithful) and 512x384 12" RGB. Portrait is not supported. This is
-	// the sense ID the ROM reads to pick V8 timing.
-	wire [3:0] v8_monitor_id = status[10] ? 4'h2 :  // 512x384 12" RGB
-	                                         4'h6;   // 640x480 VGA (default)
+	// Monitor ID Selection — 640x480 VGA (default, MAME-faithful) or
+	// 512x384 12" RGB. Portrait is not supported. This is the sense ID the
+	// ROM reads to pick V8 timing.
+	// LATCHED UNDER RESET: a real LC samples the monitor sense lines only
+	// during the ROM's boot probe — the display cannot change on a running
+	// system, and the OS lays out QuickDraw for the boot geometry. The old
+	// live status[10] wire retargeted the pixel PLL mid-session (guest-
+	// hostile, and the source of the out-of-range class pix_quiet guards).
+	// The OSD choice now applies at the next reset — R0 "Reset & Apply",
+	// R6, or core reload — the same pattern as the Memory option. Saved
+	// configs still apply on first load: the HPS delivers status while
+	// n_reset is held, so the latch captures it before first release.
+	// (verilator/sim.v hardwires 4'h6 — no sim-side counterpart needed.)
+	reg [3:0] v8_monitor_id = 4'h6;  // 640x480 VGA until first reset sample
+	always @(posedge clk_sys) begin
+		if (~n_reset) v8_monitor_id <= status[10] ? 4'h2 :  // 512x384 12" RGB
+		                                            4'h6;   // 640x480 VGA
+	end
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
