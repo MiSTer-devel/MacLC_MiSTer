@@ -306,9 +306,18 @@ vsync_adjust=0
 ```
 
 That is the standard VESA 1280×1024@60 timing (63.98 kHz / 60.02 Hz), within
-spec for any SXGA panel. For a different panel native, substitute its own
-mode line — the key is a **fixed `video_mode` plus `vsync_adjust=0`**, which
-stops automatic mode negotiation for this core only.
+spec for any SXGA panel. For a 1080p display, use the standard CEA
+1920×1080@60 line instead:
+
+```ini
+[MacLC]
+video_mode=1920,88,44,148,1080,4,5,36,148500
+vsync_adjust=0
+```
+
+For any other panel native, substitute its own mode line — the key is a
+**fixed `video_mode` plus `vsync_adjust=0`**, which stops automatic mode
+negotiation for this core only.
 
 ## Keyboard & mouse
 
