@@ -5,7 +5,7 @@ TOP = --top-module emu
 RTL = ../rtl
 V_INC = +incdir+$(RTL)
 
-V_DEFINE = +define+debug=1 +define+SIMULATION=1 +define+USE_EGRET_CPU=1 +define+USE_ASC_AUDIO=1  -CFLAGS "-I../sim/imgui -I../sim/vinc -I../sim/ -g "  --timescale-override 1ps/1ps -Wno-TIMESCALEMOD \
+V_DEFINE = +define+debug=1 +define+SIMULATION=1 +define+USE_ASC_AUDIO=1  -CFLAGS "-I../sim/imgui -I../sim/vinc -I../sim/ -g "  --timescale-override 1ps/1ps -Wno-TIMESCALEMOD \
 	-I$(RTL) \
 	-I$(RTL)/tg68k \
 	-I$(RTL)/uart \
@@ -89,7 +89,6 @@ V_SRC = \
 	$(RTL)/cd_audio.sv \
 	$(RTL)/ncr5380.sv \
 	$(RTL)/scc.v \
-	$(RTL)/cuda_maclc.sv \
 	$(RTL)/pll/pll_0002.v \
 	$(RTL)/egret/egret_wrapper.sv \
 	$(RTL)/egret/m68hc05_core.sv \

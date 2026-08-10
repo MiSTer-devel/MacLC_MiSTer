@@ -291,6 +291,34 @@ options are available in the OSD. The "Original" aspect ratio is true **4:3**
 for both monitor modes (both LC screens are 4:3 — 640×480 and 512×384), so
 integer scaling fits every common panel, including 1280×1024 (5:4) displays.
 
+### Fixed-frequency displays (e.g. 1280×1024 / SXGA panels)
+
+Some displays — particularly 5:4 1280×1024 panels — have been reported to
+negotiate an output mode outside their supported range with certain build
+combinations (an ~80 kHz / 75 Hz-class mode instead of 60 Hz). If your
+display shows "out of range", no picture, or an unexpected refresh rate,
+pin the output mode in the `[MacLC]` section of `MiSTer.ini`:
+
+```ini
+[MacLC]
+video_mode=1280,48,112,248,1024,1,3,38,108000
+vsync_adjust=0
+```
+
+That is the standard VESA 1280×1024@60 timing (63.98 kHz / 60.02 Hz), within
+spec for any SXGA panel. For a 1080p display, use the standard CEA
+1920×1080@60 line instead:
+
+```ini
+[MacLC]
+video_mode=1920,88,44,148,1080,4,5,36,148500
+vsync_adjust=0
+```
+
+For any other panel native, substitute its own mode line — the key is a
+**fixed `video_mode` plus `vsync_adjust=0`**, which stops automatic mode
+negotiation for this core only.
+
 ## Keyboard & mouse
 
 Keyboard and mouse are delivered over a wire-level ADB device model. The **Alt** key maps to

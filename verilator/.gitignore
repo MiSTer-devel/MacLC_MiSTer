@@ -1,5 +1,6 @@
 # Build artifacts
 obj_dir/
+obj_tb_*/
 *.o
 *.d
 
