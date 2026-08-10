@@ -73,8 +73,6 @@ set_global_assignment -name SEED 4
 # Disable ALSA audio output to save some resources
 #set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 
-# Use real 68HC05 CPU + Egret ROM instead of state machine (cuda_maclc.sv)
-set_global_assignment -name VERILOG_MACRO "USE_EGRET_CPU=1"
 
 # Enable the ASC FIFO + sample-output audio path (else asc.sv is a silent stub)
 set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
@@ -351,7 +349,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/via6522.sv
 set_global_assignment -name VERILOG_FILE rtl/addrDecoder.v
 set_global_assignment -name VERILOG_FILE rtl/addrController_top.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dataController_top.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cuda_maclc.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret_behavioral.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ariel_ramdac.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/maclc_v8_video.sv

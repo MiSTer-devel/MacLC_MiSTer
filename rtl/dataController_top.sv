@@ -218,9 +218,7 @@ module dataController_top(
 	wire minResetPassed = (resetDelay == 0);
 
 	// Egret controls 68000 reset via Port C bit 3
-`ifdef USE_EGRET_CPU
 	wire egret_reset_680x0;  // 1 = hold 68000 in reset, 0 = release
-`endif
 
 	initial begin
 		// force a reset when the FPGA configuration is completed
@@ -247,13 +245,8 @@ module dataController_top(
 		end
 	end
 
-`ifdef USE_EGRET_CPU
 	// With real Egret: 68000 reset is controlled by Egret (but respect minimum time)
 	assign _cpuReset = (minResetPassed && !egret_reset_680x0) ? 1'b1 : 1'b0;
-`else
-	// Without Egret: just use the timer
-	assign _cpuReset = minResetPassed ? 1'b1 : 1'b0;
-`endif
 
 	// Egret reset generation - Egret needs to start BEFORE the 68000
 	// The real Egret starts very early and controls when the 68000 comes out of reset
@@ -284,10 +277,8 @@ module dataController_top(
 `ifdef SIMULATION
 	reg [31:0] dc_debug_count = 0;
 	reg egretReset_prev = 1;
-`ifdef USE_EGRET_CPU
 	reg egret_reset_680x0_prev = 1;
 	reg cpuReset_prev = 0;
-`endif
 	always @(posedge clk32) begin
 		dc_debug_count <= dc_debug_count + 1;
 		egretReset_prev <= egretReset;
@@ -295,7 +286,6 @@ module dataController_top(
 			$display("DC[%0d]: egretReset %s (egretBootCounter=%0d)",
 			         dc_debug_count, egretReset ? "ASSERTED" : "RELEASED", egretBootCounter);
 		end
-`ifdef USE_EGRET_CPU
 		egret_reset_680x0_prev <= egret_reset_680x0;
 		cpuReset_prev <= _cpuReset;
 		// Track when Egret releases/asserts 68000 reset
@@ -312,7 +302,6 @@ module dataController_top(
 			         _cpuReset ? "RELEASED" : "ASSERTED",
 			         egret_reset_680x0, minResetPassed);
 		end
-`endif
 	end
 `endif
 	
@@ -762,28 +751,14 @@ module dataController_top(
 	assign via_sr_dbg_cb1    = cuda_cb1;
 	assign via_sr_dbg_cb2    = cuda_cb2_oe ? cuda_cb2 : cb2_o;
 
-`ifdef USE_EGRET_CPU
 	assign egret_dbg_reset_680x0  = egret_reset_680x0;
 	assign egret_dbg_cpu_reset_out = _cpuReset;
-`else
-	assign egret_dbg_running       = 1'b0;
-	assign egret_dbg_port_test_done = 1'b0;
-	assign egret_dbg_handshake_done = 1'b0;
-	assign egret_dbg_treq          = 1'b0;
-	assign egret_dbg_tip           = 1'b0;
-	assign egret_dbg_byteack       = 1'b0;
-	assign egret_dbg_reset_680x0   = 1'b0;
-	assign egret_dbg_cpu_reset_out = _cpuReset;
-`endif
 
 	// Egret/CUDA controller for Mac LC - handles PRAM, RTC, and ADB
 	// Mac LC uses Egret (not CUDA) with V8 chip:
 	// - PB3: TREQ from Egret (input to VIA)
 	// - PB4: BYTEACK from VIA (output to Egret)
 	// - PB5: TIP from VIA (output to Egret)
-	//
-	// Define USE_EGRET_CPU to use real 68HC05 CPU + Egret ROM (341s0850)
-	// Otherwise uses state machine implementation (cuda_maclc.sv)
 
 	// TIP latch: Hold TIP value when VIA is driving PB5 as output.
 	// The 68020 code frequently changes DDRB to read Port B (check TREQ),
@@ -811,7 +786,6 @@ module dataController_top(
 		end
 	end
 
-`ifdef USE_EGRET_CPU
 	// Use the real 68HC05 + 341S0851 firmware (rtl/egret/egret_wrapper.sv)
 	// for FPGA synthesis, but fall back to egret_behavioral for Verilator.
 	// The behavioral SM (rtl/egret_behavioral.sv) was previously instantiated
@@ -919,49 +893,6 @@ module dataController_top(
 		.dbg_pc_out         (),
 		.dbg_cpu_running    (egret_dbg_running)
 	);
-`else
-	cuda_maclc cuda(
-		.clk            (clk32),
-		.clk8_en        (clk8_en_p),
-		.reset          (!_cpuReset),
-
-		// RTC timestamp initialization
-		.timestamp      (timestamp),
-
-		// VIA Port B connections (Mac LC V8 protocol)
-		// TIP: Use latched value to prevent toggling when VIA reads Port B
-		// Polarity already inverted in via_tip_latched (Mac LC: PB5 HIGH = TIP asserted)
-		.via_tip        (via_tip_latched),  // TIP from VIA (PB5 = SYS_SESSION)
-		.via_byteack_in (via_pb_o[4]),     // BYTEACK from VIA - direct (no inversion, matches MAME)
-		.cuda_treq      (cuda_treq),       // TREQ to VIA (PB3 = XCVR_SESSION)
-		.cuda_byteack   (cuda_byteack),    // Not used in V8 protocol
-
-		// VIA Shift Register interface
-		.cuda_cb1       (cuda_cb1),        // Shift clock
-		.via_cb2_in     (cb2_o),           // Data from VIA
-		.cuda_cb2       (cuda_cb2),        // Data to VIA
-		.cuda_cb2_oe    (cuda_cb2_oe),     // CB2 output enable
-
-		// VIA SR control signals
-		.via_sr_read    (via_sr_read),
-		.via_sr_write   (via_sr_write),
-		.via_sr_ext_clk (via_sr_ext_clk),
-		.via_sr_dir     (via_sr_dir),
-		.cuda_sr_irq    (cuda_sr_irq),
-
-		// Full Port B
-		.cuda_portb     (cuda_pb_o),
-		.cuda_portb_oe  (cuda_pb_oe),
-
-		// ADB (simplified for now)
-		.adb_data_in    (1'b1),
-		.adb_data_out   (),
-
-		// System control (not used yet)
-		.reset_680x0    (),
-		.nmi_680x0      ()
-	);
-`endif
 
 	wire _ADBint;
 	wire ADBST0 = ~via_pb_oe[4] | via_pb_o[4];

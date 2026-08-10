@@ -706,8 +706,8 @@ module ncr5380
 	// CD-ROM target (SCSI ID 3, MAME maclc.cpp attaches NSCSI_CDROM_APPLE
 	// there). Same wedge-hardened scsi.v target as the disks, in CDROM mode:
 	// read-only, 2048-byte logical blocks over hps_io slot VD_CDROM, AppleCD
-	// command set. Supersedes the scsi_empty_cd stub (kept in scsi.v,
-	// no longer instantiated). Responds to selection whenever cd_enable —
+	// command set. Supersedes the old scsi_empty_cd stub (since removed
+	// from scsi.v). Responds to selection whenever cd_enable —
 	// media-less selection returns the AppleCD no-disc sense, which is how
 	// the driver's insertion poll works.
 	// TB_ADDRW(11) = 4 KB tb buffer (8 sectors) so LIST CDS holds the full

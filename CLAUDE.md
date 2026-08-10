@@ -107,11 +107,11 @@ show up on hardware.
 **I/O Peripherals:**
 - `via6522.sv` - Versatile Interface Adapter (parallel I/O, timers)
 - `pseudovia.sv` - VIA emulation for LC models
-- `iwm.v` - Integrated Woz Machine (floppy controller)
+- `swim.v` - SWIM floppy controller (IWM + ISM personalities)
 - `scc.v` - Serial Communication Controller
 - `adb.sv` - Apple Desktop Bus
 - `ps2_kbd.sv`, `ps2_mouse.v` - Keyboard/mouse input
-- `rtc.v` - Real-Time Clock
+- `egret/` - Egret system controller (68HC05 + 341S0851 firmware): ADB, RTC, PRAM
 - `uart/` - UART TX/RX modules
 
 **Video Subsystem:**
@@ -158,7 +158,7 @@ ghdl synth -fsynopsys -fexplicit --latches --out=verilog
 - Use `if/else if` priority within the block to handle the different write sources
 - Verilator builds (`make` in `verilator/`) will succeed even with multiple drivers — always verify the design is Quartus-clean before targeting FPGA
 
-**Conditional compilation:** `USE_EGRET_CPU` and `SIMULATION` are defined in `verilator/Makefile` for simulation. For FPGA, `USE_EGRET_CPU` is set in `MacLC.qsf`. Guard simulation-only code (`$display`, debug counters) with `` `ifdef SIMULATION ``.
+**Conditional compilation:** `SIMULATION` is defined in `verilator/Makefile`. Guard simulation-only code (`$display`, debug counters) with `` `ifdef SIMULATION ``. (`USE_EGRET_CPU` is gone — the real HC05 Egret is unconditional as of 2026-08-09; `EGRET_BEHAVIORAL` remains as an opt-in debug fallback.)
 
 **Top-level split:** the Verilator top is `verilator/sim.v` (`module emu`), NOT `MacLC.sv`. It has its **own** CPU instantiation and bus glue (VPA/DTACK/BERR/overlay); peripheral RTL is shared via `dataController_top`. CPU-glue/top-level fixes must go in **both** files or sim and FPGA silently diverge. Tracked differences (and a maintenance checklist) live in **`docs/verilator_differences.md`** — update it when you add a top-level signal or hardwire a sim config.
 
@@ -253,8 +253,8 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   not read it as "reads returned bad data". (And `byte_cnt` alone is NOT proof
   of internal-drive reads — the GCR delivery counter also churns on garbage
   with no disk in; corroborate with w7 `insertDisk`/`CSTIN`.)
-  The old parked doc `docs/resume_floppy_controller_2026-07-07.md` is RESOLVED;
-  its "SDRAM region != image" theory was never confirmed and its JTAG chain no
+  The old 2026-07-07 floppy-controller park is RESOLVED (doc removed); its
+  "SDRAM region != image" theory was never confirmed and its JTAG chain no
   longer works (dead hub). Offline instruments that settled all of this in
   minutes: `verilator/tb_gcr_read.v` (`+track/+side/+ncap`, seeks via the real
   drive-register protocol; **always pass `+acclen=40 +pollgap=40`** or the

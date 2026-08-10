@@ -19,7 +19,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/via6522.sv
 set_global_assignment -name VERILOG_FILE rtl/addrDecoder.v
 set_global_assignment -name VERILOG_FILE rtl/addrController_top.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dataController_top.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/cuda_maclc.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret_behavioral.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ariel_ramdac.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/maclc_v8_video.sv
