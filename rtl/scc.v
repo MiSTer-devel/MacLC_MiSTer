@@ -90,6 +90,13 @@ module scc
 	 * read for the Apple STM "All Sent" poll at $A49F08. */
 	reg pending_cleanup_a;
 	reg pending_cleanup_b;
+	/* Deferred data-port FIFO pop, same end-of-accessor timing as the
+	 * pointer cleanup: rdata_mux serves rx_queue[0] combinationally for the
+	 * whole CS window, so popping at the first cen INSIDE the window handed
+	 * a late-latching CPU the post-pop byte (off-by-one on every FIFO read).
+	 * MAME pops at the end of the accessor; we flag here, pop at CS-release. */
+	reg pending_dequeue_a;
+	reg pending_dequeue_b;
 
 	/* Resets via WR9, one clk pulses */
 	wire		reset_a;
@@ -145,6 +152,8 @@ module scc
 	reg [5:0] 	wr9;
 	reg [7:0] 	wr10_a;
 	reg [7:0] 	wr10_b;
+	reg [7:0] 	wr11_a;
+	reg [7:0] 	wr11_b;
 	reg [7:0] 	wr12_a;
 	reg [7:0] 	wr12_b;
 	reg [7:0] 	wr13_a;
@@ -295,6 +304,8 @@ module scc
 			scc_state_b <= 0;
 			pending_cleanup_a <= 0;
 			pending_cleanup_b <= 0;
+			pending_dequeue_a <= 0;
+			pending_dequeue_b <= 0;
 			//data_a <= 0;
 			tx_data_a<=0;
 			tx_data_b<=0;
@@ -332,6 +343,39 @@ module scc
 						rindex_b <= 0;
 						scc_state_b <= 0;
 						pending_cleanup_b <= 0;
+					end
+				end
+				// Deferred FIFO pops (flagged by a data-port read, executed
+				// once CS is low — see pending_dequeue declaration). Held one
+				// more cen if an enqueue fires this very clk, so the two
+				// never collide on rx_queue/rx_queue_pos (a hazard the old
+				// pop-inside-the-window code silently carried).
+				if (!cs) begin
+					if (pending_dequeue_a && !(rx_wr_a && !post_loopback_a)) begin
+						pending_dequeue_a <= 0;
+						if (rx_queue_pos_a > 0) begin
+							$display("SCC_RX_FIFO_DEQUEUE: ch=A data=%02x pos=%d->%d", rx_queue_a[0], rx_queue_pos_a, rx_queue_pos_a - 1);
+							rx_queue_a[0] <= rx_queue_a[1];
+							rx_queue_a[1] <= rx_queue_a[2];
+							rx_queue_a[2] <= 8'h00;
+							rx_queue_pos_a <= rx_queue_pos_a - 1;
+							rx_first_a <= 0;
+						end else begin
+							$display("SCC_RX_FIFO_EMPTY: ch=A read from empty FIFO");
+						end
+					end
+					if (pending_dequeue_b && !(rx_wr_b && !post_loopback_b)) begin
+						pending_dequeue_b <= 0;
+						if (rx_queue_pos_b > 0) begin
+							$display("SCC_RX_FIFO_DEQUEUE: ch=B data=%02x pos=%d->%d", rx_queue_b[0], rx_queue_pos_b, rx_queue_pos_b - 1);
+							rx_queue_b[0] <= rx_queue_b[1];
+							rx_queue_b[1] <= rx_queue_b[2];
+							rx_queue_b[2] <= 8'h00;
+							rx_queue_pos_b <= rx_queue_pos_b - 1;
+							rx_first_b <= 0;
+						end else begin
+							$display("SCC_RX_FIFO_EMPTY: ch=B read from empty FIFO");
+						end
 					end
 				end
 			end
@@ -461,35 +505,13 @@ module scc
 					end
 					end
 				else begin
-					// FIFO dequeue: Read from data port - consume the byte
-					if (rs[0]) begin
-						if (rx_queue_pos_a > 0) begin
-							$display("SCC_RX_FIFO_DEQUEUE: ch=A data=%02x pos=%d->%d", rx_queue_a[0], rx_queue_pos_a, rx_queue_pos_a - 1);
-							// Shift queue down
-							rx_queue_a[0] <= rx_queue_a[1];
-							rx_queue_a[1] <= rx_queue_a[2];
-							rx_queue_a[2] <= 8'h00;
-							rx_queue_pos_a <= rx_queue_pos_a - 1;
-							rx_first_a<=0;
-						end else begin
-							$display("SCC_RX_FIFO_EMPTY: ch=A read from empty FIFO");
-						end
-					end
-					else begin
-
-					// Channel B FIFO dequeue
-					if (rx_queue_pos_b > 0) begin
-					$display("SCC_RX_FIFO_DEQUEUE: ch=B data=%02x pos=%d->%d", rx_queue_b[0], rx_queue_pos_b, rx_queue_pos_b - 1);
-					// Shift queue down
-					rx_queue_b[0] <= rx_queue_b[1];
-					rx_queue_b[1] <= rx_queue_b[2];
-					rx_queue_b[2] <= 8'h00;
-					rx_queue_pos_b <= rx_queue_pos_b - 1;
-					rx_first_b<=0;
-					end else begin
-					$display("SCC_RX_FIFO_EMPTY: ch=B read from empty FIFO");
-					end
-					end
+					// FIFO dequeue: a data-port read only FLAGS the pop here;
+					// it executes at CS-release (cleanup block above) so
+					// rdata_mux serves the CURRENT head for the whole window.
+					if (rs[0])
+						pending_dequeue_a <= 1;
+					else
+						pending_dequeue_b <= 1;
 				end
 			end
 			end  // end if (cen && cs)
@@ -692,6 +714,37 @@ module scc
 			else if (wreg_b && rindex_latch == 10)
 			  wr10_b <= wdata;
 		end		
+	end
+
+	/* WR11 (clock mode control)
+	 * Bits [6:5] = receive clock source, [4:3] = transmit clock source:
+	 * 00=RTxC pin, 01=TRxC pin, 10=BRG output, 11=DPLL output.
+	 * Real Z8530: hardware reset sets WR11 to 8'h08 (TX clock from TRxC);
+	 * channel reset leaves it unchanged. We deliberately reset to 8'h00
+	 * (RTxC for both) so the TRxC/MIDI clause in the baud pipeline stays
+	 * inert until the guest explicitly selects the TRxC pin — this keeps
+	 * pre-MIDI behavior identical at boot. Guests always program WR11
+	 * during serial init, so the deviation is unobservable in practice.
+	 */
+	always@(posedge clk or posedge reset_hw) begin
+		if (reset_hw)
+		  wr11_a <= 0;
+		else if(cen) begin
+			if (reset)
+			  wr11_a <= 0;
+			else if (wreg_a && rindex_latch == 11)
+			  wr11_a <= wdata;
+		end
+	end
+	always@(posedge clk or posedge reset_hw) begin
+		if (reset_hw)
+		  wr11_b <= 0;
+		else if(cen) begin
+			if (reset)
+			  wr11_b <= 0;
+			else if (wreg_b && rindex_latch == 11)
+			  wr11_b <= wdata;
+		end
 	end
 
 	/* WR12
@@ -1514,8 +1567,23 @@ wr_3_a[7:6]  -- bits per char
                         2'b10: mult <= 8'd32;
                         default: mult <= 8'd64;
                 endcase
+                // TRxC-sourced clocking (WR11 RX or TX clock source = 01 = TRxC pin).
+                // On a real Mac the TRxC/HSKi pin is driven by an EXTERNAL clock from
+                // the attached serial device; MIDI interfaces supply 1 MHz and drivers
+                // program WR11=$28 (RX+TX from TRxC) + WR4=$84 (x32) for 31,250 baud.
+                // No physical pin exists here, so we emulate a permanently-attached
+                // 1 MHz source: clocks_per_baud = 32.5e6 * mult / 1e6 = 32.5 * mult
+                // (x32 -> 1040 exactly). Takes priority over the BRG — real hardware
+                // follows WR11's source selection regardless of WR14[0].
+                if (wr11_a[4:3] == 2'b01 || wr11_a[6:5] == 2'b01) begin
+                        reg [23:0] trxc_cpb;
+                        trxc_cpb = ({16'd0, mult} << 5) + {17'd0, mult[7:1]};
+                        if (baud_divid_speed_a != trxc_cpb)
+                                $display("SCC_TRXC_CLK: ch=A WR11=%02x mult=%0d -> clocks_per_baud=%0d (virtual 1 MHz TRxC)", wr11_a, mult, trxc_cpb);
+                        baud_divid_speed_a <= trxc_cpb;
+                end
                 // BRG enable from WR14[0] (ROM uses WR14=$01 here)
-                if (wr14_a[0]) begin
+                else if (wr14_a[0]) begin
                         // N = (WR13:WR12)+2
                         reg [15:0] n;
                         reg [31:0] mult_n;
@@ -1695,7 +1763,17 @@ always @(posedge clk) begin
         2'b10: mult_b <= 8'd32;
         default: mult_b <= 8'd64;
     endcase
-    if (wr14_b[0]) begin
+    // TRxC-sourced clocking — same virtual 1 MHz external clock as channel A
+    // (see comment there). Inert for LocalTalk: its WR11 uses DPLL/BRG/RTxC
+    // sources, never TRxC (01).
+    if (wr11_b[4:3] == 2'b01 || wr11_b[6:5] == 2'b01) begin
+        reg [23:0] trxc_cpb_b;
+        trxc_cpb_b = ({16'd0, mult_b} << 5) + {17'd0, mult_b[7:1]};
+        if (baud_divid_speed_b != trxc_cpb_b)
+            $display("SCC_TRXC_CLK: ch=B WR11=%02x mult=%0d -> clocks_per_baud=%0d (virtual 1 MHz TRxC)", wr11_b, mult_b, trxc_cpb_b);
+        baud_divid_speed_b <= trxc_cpb_b;
+    end
+    else if (wr14_b[0]) begin
         reg [15:0] n_b;
         reg [31:0] mult_n_b;
         reg [31:0] cpb_b;

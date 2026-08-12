@@ -24,7 +24,8 @@ module emu
 	`include "sys/emu_ports.vh"
 );
 	assign ADC_BUS  = 'Z;
-	assign USER_OUT = '1;
+	// USER_OUT is driven by the mt32pi instance (user-port MIDI + I2C);
+	// unused user-port pins are held at '1 inside sys/mt32pi.sv.
 
 	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
 	assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
@@ -64,7 +65,7 @@ module emu
 	
 	`include "build_id.v"
 	localparam CONF_STR = {
-		"MACLC;UART57600:115200;",
+		"MACLC;UART57600:115200,MIDI;",
 		"-;",
 		"F1,DSKIMG,Mount Pri Floppy;",
 		"F2,DSKIMG,Mount Sec Floppy;",
@@ -645,15 +646,20 @@ module emu
 	// silent (exact zeros) whenever the drive isn't playing, and are
 	// linearly interpolated inside cd_audio.sv so the sys/audio_out 48 kHz
 	// pickup doesn't add stair-step imaging.
+	// MT32-pi I2S return joins at unity gain; exact zeros when no Pi attached
+	// (mt32pi zeroes its outputs at reset and only updates them from Pi-driven
+	// I2S edges), so the pre-MIDI mix is bit-identical without the hardware.
 	wire signed [15:0] cd_snd_l, cd_snd_r;
-	wire signed [16:0] audio_mix_l = {asc_sample_l[15], asc_sample_l}
-	                               + {cd_snd_l[15], cd_snd_l};
-	wire signed [16:0] audio_mix_r = {asc_sample_r[15], asc_sample_r}
-	                               + {cd_snd_r[15], cd_snd_r};
-	assign AUDIO_L = (audio_mix_l > 17'sd32767)  ? 16'sd32767 :
-	                 (audio_mix_l < -17'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
-	assign AUDIO_R = (audio_mix_r > 17'sd32767)  ? 16'sd32767 :
-	                 (audio_mix_r < -17'sd32768) ? -16'sd32768 : audio_mix_r[15:0];
+	wire signed [17:0] audio_mix_l = {{2{asc_sample_l[15]}}, asc_sample_l}
+	                               + {{2{cd_snd_l[15]}}, cd_snd_l}
+	                               + {{2{mt32_i2s_l[15]}}, mt32_i2s_l};
+	wire signed [17:0] audio_mix_r = {{2{asc_sample_r[15]}}, asc_sample_r}
+	                               + {{2{cd_snd_r[15]}}, cd_snd_r}
+	                               + {{2{mt32_i2s_r[15]}}, mt32_i2s_r};
+	assign AUDIO_L = (audio_mix_l > 18'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_l < -18'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
+	assign AUDIO_R = (audio_mix_r > 18'sd32767)  ? 16'sd32767 :
+	                 (audio_mix_r < -18'sd32768) ? -16'sd32768 : audio_mix_r[15:0];
 	assign AUDIO_S = 1;
 	assign AUDIO_MIX = 0;
 
@@ -699,10 +705,47 @@ module emu
 	// (Previously forced to 1'b1 to dodge a suspected ROM "Break detection loop";
 	// that was a symptom of earlier boot issues, since resolved, not the RX path.)
 	// The line idles high; rxuart double-syncs UART_RXD internally.
-	assign serialIn = UART_RXD;
+	// RX source: MT32-pi return line when a Pi is detected on the user port
+	// (USB MIDI devices attached to the Pi arrive there), else the HPS UART
+	// (MidiLink / console / PPP). TX fans out to BOTH sinks unconditionally —
+	// UART_TXD (MidiLink) and the user port (mt32pi.midi_tx) — so whichever
+	// endpoint is attached hears the guest.
+	assign serialIn = mt32_available ? mt32_midi_rx : UART_RXD;
 	assign UART_TXD = serialOut;
 	assign UART_RTS = serialRTS ;
 	assign UART_DTR = UART_DSR;
+
+	// MT32-pi on the user port (framework module sys/mt32pi.sv): serial MIDI
+	// out on USER_OUT[1] at the SCC's programmed rate, I2S synth audio back
+	// on USER_IN[2/4/5], I2C detection/control on USER_IN[0]/[3]. Runs
+	// entirely in the fixed 24.576 MHz CLK_AUDIO domain — the LCD-overlay
+	// video inputs are tied off (v1: overlay unused) so no logic lands on the
+	// runtime-retargeted CLK_VIDEO domain. Mode requests hardwired: MT-32
+	// (munt) mode, ROM set 0 — the Pi's own config can still override.
+	wire [15:0] mt32_i2s_l, mt32_i2s_r;
+	wire        mt32_available;
+	wire        mt32_midi_rx;
+	mt32pi mt32pi
+	(
+		.CLK_AUDIO(CLK_AUDIO),
+		.CLK_VIDEO(1'b0),   // LCD overlay unused in v1
+		.CE_PIXEL(1'b0),
+		.VGA_VS(1'b0),
+		.VGA_DE(1'b0),
+		.USER_IN(USER_IN),
+		.USER_OUT(USER_OUT),
+		.reset(~n_reset),
+		.midi_tx(serialOut),
+		.midi_rx(mt32_midi_rx),
+		.mt32_i2s_r(mt32_i2s_r),
+		.mt32_i2s_l(mt32_i2s_l),
+		.mt32_available(mt32_available),
+		.mt32_mode_req(1'b0),
+		.mt32_rom_req(2'd0),
+		.mt32_sf_req(8'd0),
+		.mt32_mode(), .mt32_rom(), .mt32_sf(), .mt32_newmode(),
+		.mt32_lcd_en(), .mt32_lcd_pix(), .mt32_lcd_update()
+	);
 
 
 	// interconnects
