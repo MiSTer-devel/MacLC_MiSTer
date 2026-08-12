@@ -259,9 +259,13 @@ module scc
 
 	always@(posedge clk /*or posedge reset*/) begin
 
-		// FIFO enqueue: add byte to queue if space available
-		// Suppress after loopback cleared (no cable = no valid frames expected)
-		if (rx_wr_a && !post_loopback_a) begin
+		// FIFO enqueue: add byte to queue if space available. Enqueue is
+		// UNCONDITIONAL on a received frame (2026-08-12): the old
+		// !post_loopback suppression made async RX permanently dead after
+		// the ROM's loopback self-test (see the TxEmpty comment at the RR0
+		// block). With no cable the line idles mark and rxuart produces no
+		// frames, so nothing enqueues anyway.
+		if (rx_wr_a) begin
 			$display("SCC_SERIAL_IN: ch=A byte=%02x time=%0t", data_a, $time);
 			if (rx_queue_pos_a < 3) begin
 				rx_queue_a[rx_queue_pos_a] <= data_a;
@@ -278,7 +282,7 @@ module scc
 
 		// Channel B FIFO enqueue: add byte to queue if space available (from rxuart_b)
 		// Suppress after loopback cleared
-		if (rx_wr_b && !post_loopback_b) begin
+		if (rx_wr_b) begin
 			$display("SCC_SERIAL_IN: ch=B byte=%02x time=%0t", data_b, $time);
 			if (rx_queue_pos_b < 3) begin
 				rx_queue_b[rx_queue_pos_b] <= data_b;
@@ -351,7 +355,7 @@ module scc
 				// never collide on rx_queue/rx_queue_pos (a hazard the old
 				// pop-inside-the-window code silently carried).
 				if (!cs) begin
-					if (pending_dequeue_a && !(rx_wr_a && !post_loopback_a)) begin
+					if (pending_dequeue_a && !rx_wr_a) begin
 						pending_dequeue_a <= 0;
 						if (rx_queue_pos_a > 0) begin
 							$display("SCC_RX_FIFO_DEQUEUE: ch=A data=%02x pos=%d->%d", rx_queue_a[0], rx_queue_pos_a, rx_queue_pos_a - 1);
@@ -364,7 +368,7 @@ module scc
 							$display("SCC_RX_FIFO_EMPTY: ch=A read from empty FIFO");
 						end
 					end
-					if (pending_dequeue_b && !(rx_wr_b && !post_loopback_b)) begin
+					if (pending_dequeue_b && !rx_wr_b) begin
 						pending_dequeue_b <= 0;
 						if (rx_queue_pos_b > 0) begin
 							$display("SCC_RX_FIFO_DEQUEUE: ch=B data=%02x pos=%d->%d", rx_queue_b[0], rx_queue_pos_b, rx_queue_pos_b - 1);
@@ -967,17 +971,21 @@ module scc
 		end
 	end
 
-	// TX buffer empty gating: after loopback self-test, with loopback now off
-	// and no cable connected, report TX buffer as not empty. A real Z8530 with
-	// Auto Enable and CTS=0 won't drain the TX buffer, so the driver's TX
-	// routine stalls and eventually gives up.
-	// SCOPED TO ASYNC ONLY (2026-06-12): in sync/SDLC mode the LLAP byte loop
-	// polls TxEmpty per frame byte and has NO timeout — gating it post-loopback
-	// deadlocks the 7.x LAP open (the ROM 'atlk' self-test always runs loopback
-	// first, so post_loopback is true by then). MAME's truthful z80scc boots
-	// both 6.0.8 and 7.x; sync mode now reports the real latch.
-	wire tx_empty_gated_a = (post_loopback_a && !sync_mode_a) ? 1'b0 : tx_empty_latch_a;
-	wire tx_empty_gated_b = (post_loopback_b && !sync_mode_b) ? 1'b0 : tx_empty_latch_b;
+	// TX buffer empty: report the TRUE latch (2026-08-12). The old
+	// post-loopback "no cable" force-0 (a89c671-era armor against boot-time
+	// serial probes) permanently killed async channel A after the ROM's
+	// loopback self-test — loopback_was_used clears only on the hardware
+	// reset pin, so once the selftest ran, RR0 showed TxEmpty=0 forever and
+	// the Mac Serial Driver's synchronous PBWrite polled it in an UNBOUNDED
+	// loop: any async serial client (first hit: cozyMIDI, HW-frozen machine)
+	// wedged the system. The wedges that armor targeted were since fixed
+	// properly (LocalTalk: SDLC carve-out 2026-06-12; OS7 Welcome: SCSI
+	// completion IRQ), and MAME's truthful z80scc boots 6.0.8 and 7.x.
+	// Sync/SDLC semantics unchanged. Do NOT re-introduce a post_loopback
+	// force on RR0 bits 0/2 — verilator/tb_scc_midi.v now runs a loopback
+	// prelude first and will catch it.
+	wire tx_empty_gated_a = tx_empty_latch_a;
+	wire tx_empty_gated_b = tx_empty_latch_b;
 
 	/* RR0
 	 * Bit 7 (Break/Abort) and bit 4 (Sync/Hunt) MUST be 0 in async mode per
@@ -997,9 +1005,9 @@ module scc
 			 rr0_cts_a,             /* CTS */
 			 sync_mode_a & hunt_a,  /* Sync/Hunt — live in sync mode, 0 in async */
 			 rr0_dcd_a,             /* DCD */
-			 tx_empty_gated_a,      /* Tx Empty (post_loopback gated) */
+			 tx_empty_gated_a,      /* Tx Empty (true latch, see comment above) */
 			 1'b0,                  /* Zero Count */
-			 post_loopback_a ? 1'b0 : (rx_queue_pos_a > 0)  /* Rx Available (post_loopback gated) */
+			 (rx_queue_pos_a > 0)   /* Rx Available (true FIFO state) */
 			 };
 
 	// Debug: Show RR0 composition when reading from control register
@@ -1015,9 +1023,9 @@ module scc
 			 rr0_cts_b,             /* CTS */
 			 sync_mode_b & hunt_b,  /* Sync/Hunt — live in sync mode, 0 in async */
 			 rr0_dcd_b,             /* DCD */
-			 tx_empty_gated_b,      /* Tx Empty (post_loopback gated) */
+			 tx_empty_gated_b,      /* Tx Empty (true latch, see channel A comment) */
 			 1'b0,                  /* Zero Count */
-			 post_loopback_b ? 1'b0 : (rx_queue_pos_b > 0)  /* Rx Available (post_loopback gated) */
+			 (rx_queue_pos_b > 0)   /* Rx Available (true FIFO state) */
 			 };
 
 	/* RR1 */

@@ -302,6 +302,41 @@ module tb_scc_midi;
 		reset_hw = 0;
 		repeat (100) @(posedge clk);
 
+		// -------- 0. ROM-selftest-style loopback prelude --------
+		// The boot ROM runs the SCC in local loopback, then clears it — and
+		// loopback_was_used latches until the hardware reset pin. EVERY check
+		// below therefore runs post-loopback: the state in which the old
+		// "no cable" RR0/RX gates showed a permanently dead async port and
+		// froze the machine on the Serial Driver's unbounded TxEmpty poll
+		// (cozyMIDI, HW, 2026-08-12). This prelude keeps that class caught.
+		wreg_ch_a(9, 8'hC0);     // hardware reset (does NOT clear the latch)
+		repeat (60) @(posedge clk);
+		wreg_ch_a(3, 8'hC1);     // RX 8 bits, RX enable
+		wreg_ch_a(5, 8'h68);     // TX 8 bits, TX enable
+		wreg_ch_a(14, 8'h10);    // local loopback ON (BRG off -> 9600 default)
+		// rxuart (like txuart) hunts idle for 16 baud intervals after its
+		// reset (the WR9 reset above): 16*3385 = ~54k clk at the 9600 default.
+		// A frame sent inside that window is silently ignored — wait it out.
+		repeat (60000) @(posedge clk);
+		bus_write(2'b11, 8'hA5); // byte must come back to our own RX
+		k = 0; v = 0;            // 9600 frame + 16-baud guard ~90k clk; poll big
+		while (!v[0] && k < 6000) begin
+			rd_rr0_a(v);
+			k = k + 1;
+		end
+		if (!v[0]) begin
+			errors = errors + 1;
+			$display("TB_FAIL: loopback byte never arrived (RR0=%02x)", v);
+		end else begin
+			rd_data_a(v);
+			if (v !== 8'hA5) begin
+				errors = errors + 1;
+				$display("TB_FAIL: loopback byte read %02x, expected A5", v);
+			end else
+				$display("TB_INFO: loopback prelude OK (post_loopback latched from here on)");
+		end
+		wreg_ch_a(14, 8'h00);    // loopback OFF -> post_loopback = 1 for the rest
+
 		// -------- MIDI recipe (the TinkerDifferent/Apple-driver sequence) ----
 		wreg_ch_a(9, 8'hC0);     // force hardware reset
 		repeat (60) @(posedge clk);
