@@ -374,6 +374,16 @@ module tb_scc_midi;
 			errors = errors + 1;
 			$display("TB_FAIL: RR0 rx-available clear after RX byte (RR0=%02x)", v);
 		end
+		// RR2B modified vector while A-RX is pending: Status Low (WR9[4]=0),
+		// WR2=0 -> V3:V1 = 110 (Ch A RX) -> $0C. The Mac ROM's SCC dispatcher
+		// relies on this; returning the raw vector here froze the machine.
+		bus_write(2'b00, 8'h02);   // ch B pointer -> RR2
+		bus_read(2'b00, v);
+		if (v !== 8'h0C) begin
+			errors = errors + 1;
+			$display("TB_FAIL: RR2B modified vector %02x, expected 0C (A-RX pending, status low)", v);
+		end else
+			$display("TB_INFO: RR2B modified vector OK (0C = Ch A RX)");
 		rd_data_a(v);
 		if (v !== 8'hF8) begin
 			errors = errors + 1;

@@ -1053,9 +1053,18 @@ assign rr1_b = { 1'b0, /* End of frame */
      * In Vector Includes Status mode (WR9.VIS=1), place status code into bits 6:4.
      * Our tests mask &0x70 and expect 0x10 for TX pending (100b).
      */
+    /* RR2 (channel B) is ALWAYS the status-MODIFIED vector on a real Z8530.
+     * WR9[4] (Status High/Low) only selects WHICH bits carry the condition:
+     * High -> V6:V4, Low -> V3:V1. The old code returned the RAW vector in
+     * Status-Low mode — the Mac runs Status Low with WR2=0, so every RR2B
+     * read said "Ch B TX empty" ($00) no matter what was pending; the ROM's
+     * SCC dispatcher then serviced the wrong channel, the real pending
+     * source was never acked, _irq never released, and the level-2 interrupt
+     * re-entered forever (cozyMIDI/Serial Driver open, HW freeze,
+     * 2026-08-12). tb_scc_midi now reads RR2B with A-RX pending. */
     assign rr2_b = wr9[4]
                    ? { wr2[7], rr2_vec_stat[2:0], wr2[3:0] }
-                   : wr2;
+                   : { wr2[7:4], rr2_vec_stat[2:0], wr2[0] };
 	
 
 	/* RR3 (Chan A only) */
