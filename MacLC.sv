@@ -87,6 +87,13 @@ module emu
 		"-;",
 		"O4,Memory,2MB,10MB;",
 		"-;",
+		"P1,MT32-pi;",
+		"P1-;",
+		"P1OO,Use MT32-pi,Yes,No;",
+		"P1OQ,Synth,Munt,FluidSynth;",
+		"P1ORS,Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
+		"P1OTV,SoundFont,0,1,2,3,4,5,6,7;",
+		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
 		"R0,Reset & Apply CPU+Memory;",
@@ -646,16 +653,16 @@ module emu
 	// silent (exact zeros) whenever the drive isn't playing, and are
 	// linearly interpolated inside cd_audio.sv so the sys/audio_out 48 kHz
 	// pickup doesn't add stair-step imaging.
-	// MT32-pi I2S return joins at unity gain; exact zeros when no Pi attached
-	// (mt32pi zeroes its outputs at reset and only updates them from Pi-driven
-	// I2S edges), so the pre-MIDI mix is bit-identical without the hardware.
+	// MT32-pi I2S return joins at unity gain, gated by mt32_use (a Pi is
+	// present AND "Use MT32-pi" is Yes); exact zeros otherwise, so the mix is
+	// bit-identical with no Pi attached or the device disabled from the OSD.
 	wire signed [15:0] cd_snd_l, cd_snd_r;
 	wire signed [17:0] audio_mix_l = {{2{asc_sample_l[15]}}, asc_sample_l}
 	                               + {{2{cd_snd_l[15]}}, cd_snd_l}
-	                               + {{2{mt32_i2s_l[15]}}, mt32_i2s_l};
+	                               + (mt32_use ? {{2{mt32_i2s_l[15]}}, mt32_i2s_l} : 18'sd0);
 	wire signed [17:0] audio_mix_r = {{2{asc_sample_r[15]}}, asc_sample_r}
 	                               + {{2{cd_snd_r[15]}}, cd_snd_r}
-	                               + {{2{mt32_i2s_r[15]}}, mt32_i2s_r};
+	                               + (mt32_use ? {{2{mt32_i2s_r[15]}}, mt32_i2s_r} : 18'sd0);
 	assign AUDIO_L = (audio_mix_l > 18'sd32767)  ? 16'sd32767 :
 	                 (audio_mix_l < -18'sd32768) ? -16'sd32768 : audio_mix_l[15:0];
 	assign AUDIO_R = (audio_mix_r > 18'sd32767)  ? 16'sd32767 :
@@ -727,11 +734,15 @@ module emu
 	// on USER_IN[2/4/5], I2C detection/control on USER_IN[0]/[3]. Runs
 	// entirely in the fixed 24.576 MHz CLK_AUDIO domain — the LCD-overlay
 	// video inputs are tied off (v1: overlay unused) so no logic lands on the
-	// runtime-retargeted CLK_VIDEO domain. Mode requests hardwired: MT-32
-	// (munt) mode, ROM set 0 — the Pi's own config can still override.
+	// runtime-retargeted CLK_VIDEO domain. Mode/ROM/SoundFont are chosen from
+	// the OSD "MT32-pi" page (CONF_STR P1, status[31:24]); the on-screen LCD
+	// info overlay is still omitted (it needs the CLK_VIDEO inputs we tie off).
 	wire [15:0] mt32_i2s_l, mt32_i2s_r;
 	wire        mt32_available;
 	wire        mt32_midi_rx;
+	wire        mt32_disable = status[24];                 // "Use MT32-pi" = No
+	wire        mt32_mute    = mt32_available & mt32_disable;
+	wire        mt32_use     = mt32_available & ~mt32_disable;
 	mt32pi mt32pi
 	(
 		.CLK_AUDIO(CLK_AUDIO),
@@ -742,14 +753,14 @@ module emu
 		.USER_IN(USER_IN),
 		.USER_OUT(USER_OUT),
 		.reset(~n_reset),
-		.midi_tx(serialOut),
+		.midi_tx(serialOut | mt32_mute),   // idle the Pi's MIDI-in when disabled
 		.midi_rx(mt32_midi_rx),
 		.mt32_i2s_r(mt32_i2s_r),
 		.mt32_i2s_l(mt32_i2s_l),
 		.mt32_available(mt32_available),
-		.mt32_mode_req(1'b0),
-		.mt32_rom_req(2'd0),
-		.mt32_sf_req(8'd0),
+		.mt32_mode_req(status[26]),          // Synth: 0=Munt, 1=FluidSynth
+		.mt32_rom_req(status[28:27]),        // Munt ROM: MT-32 v1/v2/CM-32L
+		.mt32_sf_req({5'd0, status[31:29]}), // SoundFont 0-7
 		.mt32_mode(), .mt32_rom(), .mt32_sf(), .mt32_newmode(),
 		.mt32_lcd_en(), .mt32_lcd_pix(), .mt32_lcd_update()
 	);
