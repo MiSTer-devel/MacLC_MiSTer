@@ -93,6 +93,20 @@ module emu
 		"P1OQ,Synth,Munt,FluidSynth;",
 		"P1ORS,Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
 		"P1OTV,SoundFont,0,1,2,3,4,5,6,7;",
+		"P1OMN,Show Info,No,Yes,LCD-On,LCD-Auto;",
+		"I,",
+		"MT32-pi: SoundFont #0,",
+		"MT32-pi: SoundFont #1,",
+		"MT32-pi: SoundFont #2,",
+		"MT32-pi: SoundFont #3,",
+		"MT32-pi: SoundFont #4,",
+		"MT32-pi: SoundFont #5,",
+		"MT32-pi: SoundFont #6,",
+		"MT32-pi: SoundFont #7,",
+		"MT32-pi: MT-32 v1,",
+		"MT32-pi: MT-32 v2,",
+		"MT32-pi: CM-32L,",
+		"MT32-pi: Unknown mode;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
@@ -468,6 +482,10 @@ module emu
 		.buttons(buttons),
 		.status(status),
 
+		// MT32-pi "Show Info = Yes" OSD popup (CONF_STR "I," strings, 1-based)
+		.info_req(mt32_info_req),
+		.info({4'd0, mt32_info_disp}),
+
 		.sd_lba(sd_lba),
 		.sd_rd(sd_rd),
 		.sd_wr(sd_wr),
@@ -500,17 +518,26 @@ module emu
 	assign CLK_VIDEO = clk_vid;
 	assign CE_PIXEL  = v8_ce_pix;   // constant 1 now (pix_ce tied high below)
 
-	// Video Output — straight V8 video, no overlays.
+	// Video Output — V8 video with the MT32-pi LCD overlay composited on the
+	// FINAL VGA_R/G/B (works in the release HUD-off fit). ao486 convention:
+	// inside the LCD box the video dims to the low 6 bits and the white text
+	// pixel is OR'd into the top 2 bits. mt32_lcd_en/pix are generated on
+	// clk_vid inside sys/mt32pi.sv — same domain as this mux.
+	wire       mt32_lcd   = mt32_lcd_en & mt32_lcd_on;
+	wire [7:0] mt32_vga_r = mt32_lcd ? {{2{mt32_lcd_pix}}, v8_vga_r[7:2]} : v8_vga_r;
+	wire [7:0] mt32_vga_g = mt32_lcd ? {{2{mt32_lcd_pix}}, v8_vga_g[7:2]} : v8_vga_g;
+	wire [7:0] mt32_vga_b = mt32_lcd ? {{2{mt32_lcd_pix}}, v8_vga_b[7:2]} : v8_vga_b;
 `ifdef USE_DBG_HUD
 	// Debug HUD (see the USE_DBG_HUD block near the probe deck): binary
 	// pixel-strip overlay, BOTTOM-left corner, video-only (input untouched).
-	assign VGA_R  = hud_on_q ? hud_px : v8_vga_r;
-	assign VGA_G  = hud_on_q ? hud_px : v8_vga_g;
-	assign VGA_B  = hud_on_q ? hud_px : v8_vga_b;
+	// HUD keeps precedence over the MT32-pi overlay when enabled.
+	assign VGA_R  = hud_on_q ? hud_px : mt32_vga_r;
+	assign VGA_G  = hud_on_q ? hud_px : mt32_vga_g;
+	assign VGA_B  = hud_on_q ? hud_px : mt32_vga_b;
 `else
-	assign VGA_R  = v8_vga_r;
-	assign VGA_G  = v8_vga_g;
-	assign VGA_B  = v8_vga_b;
+	assign VGA_R  = mt32_vga_r;
+	assign VGA_G  = mt32_vga_g;
+	assign VGA_B  = mt32_vga_b;
 `endif
 	assign VGA_DE = v8_de;
 	assign VGA_VS = v8_vsync;
@@ -731,25 +758,30 @@ module emu
 
 	// MT32-pi on the user port (framework module sys/mt32pi.sv): serial MIDI
 	// out on USER_OUT[1] at the SCC's programmed rate, I2S synth audio back
-	// on USER_IN[2/4/5], I2C detection/control on USER_IN[0]/[3]. Runs
-	// entirely in the fixed 24.576 MHz CLK_AUDIO domain — the LCD-overlay
-	// video inputs are tied off (v1: overlay unused) so no logic lands on the
-	// runtime-retargeted CLK_VIDEO domain. Mode/ROM/SoundFont are chosen from
-	// the OSD "MT32-pi" page (CONF_STR P1, status[31:24]); the on-screen LCD
-	// info overlay is still omitted (it needs the CLK_VIDEO inputs we tie off).
+	// on USER_IN[2/4/5], I2C detection/control on USER_IN[0]/[3]. The synth
+	// path runs in the fixed 24.576 MHz CLK_AUDIO domain; the LCD-overlay
+	// raster tracker runs on clk_vid (live video inputs below) and its box is
+	// composited into the final VGA_R/G/B at the video output above.
+	// Mode/ROM/SoundFont are chosen from the OSD "MT32-pi" page (CONF_STR P1,
+	// status[31:24]); "Show Info" (status[23:22]) selects the readout:
+	// 1=Yes → framework OSD info popup, 2/3=LCD-On/LCD-Auto → LCD overlay.
 	wire [15:0] mt32_i2s_l, mt32_i2s_r;
 	wire        mt32_available;
 	wire        mt32_midi_rx;
 	wire        mt32_disable = status[24];                 // "Use MT32-pi" = No
 	wire        mt32_mute    = mt32_available & mt32_disable;
 	wire        mt32_use     = mt32_available & ~mt32_disable;
+	wire  [1:0] mt32_info    = status[23:22];              // Show Info: No/Yes/LCD-On/LCD-Auto
+	wire  [7:0] mt32_mode, mt32_rom, mt32_sf;
+	wire        mt32_newmode;
+	wire        mt32_lcd_en, mt32_lcd_pix, mt32_lcd_update;
 	mt32pi mt32pi
 	(
 		.CLK_AUDIO(CLK_AUDIO),
-		.CLK_VIDEO(1'b0),   // LCD overlay unused in v1
-		.CE_PIXEL(1'b0),
-		.VGA_VS(1'b0),
-		.VGA_DE(1'b0),
+		.CLK_VIDEO(clk_vid),
+		.CE_PIXEL(v8_ce_pix),
+		.VGA_VS(v8_vsync),
+		.VGA_DE(v8_de),
 		.USER_IN(USER_IN),
 		.USER_OUT(USER_OUT),
 		.reset(~n_reset),
@@ -761,9 +793,58 @@ module emu
 		.mt32_mode_req(status[26]),          // Synth: 0=Munt, 1=FluidSynth
 		.mt32_rom_req(status[28:27]),        // Munt ROM: MT-32 v1/v2/CM-32L
 		.mt32_sf_req({5'd0, status[31:29]}), // SoundFont 0-7
-		.mt32_mode(), .mt32_rom(), .mt32_sf(), .mt32_newmode(),
-		.mt32_lcd_en(), .mt32_lcd_pix(), .mt32_lcd_update()
+		.mt32_mode(mt32_mode),
+		.mt32_rom(mt32_rom),
+		.mt32_sf(mt32_sf),
+		.mt32_newmode(mt32_newmode),
+		.mt32_lcd_en(mt32_lcd_en),
+		.mt32_lcd_pix(mt32_lcd_pix),
+		.mt32_lcd_update(mt32_lcd_update)
 	);
+
+	// "Show Info = Yes": on a Pi-acknowledged mode change (mt32_newmode
+	// toggles), flash the mode name via the framework info popup (hps_io
+	// info_req/info -> CONF_STR "I," strings). Block is ao486-verbatim;
+	// mt32_newmode/mode/rom/sf come from the CLK_AUDIO domain but change
+	// rarely and are edge-detected, same as ao486.
+	reg       mt32_info_req;
+	reg [3:0] mt32_info_disp;
+	always @(posedge clk_sys) begin
+		reg old_mode;
+
+		old_mode <= mt32_newmode;
+		mt32_info_req <= (old_mode ^ mt32_newmode) && (mt32_info == 1);
+
+		mt32_info_disp <= (mt32_mode == 'hA2) ? (4'd1 + mt32_sf[2:0]) :
+		                  (mt32_mode == 'hA1 && mt32_rom == 0) ?  4'd9 :
+		                  (mt32_mode == 'hA1 && mt32_rom == 1) ?  4'd10 :
+		                  (mt32_mode == 'hA1 && mt32_rom == 2) ?  4'd11 : 4'd12;
+	end
+
+	// LCD overlay visibility (ao486 pattern): "LCD-On" pins it up, "LCD-Auto"
+	// shows it while the Pi pushes LCD updates and drops it after a timeout.
+	// The timeout counts clk_vid ticks: at RUNTIME clk_vid is 25.175 MHz
+	// (VGA) or 15.664 MHz (12") — the 58.74 MHz static config is STA-only —
+	// so 50M ticks ~= 2.0 s / 3.2 s. Purely cosmetic timer; a monitor-mode
+	// PLL retarget mid-count merely stretches the fade.
+	reg mt32_lcd_on;
+	always @(posedge clk_vid) begin
+		int to;
+		reg old_update;
+
+		old_update <= mt32_lcd_update;
+		if(to) to <= to - 1;
+
+		if(mt32_info == 2) mt32_lcd_on <= 1;
+		else if(mt32_info != 3) mt32_lcd_on <= 0;
+		else begin
+			if(!to) mt32_lcd_on <= 0;
+			if(old_update ^ mt32_lcd_update) begin
+				mt32_lcd_on <= 1;
+				to <= 50_000_000;
+			end
+		end
+	end
 
 
 	// interconnects
