@@ -705,12 +705,19 @@ module emu
 	// (Previously forced to 1'b1 to dodge a suspected ROM "Break detection loop";
 	// that was a symptom of earlier boot issues, since resolved, not the RX path.)
 	// The line idles high; rxuart double-syncs UART_RXD internally.
-	// RX source: MT32-pi return line when a Pi is detected on the user port
-	// (USB MIDI devices attached to the Pi arrive there), else the HPS UART
-	// (MidiLink / console / PPP). TX fans out to BOTH sinks unconditionally —
-	// UART_TXD (MidiLink) and the user port (mt32pi.midi_tx) — so whichever
-	// endpoint is attached hears the guest.
-	assign serialIn = mt32_available ? mt32_midi_rx : UART_RXD;
+	// RX source: ALWAYS the HPS UART (UART_RXD) — MidiLink / console / PPP.
+	// The MT32-pi is an OUTPUT synth: the guest sends MIDI out to it and gets
+	// AUDIO back over I2S — it never drives the guest's serial receive line.
+	// (2026-08-13) The old `mt32_available ? mt32_midi_rx : UART_RXD` mux was a
+	// bug: whenever a Pi was detected on the user port it repointed the guest's
+	// RX at the Pi's MIDI-return line, so EVERY guest-receive path died with a
+	// Pi plugged in — TX still worked (UART_TXD=serialOut, unaffected), so it
+	// looked one-directional. PPP was the first feature to need guest RX and
+	// exposed it (LCP: pppd rcvd the guest's ConfReq but the guest never saw
+	// pppd's ConfAck -> LCP never completed). cozyMIDI is TX-only and missed it.
+	// If a USB-MIDI-controller-on-the-Pi -> guest path is ever wanted, gate
+	// mt32_midi_rx on a wired uart_mode==MIDI, never unconditionally.
+	assign serialIn = UART_RXD;
 	assign UART_TXD = serialOut;
 	assign UART_RTS = serialRTS ;
 	assign UART_DTR = UART_DSR;
