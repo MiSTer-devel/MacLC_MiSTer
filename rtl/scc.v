@@ -1624,8 +1624,13 @@ wr_3_a[7:6]  -- bits per char
                             if (baud_divid_speed_a != 24'd100)
                                 $display("SCC_BRG_FAST: Applying fast baud for diagnostic WR4=%02x WR12=%02x WR13=%02x WR14=%02x", wr4_a, wr12_a, wr13_a, wr14_a);
                             baud_divid_speed_a <= 24'd100;  // ~1200 clocks for 10-bit frame
-                        end else if (wr12_a == 8'h00 && wr13_a == 8'h00) begin
-                            // Also handle completely uninitialized case
+                        end else if (wr12_a == 8'h00 && wr13_a == 8'h00 && wr4_a[7:6] == 2'b00) begin
+                            // Completely-uninitialized default: BRG enabled but WR4
+                            // still 0 (x1 clock) and WR12/WR13 zero. Qualified on the
+                            // x1 clock mode (2026-08-12): a real 57600-baud setup has
+                            // the SAME WR12/WR13=00 image but programs x16 (WR4=$44),
+                            // so an unqualified catch-all stole 57600 and forced it to
+                            // 4 clk/bit (tb_scc_baud capture). x16+ now computes normally.
                             baud_divid_speed_a <= 24'd4;  // Very fast
                         end else begin
                             // Normal BRG calculation for configured values
@@ -1805,7 +1810,8 @@ always @(posedge clk) begin
             if (baud_divid_speed_b != 24'd100)
                 $display("SCC_BRG_FAST(B): diagnostic WR4=%02x WR12=%02x WR13=%02x WR14=%02x", wr4_b, wr12_b, wr13_b, wr14_b);
             baud_divid_speed_b <= 24'd100;
-        end else if (wr12_b == 8'h00 && wr13_b == 8'h00) begin
+        end else if (wr12_b == 8'h00 && wr13_b == 8'h00 && wr4_b[7:6] == 2'b00) begin
+            // x1-clock qualifier — see channel A note (don't steal 57600's image)
             baud_divid_speed_b <= 24'd4;
         end else begin
             mult_n_b = (({16'd0, n_b} << 1) * mult_b);
