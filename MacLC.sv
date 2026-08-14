@@ -512,7 +512,12 @@ module emu
 		.ps2_kbd_led_use(3'b001),
 		.ps2_kbd_led_status({2'b00, capslock}),
 
-		.ps2_mouse(ps2_mouse)
+		.ps2_mouse(ps2_mouse),
+
+		// OSD "UART mode" as Main reports it to the core: 0=None, 1=PPP
+		// (Main maps its modem modes to 1 before sending), 2=Console, 3=MIDI.
+		// Gates the user-port MIDI-in merge at the serialIn assign below.
+		.uart_mode(uart_mode)
 	);
 
 	assign CLK_VIDEO = clk_vid;
@@ -720,6 +725,7 @@ module emu
 	wire serialIn;
 	wire serialCTS = 1'b1; // Idle/deasserted when no serial device connected
 	wire serialRTS;
+	wire [7:0] uart_mode;  // OSD "UART mode" from hps_io (3 = MIDI)
 
 	// V8 Video system wires
 	wire v8_hsync, v8_vsync, v8_hblank, v8_vblank, v8_de;
@@ -739,9 +745,18 @@ module emu
 	// (Previously forced to 1'b1 to dodge a suspected ROM "Break detection loop";
 	// that was a symptom of earlier boot issues, since resolved, not the RX path.)
 	// The line idles high; rxuart double-syncs UART_RXD internally.
-	// RX source: ALWAYS the HPS UART (UART_RXD) — MidiLink / console / PPP.
-	// The MT32-pi is an OUTPUT synth: the guest sends MIDI out to it and gets
-	// AUDIO back over I2S — it never drives the guest's serial receive line.
+	// RX sources:
+	//  - ALWAYS the HPS UART (UART_RXD) — MidiLink / console / PPP.
+	//  - MIDI IN (2026-08-14): in OSD UART mode = MIDI ONLY, the user-port
+	//    MIDI-in line (mt32_midi_rx from sys/mt32pi.sv: the Pi's TX pin when
+	//    an MT32-pi is detected, USER_IN[0] otherwise) is AND-merged in.
+	//    Both lines idle high (USER_IO has weak pull-ups, MacLC.qsf), so the
+	//    merge is inert until a source actually transmits; a start bit from
+	//    either reaches the SCC. A USB MIDI keyboard on the MiSTer arrives
+	//    via MidiLink on UART_RXD; a controller on the MT32-pi (or a user-port
+	//    MIDI receiver with no Pi) arrives on mt32_midi_rx. The SCC side needs
+	//    nothing: rx/tx share one baud divider, the WR11/TRxC clause covers
+	//    the RX clock-source bits, and tb_scc_midi section 3 gates RX @31250.
 	// (2026-08-13) The old `mt32_available ? mt32_midi_rx : UART_RXD` mux was a
 	// bug: whenever a Pi was detected on the user port it repointed the guest's
 	// RX at the Pi's MIDI-return line, so EVERY guest-receive path died with a
@@ -749,9 +764,11 @@ module emu
 	// looked one-directional. PPP was the first feature to need guest RX and
 	// exposed it (LCP: pppd rcvd the guest's ConfReq but the guest never saw
 	// pppd's ConfAck -> LCP never completed). cozyMIDI is TX-only and missed it.
-	// If a USB-MIDI-controller-on-the-Pi -> guest path is ever wanted, gate
-	// mt32_midi_rx on a wired uart_mode==MIDI, never unconditionally.
-	assign serialIn = UART_RXD;
+	// The uart_mode==MIDI gate below is exactly what that post-mortem
+	// prescribed: outside MIDI mode serialIn is UART_RXD alone and the user
+	// port can never hijack guest receive (PPP/console unaffected).
+	wire userport_midi_in = (uart_mode == 8'd3) ? mt32_midi_rx : 1'b1;
+	assign serialIn = UART_RXD & userport_midi_in;
 	assign UART_TXD = serialOut;
 	assign UART_RTS = serialRTS ;
 	assign UART_DTR = UART_DSR;
