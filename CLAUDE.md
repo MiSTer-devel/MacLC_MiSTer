@@ -323,3 +323,13 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   (or a third-party CD driver) to mount discs. Serving law for any new
   DataIn command: transfer EXACTLY what the initiator arms (see
   docs/SCSI_CMD_GAPS.md).
+- **Serial (SCC, modem port): MIDI OUT + MIDI IN + PPP all work, HW-validated**
+  (OUT 2026-08-12 cozyMIDI → MidiLink/MT32-pi; PPP 2026-08-13 LCP+IPCP on
+  7.5.5 incl. guest FTP; IN 2026-08-14). MIDI IN sources: HPS UART (MidiLink
+  USB, always wired) and the user-port MIDI-in line (MT32-pi TX pin) — the
+  latter joins guest RX ONLY in OSD UART mode = MIDI (`uart_mode==3` AND-merge
+  in MacLC.sv), so PPP/console guest-receive can never be hijacked by the user
+  port (the 2026-08-13 serialIn-mux lesson). v1 is channel A only; printer-port
+  TX (`txd_b_out`) still dangles at dataController. Regression gate for ANY SCC
+  serial/baud/FIFO edit: `verilator/tb_scc_midi.v` (build cmd in its header;
+  §3 = MIDI-in RX at 31250; keep the ROM-style loopback prelude).
