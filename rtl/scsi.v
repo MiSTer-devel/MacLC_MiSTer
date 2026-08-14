@@ -3160,9 +3160,32 @@ always @(posedge clock) begin
 				pf_c_addr <= pf_c_tgt;
 				pf_d_addr <= pf_d_tgt;
 				pf_valid  <= 1'b1;
+			end else begin
+				// (2026-08-14) A snooped fetch may have CAPTURED COLLIDED
+				// DATA: the port-B read of pf_c_tgt (steal-launch cycle) or
+				// pf_d_tgt (PF_RDC cycle) can issue in the same cycle a
+				// port-A write lands on that address, and the no_rw_check
+				// M10K returns the PRE-write byte into q_b -> q_c/q_d.
+				// Declining to publish is NOT an invalidation: if an earlier
+				// fetch already published these same addresses, pf_valid is
+				// still 1 and the addresses still compare equal, so pf_stale
+				// stays false and no refetch ever launches — the stale byte
+				// is served as valid PERMANENTLY. Every virgin-slot
+				// sequential HPS fill hits this (q_d holds $00 for the real
+				// byte); consumed only by the odd-data_cnt arm of
+				// din_pair_next, which is why word-aligned transfers never
+				// saw it. Found by the MacLC_pocket fork (their
+				// docs/mystery_b_root_cause.md: a compressed CODE resource
+				// lost $2C00, desync'd the instruction stream, and returned
+				// into the boot blocks' 'LK' signature -> deterministic
+				// Sad-Mac ~15-20 s into boot). The discard must INVALIDATE
+				// so pf_stale forces the refetch the COHERENCY note above
+				// already promises. pf_snooped is cleared this same cycle
+				// and nothing else remembers the poisoning — do NOT fold
+				// this into the publish condition or into pf_stale.
+				// Guarded by verilator/tb_scsi_pf.v (fails without this).
+				pf_valid <= 1'b0;
 			end
-			// A hit before/at this edge forced the discard above; the refetch
-			// it triggers will read post-write data, so the flag is consumed.
 			pf_snooped <= 1'b0;
 			pf_st      <= PF_IDLE;
 		end
