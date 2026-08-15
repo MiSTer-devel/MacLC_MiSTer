@@ -27,7 +27,20 @@ module emu
 	// USER_OUT is driven by the mt32pi instance (user-port MIDI + I2C);
 	// unused user-port pins are held at '1 inside sys/mt32pi.sv.
 
-	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
+	// DDR3 port: wholly owned by the PDS Ethernet card's shared-memory mailbox
+	// (rtl/pds/pds_enet.sv — the maclc_eth daemon serves the other side).
+	// Single clock domain: the mailbox runs in clk_sys.
+	assign DDRAM_CLK      = clk_sys;
+	assign DDRAM_BURSTCNT = pds_mem_burst;
+	assign DDRAM_ADDR     = pds_mem_addr;
+	assign DDRAM_DIN      = pds_mem_wdata;
+	assign DDRAM_BE       = pds_mem_be;
+	assign DDRAM_RD       = pds_mem_rd;
+	assign DDRAM_WE       = pds_mem_we;
+	wire [28:0] pds_mem_addr;
+	wire  [7:0] pds_mem_burst, pds_mem_be;
+	wire        pds_mem_rd, pds_mem_we;
+	wire [63:0] pds_mem_wdata;
 	assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 	assign LED_USER  = dio_download || (disk_act ^ |diskMotor);
@@ -80,6 +93,7 @@ module emu
 		// on a stock Main a 2048-byte-sector .bin also works mounted directly.
 		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
 		"OI,CD-ROM Drive,Enabled,Disabled;",
+		"OJ,Ethernet,On,Off;",
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
@@ -897,7 +911,7 @@ module emu
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
-	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
+	wire pds_slot_irq = pds_irq;  // PDS Ethernet card → pseudo-VIA slot-IFR bit $20 (slot $E)
 	wire vid_alt;
 	wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectASC, selectUnmapped;
 	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
@@ -1039,8 +1053,42 @@ module emu
 		end
 	end
 
-	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
+	// ── PDS Ethernet card (Asante MacCON i LC, pseudo-slot $E) ─────────────────
+	// Claims $FE0Dxxxx/$FE0Exxxx/$FEFFxxxx (and the 24-bit $EDxxxx/$EExxxx
+	// windows) ONLY when the maclc_eth daemon's MAGIC is present — otherwise
+	// slot space keeps the hardware-validated open-bus $FFFF ack below. Card
+	// cycles complete via stretched async DTACK (never VPA), like SCSI DMA.
+	wire        pds_card_sel, pds_card_ack, pds_irq;
+	wire [15:0] pds_dout;
+	pds_enet pds_enet (
+		.clk_sys   (clk_sys),
+		.rst_core  (~pll_locked_s | RESET),
+		.rst_guest (~_cpuReset | ~_cpuReset_o),
+		.ena_osd   (~status[19]),
+		.cpuAddr   (cpuAddr),
+		.cpuDataIn (cpuDataOut),
+		._cpuAS    (_cpuAS),
+		._cpuUDS   (_cpuUDS),
+		._cpuLDS   (_cpuLDS),
+		._cpuRW    (_cpuRW),
+		.card_sel  (pds_card_sel),
+		.card_ack  (pds_card_ack),
+		.card_dout (pds_dout),
+		.irq       (pds_irq),
+		.mem_addr  (pds_mem_addr),
+		.mem_burst (pds_mem_burst),
+		.mem_rd    (pds_mem_rd),
+		.mem_we    (pds_mem_we),
+		.mem_wdata (pds_mem_wdata),
+		.mem_be    (pds_mem_be),
+		.mem_rdata (DDRAM_DOUT),
+		.mem_rvalid(DDRAM_DOUT_READY),
+		.mem_busy  (DDRAM_BUSY)
+	);
+
+	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space || pds_card_sel) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
@@ -1153,7 +1201,8 @@ module emu
 	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
 	reg [15:0] periph_din_reg;
 	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
-	wire [15:0] cpu_din_muxed = slot_space     ? 16'hFFFF :
+	wire [15:0] cpu_din_muxed = pds_card_sel   ? pds_dout :
+	                            slot_space     ? 16'hFFFF :
 	                            vpa_periph_read ? periph_din_reg :
 	                                              dataControllerDataOut;
 `ifdef SIMULATION
@@ -1225,6 +1274,7 @@ module emu
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
 		.cpuFC(cpuFC),
+		.pds_claim(pds_card_sel),
 		.ram_config(pvia_ram_config_out),
 		.ram_config_phys(configRAMSize),   // PHYSICAL SIMM size — was unconnected (=0),
 		                                   // so the 10MB SIMM was invisible and the Mac

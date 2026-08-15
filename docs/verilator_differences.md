@@ -12,7 +12,21 @@ CPU-glue or top-level wiring fix must be made in **both** files or sim and FPGA
 silently diverge. (This has bitten us before — e.g. sim once hardwired
 `.berr(1'b0)`, masking the MOVES bus-error fix.)
 
-Last audited: 2026-08-02 (sim MFM floppy detection wired — see below).
+Last audited: 2026-08-15 (PDS Ethernet card wired into both tops — see below).
+
+**2026-08-15 — PDS Ethernet (rtl/pds/pds_enet.sv) wired into BOTH tops,
+backing store differs by design:** MacLC.sv backs the card's DDR3 mailbox with
+the real DDRAM port (`DDRAM_CLK = clk_sys`, port was previously tied off and
+is wholly owned by the card); sim.v backs it with the behavioral
+`verilator/sim_ddr3.v` model (`+pds_magic` / `+pds_rom=<hex>` stage the
+window; without them the card is absent and slot space behaves exactly as
+before, so the boot gate is unaffected). The CPU-glue edits are IDENTICAL in
+both tops and must stay so: `pds_card_sel` branch in `_cpuVPA` (forced 1),
+`_cpuDTACK` (`~pds_card_ack`, ahead of the slot_space $FFFF ack) and the din
+mux (`pds_dout`, ahead of slot_space), plus `.pds_claim(pds_card_sel)` into
+addrController_top (masks the selectRAM alias of $FE0Dxxxx/$FE0Exxxx onto
+guest SDRAM). Sim-only difference: `ena_osd` is hardwired 1 (no OSD) and
+rst_core is `~pll_locked | reset` vs MacLC.sv's `~pll_locked_s | RESET`.
 
 **2026-08-02 — sim floppy MFM/HD detection un-hardwired (both tops now
 equivalent):** `sim.v` used to pass `.diskMFM(2'b00)/.diskHD(2'b00)` ("MFM path

@@ -32,6 +32,14 @@ module addrController_top(
 	// for our TG68 + SDRAM stack even though it diverges from MAME.
 	input [2:0] cpuFC,
 
+	// PDS Ethernet card claims this bus cycle (rtl/pds/pds_enet.sv): its
+	// 32-bit slot addresses ($FE0Dxxxx RAM / $FE0Exxxx regs) alias into the
+	// $0Dxxxx/$0Exxxx RAM range through the 24-bit-truncating decode below,
+	// so an unmasked selectRAM would let a card-RAM write ALSO commit to
+	// guest SDRAM. Mask selectRAM for claimed cycles; everything else the
+	// card claims decodes as peripheral/unmapped space and is harmless.
+	input pds_claim,
+
 	// RAM/ROM:
 	output [22:0] memoryAddr,  // 23-bit SDRAM word address
 	output _memoryUDS,
@@ -234,6 +242,9 @@ module addrController_top(
 	// ============================================================
 	// Address decoder
 	// ============================================================
+	wire selectRAM_dec;
+	assign selectRAM = selectRAM_dec & ~pds_claim;
+
 	addrDecoder ad(
 		.address({cpuAddr[23:1], 1'b0}),
 		._cpuAS(_cpuAS),
@@ -242,7 +253,7 @@ module addrController_top(
 		.ram_config(ram_config),
 		.ram_config_phys(ram_config_phys),
 		.ram_configured(ram_configured),
-		.selectRAM(selectRAM),
+		.selectRAM(selectRAM_dec),
 		.selectROM(selectROM),
 		.selectSCSI(selectSCSI),
 		.selectSCSIDMA(selectSCSIDMA),

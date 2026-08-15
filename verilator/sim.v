@@ -239,7 +239,7 @@ module emu
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
-	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
+	wire pds_slot_irq = pds_irq;  // PDS Ethernet card → pseudo-VIA slot-IFR bit $20 (slot $E)
 	wire vid_alt;
 	wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectUnmapped;
 	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
@@ -303,8 +303,58 @@ module emu
 	wire        slot_space = (cpuAddrFullHi >= 8'hF1) && (cpuAddrFullHi <= 8'hFE);
 	// SCSI pseudo-DMA ($F06000/$F12000) uses async DTACK gated by the NCR5380 DREQ
 	// instead of the 6800-style VPA path the rest of $F0xxxx uses — see MacLC.sv.
-	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
+	// ── PDS Ethernet card (mirror of MacLC.sv — keep both tops identical) ──────
+	// Backing store is the behavioral sim_ddr3 model instead of the DDRAM port;
+	// with no "daemon" (MAGIC absent) the card is invisible and slot space
+	// behaves exactly as before. +pds_magic / +pds_rom=<hex> stage the window.
+	wire        pds_card_sel, pds_card_ack, pds_irq;
+	wire [15:0] pds_dout;
+	wire [28:0] pds_mem_addr;
+	wire  [7:0] pds_mem_burst, pds_mem_be;
+	wire        pds_mem_rd, pds_mem_we;
+	wire [63:0] pds_mem_wdata, pds_mem_rdata;
+	wire        pds_mem_rvalid, pds_mem_busy;
+	pds_enet pds_enet (
+		.clk_sys   (clk_sys),
+		.rst_core  (~pll_locked | reset),
+		.rst_guest (~_cpuReset | ~_cpuReset_o),
+		.ena_osd   (1'b1),
+		.cpuAddr   (cpuAddr),
+		.cpuDataIn (cpuDataOut),
+		._cpuAS    (_cpuAS),
+		._cpuUDS   (_cpuUDS),
+		._cpuLDS   (_cpuLDS),
+		._cpuRW    (_cpuRW),
+		.card_sel  (pds_card_sel),
+		.card_ack  (pds_card_ack),
+		.card_dout (pds_dout),
+		.irq       (pds_irq),
+		.mem_addr  (pds_mem_addr),
+		.mem_burst (pds_mem_burst),
+		.mem_rd    (pds_mem_rd),
+		.mem_we    (pds_mem_we),
+		.mem_wdata (pds_mem_wdata),
+		.mem_be    (pds_mem_be),
+		.mem_rdata (pds_mem_rdata),
+		.mem_rvalid(pds_mem_rvalid),
+		.mem_busy  (pds_mem_busy)
+	);
+	sim_ddr3 sim_ddr3 (
+		.clk   (clk_sys),
+		.addr  (pds_mem_addr),
+		.burst (pds_mem_burst),
+		.rd    (pds_mem_rd),
+		.we    (pds_mem_we),
+		.wdata (pds_mem_wdata),
+		.be    (pds_mem_be),
+		.rdata (pds_mem_rdata),
+		.rvalid(pds_mem_rvalid),
+		.busy  (pds_mem_busy)
+	);
+
+	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space || pds_card_sel) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
@@ -438,7 +488,7 @@ module emu
 
 		.ipl        ( _cpuIPL ),
 		.berr       ( cpu_berr ),
-		.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
+		.din        ( pds_card_sel ? pds_dout : slot_space ? 16'hFFFF : dataControllerDataOut ),
 		.dout       ( tg68_dout ),
 		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
@@ -522,6 +572,7 @@ module emu
 		._cpuLDS(_cpuLDS),
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
+		.pds_claim(pds_card_sel),
 		.ram_config(pvia_ram_config_out),
 		.ram_config_phys(configRAMSize),
 		.ram_configured(pvia_ram_configured),

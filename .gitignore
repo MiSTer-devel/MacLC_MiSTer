@@ -63,3 +63,4 @@ verilator/sim_stdout.log
 # python tooling artifacts
 __pycache__/
 *.pyc
+hps/maclc_eth/maclc_eth
