@@ -165,7 +165,9 @@ static int core_is_maclc(void)
     if (!fgets(buf, sizeof buf - 1, f)) buf[0] = 0;
     fclose(f);
     buf[strcspn(buf, "\r\n")] = 0;
-    return !strncasecmp(buf, "MACLC", 5);
+    /* exact match — a prefix test would also fire for the separate MacLCII
+     * core, whose DDR3 this daemon must never touch */
+    return !strcasecmp(buf, "MACLC");
 }
 
 static void default_mac(void)
