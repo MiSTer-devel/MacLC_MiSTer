@@ -384,3 +384,5 @@ set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *vga_scale
 set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *HDMI_shadowmask|vid*
 set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *yc_out|phase*
 set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *dv_de1*
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/pds/pds_enet.sv
