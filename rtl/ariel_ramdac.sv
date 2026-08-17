@@ -151,6 +151,19 @@ always @(posedge clk_sys)
 // disarm on an early strobe-less mem_latch and drop the access entirely.
 reg ariel_armed;
 wire req_stb = ariel_armed && req && mem_latch && (~uds_n | ~lds_n);
+
+`ifdef SIMULATION
+// Phase-C magenta hunt (2026-08-17): trace every CPU register action the
+// RAMDAC takes so CLUT programming is observable. Remove when resolved.
+integer dbg_ariel_wr = 0;
+always @(posedge clk_sys) begin
+	if (req_stb && we) begin
+		dbg_ariel_wr = dbg_ariel_wr + 1;
+		$display("ARIEL WR[%0d]: breg=%0d data=%02x paddr=%02x comp=%0d @%0t",
+		         dbg_ariel_wr, byte_reg, data_in, palette_addr, color_comp, $time);
+	end
+end
+`endif
 always @(posedge clk_sys) begin
     if (reset)         ariel_armed <= 1'b1;
     else if (cpu_as_n) ariel_armed <= 1'b1; // access ended -> re-arm

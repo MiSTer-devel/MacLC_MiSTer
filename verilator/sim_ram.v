@@ -63,8 +63,10 @@ always @(posedge clk) begin
 		`endif
 	end
 
-	// floppy-window read serve (legacy dout path and timing)
-	if (flp_win && oe) dout <= mem[addr[22:0]];
+	// floppy-window read serve (legacy dout path and timing). No oe
+	// qualifier: oe is pure CPU intent now; the window itself IS the
+	// floppy read request (mirrors rtl/sdram.v req_flp).
+	if (flp_win) dout <= mem[addr[22:0]];
 
 	// demand handshake
 	if (reset) begin

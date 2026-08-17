@@ -1101,7 +1101,10 @@ module emu
 	wire  [1:0] ram_ds   = download_cycle ? 2'b11                 : { !_memoryUDS, !_memoryLDS };
 	// Use ioctl_wr directly as write enable during download (bypass registered dio_write)
 	wire        ram_we   = download_cycle ? 1'b1                  : !_ramWE;
-	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
+	// Phase C: oe is PURE CPU read intent — floppy windows request via
+	// flp_win (see the stale-read/lost-strobe note in MacLC.sv; keep both
+	// tops identical).
+	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE);
 	wire [15:0] ram_do_raw;
 	wire        ram_cpu_done;
 	wire [15:0] ram_cpu_dout;

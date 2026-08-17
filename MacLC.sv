@@ -2413,8 +2413,16 @@ module emu
 	                                          { !_memoryUDS, !_memoryLDS };
 	wire        sdram_we   = download_cycle ? dio_write :
 	                                          !_ramWE;
+	// Phase C: oe is PURE CPU read intent — floppy windows request via
+	// flp_win, NOT via oe. Including dskReadAck here (as the slot machine
+	// needed) let a pending floppy window bridge the 2-3 tick AS-high gap
+	// between CPU cycles, holding oe high so cpu_done never cleared: the
+	// next read then instant-acked on the HELD done and latched the
+	// PREVIOUS access's cpu_dout without ever touching SDRAM (stale-read
+	// class), and writes lost their done-RISE (vram_we strobes silently
+	// dropped -> the magenta-screen hunt of 2026-08-17).
 	wire        sdram_oe   = download_cycle ? 1'b0 :
-	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
+	                                          (!_ramOE || !_romOE);
 	// Phase C: CPU reads come from the SDRAM controller's held cpu_dout
 	// register (captured once per demand access), not the shared slot-domain
 	// dout — floppy windows can no longer clobber CPU read data, and the

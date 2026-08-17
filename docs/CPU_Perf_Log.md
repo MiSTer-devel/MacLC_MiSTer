@@ -191,6 +191,30 @@ with un-slotted `_ramWE`, a pending CPU write's `we` is high during
 floppy windows while `addr` is the floppy image's (the FPGA controller is
 safe by construction; the sim model needed the explicit gate).
 
+**Bug found and fixed during bring-up (the magenta screen, 2026-08-17,
+identical on HW and sim):** first Phase-C builds booted to a uniform
+magenta instead of the desktop. Diagnosis chain: CPU healthy (check_boot
+PASS, desktop workload executing), VRAM BRAM strobes healthy through
+frame 240 (109,364 strobes = exactly the visible-column fraction, 0
+missed), frame 200 healthy grey, frame 450 magenta — the break follows
+the Sony driver install, whose drive polling churns the floppy fetch
+address and fires pending windows continuously. Root cause: `sdram_oe`
+still included `dskReadAckInt/Ext` (a slot-machine leftover), while
+`cpu_done` clears on `!(oe||we)` — a floppy window bridging the 2-3 tick
+AS-high gap between CPU cycles held oe high, so done never cleared: the
+next READ instant-acked on the held done and latched the PREVIOUS
+access's cpu_dout without touching SDRAM (stale-read class), and the
+next WRITE lost its done-RISE, silently dropping the vram_we BRAM
+strobe. Fix: `oe` is pure CPU/download read intent in both tops (floppy
+intent travels only via flp_win; sim_ram's window serve drops its oe
+qualifier). The magenta itself was the Ariel's reset-time diagnostic
+palette (bin 5 = magenta) showing through — a deliberately loud init
+pattern that made the failure visible and diagnosable; uniform color =
+the System's post-mode-switch redraw lost to dropped strobes and stale
+RMW reads. **Pocket port note: this is THE trap class for any port of
+the demand engine — every request-done handshake must key on the
+requester's OWN level, never on a mux shared with another master.**
+
 ### 1 — 2026-08-17: Step-0 measurement instrumentation (sim-only) + BASELINE
 
 - `rtl/tg68k/tg68k.v`: `ifdef SIMULATION` block — histograms every completed

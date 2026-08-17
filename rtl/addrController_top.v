@@ -237,6 +237,36 @@ module addrController_top(
 	assign vram_we = selectVRAM && !_cpuRW && vram_col_visible &&
 	                 cpu_wr_ack && !cpu_wr_ack_q;
 
+`ifdef SIMULATION
+	// Phase-C debug: is the BRAM mirror strobe firing once per VRAM write
+	// cycle? (magenta-screen hunt 2026-08-17; remove when resolved)
+	integer dbg_vwe_cnt = 0, dbg_vwr_cycles = 0, dbg_vwr_missed = 0;
+	reg dbg_in_vwr = 0, dbg_got_strobe = 0;
+	always @(posedge clk) begin
+		if (vram_we) begin
+			dbg_vwe_cnt = dbg_vwe_cnt + 1;
+			if (dbg_vwe_cnt <= 6)
+				$display("VRAMWE[%0d]: waddr=%h wpl=%0d cpuAddr=%h ack=%b%b",
+				         dbg_vwe_cnt, vram_waddr, words_per_line,
+				         cpuAddr[23:0], cpu_wr_ack, cpu_wr_ack_q);
+		end
+		if (selectVRAM && !_cpuRW && !_cpuAS) begin
+			dbg_in_vwr <= 1;
+			if (vram_we) dbg_got_strobe <= 1;
+		end else if (dbg_in_vwr) begin
+			dbg_vwr_cycles = dbg_vwr_cycles + 1;
+			if (!dbg_got_strobe && vram_col_visible_q) dbg_vwr_missed = dbg_vwr_missed + 1;
+			if (dbg_vwr_cycles % 200000 == 0 || (dbg_vwr_missed > 0 && dbg_vwr_missed <= 6))
+				$display("VRAMWR cycles=%0d strobes=%0d missed=%0d",
+				         dbg_vwr_cycles, dbg_vwe_cnt, dbg_vwr_missed);
+			dbg_in_vwr <= 0;
+			dbg_got_strobe <= 0;
+		end
+	end
+	reg vram_col_visible_q;
+	always @(posedge clk) if (selectVRAM && !_cpuRW && !_cpuAS) vram_col_visible_q <= vram_col_visible;
+`endif
+
 	// Floppy disk addresses: byte offset → SDRAM word
 	wire [22:0] dsk_int_sdram_word = 23'h600000 + {2'b0, dskReadAddrInt[21:1]};
 	wire [22:0] dsk_ext_sdram_word = 23'h700000 + {2'b0, dskReadAddrExt[21:1]};
