@@ -50,6 +50,10 @@ module addrController_top(
 	output dioBusControl,
 	output cpuBusControl,
 	output memoryLatch,
+	output flp_guard,      // pending floppy window this rotation: SDRAM demand
+	                       // sequencer must not start a CPU access (Phase C)
+	input  cpu_wr_ack,     // demand write acked (sdram cpu_done): strobes the
+	                       // VRAM BRAM write mirror once per CPU write cycle
 
 	// peripherals:
 	output selectSCSI,
@@ -129,15 +133,22 @@ module addrController_top(
 	// ============================================================
 	// Memory control signals
 	// ============================================================
-	assign _romOE = ~(cpuBusControl && selectROM && _cpuRW);
+	// Phase C (branch cpu-enhancements): the SDRAM controller is demand-
+	// started, so these are no longer gated on cpuBusControl (the slot
+	// rotation). They form a LEVEL request held for the whole AS-low window;
+	// the controller serves it once (cpu_done handshake in sdram.v) at the
+	// next free clk_64 edge. The selects are already AS-qualified in
+	// addrDecoder. Floppy windows force read-both-bytes below.
+	assign _romOE = ~(selectROM && _cpuRW);
 
-	assign _ramOE = ~(cpuBusControl && (selectRAM || selectVRAM) && _cpuRW);
+	assign _ramOE = ~((selectRAM || selectVRAM) && _cpuRW);
 
 	// RAM Write Enable: Active for RAM or VRAM writes
-	assign _ramWE = ~(cpuBusControl && (selectRAM || selectVRAM) && !_cpuRW);
+	assign _ramWE = ~((selectRAM || selectVRAM) && !_cpuRW);
 
-	assign _memoryUDS = cpuBusControl ? _cpuUDS : 1'b0;
-	assign _memoryLDS = cpuBusControl ? _cpuLDS : 1'b0;
+	wire flp_win_any = dskReadAckInt || dskReadAckExt;
+	assign _memoryUDS = flp_win_any ? 1'b0 : _cpuUDS;
+	assign _memoryLDS = flp_win_any ? 1'b0 : _cpuLDS;
 
 	// ============================================================
 	// V8-style RAM address translation
@@ -209,10 +220,22 @@ module addrController_top(
 	wire [8:0]  vram_colw = vram_cpu_offset[9:1];     // word within the line (0..511)
 	wire [18:0] vram_packed = vram_line * words_per_line + {10'd0, vram_colw};
 	wire        vram_col_visible = ({2'b0, vram_colw} < words_per_line);
-	assign vram_waddr = vram_packed[17:0];
-	// One write per CPU VRAM bus cycle (memoryLatch), only for visible columns
+	// One BRAM write per CPU VRAM write cycle, only for visible columns
 	// (off-screen stride padding is dropped so it can't corrupt the next line).
-	assign vram_we = selectVRAM && !_cpuRW && cpuBusControl && memoryLatch && vram_col_visible;
+	// Phase C: the strobe fires on the RISING EDGE of the demand write ack
+	// (sdram cpu_done, via cpu_wr_ack), instead of at (cpuBusControl &&
+	// memoryLatch). Under demand-start serving the CPU write cycle is no
+	// longer slot-aligned, and an AS-low window can contain a memoryLatch
+	// tick that falls in the floppy slot — the old condition would silently
+	// drop that BRAM mirror write (stale framebuffer pixels, ghost class).
+	// The ack rises mid-cycle while AS, the data strobes (a_be at the top is
+	// the LIVE ~_cpuUDS/~_cpuLDS), the address, and the write data are all
+	// still held — everything the BRAM port needs is naturally valid.
+	reg cpu_wr_ack_q;
+	always @(posedge clk) cpu_wr_ack_q <= cpu_wr_ack;
+	assign vram_waddr = vram_packed[17:0];
+	assign vram_we = selectVRAM && !_cpuRW && vram_col_visible &&
+	                 cpu_wr_ack && !cpu_wr_ack_q;
 
 	// Floppy disk addresses: byte offset → SDRAM word
 	wire [22:0] dsk_int_sdram_word = 23'h600000 + {2'b0, dskReadAddrInt[21:1]};
@@ -229,9 +252,49 @@ module addrController_top(
 	// ============================================================
 	// Extra bus slots (disk reads, sound)
 	// ============================================================
-	assign dskReadAckInt = (extraBusControl == 1'b1) && (extra_slot_count == 0);
-	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1);
+	// Phase C: floppy fetch windows are PENDING-GATED — a window only fires
+	// when the encoder's fetch address has changed since the last served
+	// fetch (or none was served yet). The old design read SDRAM every
+	// rotation regardless (the MacIIvi-noted spurious read); under demand-
+	// start those idle windows would steal CPU bandwidth for nothing. The
+	// window itself keeps the exact old slot alignment, so floppy.v's
+	// ack/latch protocol (dskReadAckD at cen, fetch-freshness after an
+	// address advance) sees identical timing — one ack per address, which is
+	// precisely what the freshness protocol needs. Served state is marked at
+	// the window's memoryLatch tick (data captured into sdram dout by then).
+	reg [21:0] flp_addr_int_q, flp_addr_ext_q;
+	reg        flp_valid_int,  flp_valid_ext;
+	wire flp_pend_int = !flp_valid_int || (dskReadAddrInt != flp_addr_int_q);
+	wire flp_pend_ext = !flp_valid_ext || (dskReadAddrExt != flp_addr_ext_q);
+	always @(posedge clk) begin
+		if (!_cpuReset) begin
+			flp_valid_int <= 0;
+			flp_valid_ext <= 0;
+		end else begin
+			if (dskReadAckInt && memoryLatch) begin
+				flp_addr_int_q <= dskReadAddrInt;
+				flp_valid_int  <= 1;
+			end
+			if (dskReadAckExt && memoryLatch) begin
+				flp_addr_ext_q <= dskReadAddrExt;
+				flp_valid_ext  <= 1;
+			end
+		end
+	end
+	assign dskReadAckInt = (extraBusControl == 1'b1) && (extra_slot_count == 0) && flp_pend_int;
+	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1) && flp_pend_ext;
 	// extra_slot_count == 2 is now idle (legacy sound DMA removed)
+
+	// flp_guard: a pending floppy window fires this rotation — hold off new
+	// CPU accesses from one full slot before it through its end, so the
+	// demand sequencer is guaranteed idle when the window opens (an access
+	// occupies 8 clk_64 = one slot). Covering ALL of the preceding slot
+	// (not just its last 3 ticks) costs the CPU at most one extra slot only
+	// while a floppy fetch is actually pending, and makes the guard's rise
+	// race-free against the sequencer's clk_64 sampling.
+	assign flp_guard = ((extra_slot_count == 2'd0 && flp_pend_int) ||
+	                    (extra_slot_count == 2'd1 && flp_pend_ext)) &&
+	                   ((busCycle == 2'b01) || (busCycle == 2'b10));
 
 	// Final SDRAM word address output
 	assign memoryAddr =

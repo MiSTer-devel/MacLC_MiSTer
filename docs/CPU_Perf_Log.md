@@ -131,7 +131,67 @@ floor; the 10/12-tick misalignment and transient cases compress toward
 6-9; DTACK-immediate targets (slot space, SCSI-DMA when DREQ pending)
 complete in 5-6 ticks vs 8. Measured effect: see entry 3.
 
-### 1 — 2026-08-17: Step-0 measurement instrumentation (sim-only)
+**MEASURED (sim A/B, archived `scratch/bus_hist_phaseB.log`):** window-0
+boot workload executed cycle-for-cycle identically to baseline (2,944,491
+vs 2,944,483 cycles — functional transparency proven); ROM fetch stays
+8.93 (the slot lock, as modeled), while the new fast paths appear exactly
+where designed (IO-DTACK 5.0, RAM writes 6.0, len-5/6 buckets populated).
+Desktop windows: fetch 8.60, VRAM read 9.50, VRAM write 10.10.
+
+**HW gate 2026-08-17: PASS.** Fit seed 7: Fitter Successful, STA met
+(worst slack +0.216 ns). Deployed md5 63982eb3b61e476e1259f14b15331bd3 as
+canonical MacLC.rbf; coreRunning=MACLC; booted System 7.5 to the Finder
+desktop with clean video and colour icons (scratch/phaseB_hw_boot1.png).
+
+### 3 — 2026-08-17: Phase C — demand-start SDRAM service (the slot-floor break)
+
+**Core RTL (ports to Pocket): `rtl/sdram.v`** — the operational branch of
+the command engine is a demand sequencer: an access starts at any idle
+clk_64 edge (same 8-clk_64 ACTIVE/CAS/capture schedule as before,
+including the +2 capture margin), instead of only at bus-slot boundaries.
+New ports: `flp_win` (floppy window, priority, runs slot-aligned by
+construction so floppy.v sees identical timing), `flp_guard` (hold CPU
+starts while a pending floppy window approaches), `cpu_done` (early-done:
+reads at ACTIVE+3 clk_64 — data lands in `cpu_dout` at ACTIVE+6, a full
+tick before the FSM's exit+2 din_r latch; writes POSTED at ACTIVE),
+`cpu_dout` (private held CPU read register — floppy windows can no longer
+clobber CPU data). Request values (din/ds/column) freeze at ACTIVE
+(din_q/ds_q/col_q) so mid-access mux flips (download windows) can't
+corrupt a delayed access. CPU starts gated to t[0] parity (integer
+clk_sys edges) so cpu_dout launches on full-period STA paths — no
+cross-clock multicycle needed. Explicit refresh: opportunistic when idle
+past REF_OPP (300 clk_64), forced past REF_FORCE (480) — tREF needs one
+per ~508. Read period: 7 clk_sys; write period: 6 (vs 8/10/12 before).
+
+**`rtl/addrController_top.v`**: `_ramOE/_romOE/_ramWE/_memoryUDS/LDS`
+drop their `cpuBusControl` slot gating (they are now level requests;
+floppy windows force read-both-bytes). `dskReadAckInt/Ext` are
+PENDING-GATED (fire only when the encoder's fetch address changed since
+last served — kills the every-rotation spurious SDRAM read; served state
+marked at the window's memoryLatch). New outputs `flp_guard` (covers the
+full slot before a pending window + the window), input `cpu_wr_ack`. The
+VRAM BRAM write-mirror strobe (`vram_we`) fires on the RISING EDGE of
+`cpu_wr_ack` instead of at cpuBusControl&&memoryLatch — under demand
+serving an AS-low window need not contain a cpu-slot latch tick (silent
+BRAM-write drop = stale pixels), while the ack rises mid-cycle when AS,
+the live a_be strobes, address and data are all still held.
+
+**Top glue (re-derive per platform): `MacLC.sv` + `verilator/sim.v`** —
+`_cpuDTACK` mem leg = `~cpu_done` (dtack_en shrinks to the immediate
+peripheral/unmapped path; the as_low_q slot qualifier from entry 2 is
+gone with the slot grant itself). `sdram_do`'s CPU leg serves the held
+`cpu_dout` (warm-boot ROM patch applied there); `sdram_out` remains the
+floppy demux source. `rtl/dataController_top.sv`: the memory leg of
+cpuDataOut passes `memoryDataIn` straight through (retired the
+slot-sampled `cpu_data` register — upstream data is now held).
+
+**`verilator/sim_ram.v`**: same handshake, latency-matched (reads done at
++2 edges, writes posted at +1) — plus the write path is `!flp_win`-gated:
+with un-slotted `_ramWE`, a pending CPU write's `we` is high during
+floppy windows while `addr` is the floppy image's (the FPGA controller is
+safe by construction; the sim model needed the explicit gate).
+
+### 1 — 2026-08-17: Step-0 measurement instrumentation (sim-only) + BASELINE
 
 - `rtl/tg68k/tg68k.v`: `ifdef SIMULATION` block — histograms every completed
   bus cycle's clkena-to-clkena tick count, binned by busstate
@@ -141,3 +201,18 @@ complete in 5-6 ticks vs 8. Measured effect: see entry 3.
 - **Pocket port: not needed** (measurement scaffolding only). The timing
   model above, however, applies wherever the same addrController/sdram slot
   scheme is used.
+
+**BASELINE (pre-Phase-B commit `3568a1e`, 9 sim-seconds boot→desktop,
+archived `scratch/bus_hist_baseline.log`):**
+
+| phase | bus-cycle share | avg cycle | notes |
+|---|---|---|---|
+| whole run (w0-6) | 86.6% of ticks | ~9.2 | ROM fetch 44.4% @ 8.96; RAM rd 17.5% @ 9.50; RAM wr 13.9% @ 10.03 |
+| desktop (w6-8) | 86.5% of ticks | ~8.4 | ROM fetch 46.6% @ 8.41 (89.6% at len 8); VRAM/periph via $50Fxxxxx aliases: rd 26.5% @ 11.60, wr 17.3% @ 10.10 |
+
+Memory-cycle length mix (whole run): only 57% (RAM) / 75% (ROM) of cycles
+hit the 8-tick floor; the rest sit at 10/12/14 (slot misalignment + the
+idle floppy slot). Internal steps are just 3-4% of ticks — the CPU's time
+is essentially all bus cycles. Confirms: cut ticks-per-access or nothing.
+(Caveat for A/B: this run predates the classifier fix, so 32-bit
+$50Fxxxxx I/O/VRAM aliases count as "other" here.)

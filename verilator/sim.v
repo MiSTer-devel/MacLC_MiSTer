@@ -235,6 +235,7 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
+	wire flp_guard;
 	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
@@ -254,39 +255,18 @@ module emu
 	wire [21:0] dskReadAddrExt;
 
 	// dtack generation for 16 MHz mode
-	reg  dtack_en, mem_latch_d, as_low_q;
+	// Phase C (branch cpu-enhancements): RAM/ROM/VRAM DTACK comes straight
+	// from the RAM model's demand handshake (ram_cpu_done) — the old
+	// slot-aligned grant is gone. dtack_en now serves ONLY the immediate
+	// peripheral/unmapped path. Mirror of MacLC.sv — keep both tops identical.
+	reg  dtack_en;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
-			as_low_q <= 0;
 		end
 		else begin
-			// mem_latch_d = registered memoryLatch: high at busPhase 0, i.e. the
-			// START of each busCycle. (cpuBusControl & mem_latch_d) therefore
-			// strobes once at the start of EVERY cpu slot.
-			mem_latch_d <= memoryLatch;
-			// as_low_q = AS was low through the PREVIOUS tick. The mem-slot
-			// grant requires it: the SDRAM controller samples oe/we at the
-			// slot's first clk_64 edge, so a slot may only be granted if
-			// AS/addr/oe were already stable when that edge fired. The Phase-B
-			// bus FSM (branch cpu-enhancements) asserts AS on ANY tick, so an
-			// AS landing exactly on a slot boundary must wait for the next
-			// slot instead of being granted a slot whose read command never
-			// issued (= stale-dout serve). Mirror of MacLC.sv — keep both
-			// tops identical.
-			as_low_q <= !_cpuAS;
 			if (_cpuAS) dtack_en <= 0;
-			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
-			// so it must take the slot-aligned DTACK path (a cpu-slot start),
-			// NOT the immediate !ROM&!RAM peripheral path. Excluding selectVRAM
-			// here stops DTACK asserting before the SDRAM cpu-slot commits the
-			// read/write (was truncating longword writes / sampling stale data).
-			// H1: this was `!cpuBusControl_d & cpuBusControl` (rising edge), which
-			// gave each ISOLATED cpu slot one DTACK opportunity. With slot 00 now
-			// also a cpu slot the three slots are contiguous (one rising edge per
-			// round), so we strobe at each cpu-slot start instead — same busPhase-0
-			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
-			if (!_cpuAS & ((cpuBusControl & mem_latch_d & as_low_q) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			if (!_cpuAS & !selectROM & !selectRAM & !selectVRAM) dtack_en <= 1;
 		end
 	end
 
@@ -368,7 +348,10 @@ module emu
 	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
-	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+	                        // Phase C: SDRAM-backed targets ack via the demand
+	                        // handshake — mirror of MacLC.sv, keep identical
+	                        (!_cpuAS && (selectRAM || selectROM || selectVRAM)) ? ~ram_cpu_done :
+	                        (~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en);
 
 	// Programmer's switch / Level-7 NMI — mirror of MacLC.sv (there the trigger is
 	// the "R5" OSD button status[5]; in sim it is the nmi_pulse input driven by
@@ -596,6 +579,8 @@ module emu
 		._ramWE(_ramWE),
 		.dioBusControl(dioBusControl),
 		.cpuBusControl(cpuBusControl),
+		.flp_guard(flp_guard),
+		.cpu_wr_ack(ram_cpu_done),
 		.selectSCSI(selectSCSI),
 		.selectSCSIDMA(selectSCSIDMA),
 		.selectSCC(selectSCC),
@@ -1118,14 +1103,17 @@ module emu
 	wire        ram_we   = download_cycle ? 1'b1                  : !_ramWE;
 	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
 	wire [15:0] ram_do_raw;
+	wire        ram_cpu_done;
+	wire [15:0] ram_cpu_dout;
 	// --- Force cold-boot path (warm-reset hang workaround) — keep in sync with MacLC.sv.
 	// Patch the boot ROM's warm-vs-cold `bne.w` at ROM byte $4655E (SDRAM word
 	// $52322F) to UNCONDITIONAL (0x6600 -> 0x6000) as it is fetched, so every boot
 	// runs the full cold RAM march. No-op on a cold boot (branch already taken);
 	// guarded on the address AND opcode so other ROMs are untouched.
-	wire [15:0] ram_do_patched =
-		(!_romOE && memoryAddr == 23'h52322F && ram_do_raw == 16'h6600) ? 16'h6000 : ram_do_raw;
-	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_patched;
+	// Phase C: the patch applies to the CPU's private read register (cpu_dout).
+	wire [15:0] cpu_dout_patched =
+		(!_romOE && memoryAddr == 23'h52322F && ram_cpu_dout == 16'h6600) ? 16'h6000 : ram_cpu_dout;
+	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : cpu_dout_patched;
 	// Disk byte-parity select: must be dskReadAddr[0], NOT memoryAddr[0] (which
 	// is dskReadAddr[1] after the >>1 word conversion drops bit 0). See the long
 	// note at the matching demux in MacLC.sv — the old bit selected the wrong
@@ -1144,6 +1132,14 @@ module emu
 		.we             ( ram_we      ),
 		.oe             ( ram_oe      ),
 		.dout           ( ram_do_raw  ),
+
+		// Phase C demand-start handshake (latency-matched to rtl/sdram.v).
+		// !dio_download mirrors MacLC.sv: floppy windows + guard pause during
+		// downloads so dio writes can't be starved (see the note there).
+		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
+		.flp_guard      ( flp_guard && !dio_download ),
+		.cpu_done       ( ram_cpu_done ),
+		.cpu_dout       ( ram_cpu_dout ),
 		.frame_count    ( sim_frame_count )
 	);
 

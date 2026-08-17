@@ -12,11 +12,20 @@ module sim_ram
 	input               reset,      // reset signal
 
 	input [15:0]        din,        // data input from chipset/cpu
-	output reg [15:0]   dout,       // data output to chipset/cpu
+	output reg [15:0]   dout,       // data output to chipset/cpu (floppy windows)
 	input [24:0]        addr,       // 25 bit word address
 	input [1:0]         ds,         // upper/lower data strobe
 	input               oe,         // cpu/chipset requests read
 	input               we,         // cpu/chipset requests write
+
+	// Phase C demand-start handshake — mirrors rtl/sdram.v with matched
+	// latency: reads assert cpu_done (+cpu_dout) two clk edges after the
+	// request is seen, writes post at the first edge. Keep the latencies in
+	// sync with the FPGA controller or the sim measures fiction.
+	input               flp_win,
+	input               flp_guard,
+	output reg          cpu_done,
+	output reg [15:0]   cpu_dout,
 
 	input [31:0]        frame_count // frame counter for debug logging
 );
@@ -30,9 +39,19 @@ reg [15:0] mem [0:8388607];  // 8M words = 16MB
 integer wr_count = 0;
 integer rom_rd_count = 0;
 
+reg        req_d;         // read request seen last edge (models ACTIVE->done)
+reg [24:0] served_addr;   // write re-arm on address change (download bursts)
+wire cpu_req  = (oe || we) && !flp_win && !flp_guard;
+wire wr_rearm = we && (addr != served_addr);
+
 always @(posedge clk) begin
-	// Writes are allowed even during reset (needed for ROM loading)
-	if (we && |ds) begin
+	// Writes are allowed even during reset (needed for ROM loading).
+	// !flp_win: with the Phase-C un-slotted _ramWE a pending CPU write's
+	// `we` can be high during a floppy fetch window while `addr` is the
+	// FLOPPY image address — committing then would corrupt the disk image.
+	// (The FPGA controller is safe by construction: flp accesses force
+	// we_latch=0 and CPU starts are blocked during windows.)
+	if (we && |ds && !flp_win) begin
 		if (ds[1]) mem[addr[22:0]][15:8] <= din[15:8];
 		if (ds[0]) mem[addr[22:0]][7:0]  <= din[7:0];
 		wr_count <= wr_count + 1;
@@ -44,11 +63,35 @@ always @(posedge clk) begin
 		`endif
 	end
 
+	// floppy-window read serve (legacy dout path and timing)
+	if (flp_win && oe) dout <= mem[addr[22:0]];
+
+	// demand handshake
+	if (reset) begin
+		cpu_done <= 0;
+		req_d    <= 0;
+	end else if (!(oe || we)) begin
+		cpu_done <= 0;         // AS released / request withdrawn
+		req_d    <= 0;
+	end else if (cpu_req && (!cpu_done || wr_rearm)) begin
+		if (we) begin
+			cpu_done    <= 1;  // posted write (commit is the block above)
+			served_addr <= addr;
+			req_d       <= 0;
+		end else begin
+			req_d <= 1;
+			if (req_d) begin
+				cpu_dout    <= mem[addr[22:0]];
+				cpu_done    <= 1;
+				served_addr <= addr;
+			end
+		end
+	end
+
 	if (reset) begin
 		rom_rd_count <= 0;
 	end else begin
-		if (oe) begin
-			dout <= mem[addr[22:0]];
+		if (oe && req_d && !cpu_done) begin
 			// Log first 20 ROM reads only
 			if (addr[22:0] >= 23'h500000 && addr[22:0] < 23'h540000 && rom_rd_count < 20) begin
 				$display("[F%0d] sim_ram RD_ROM[%0d]: addr=%h dout=%h",

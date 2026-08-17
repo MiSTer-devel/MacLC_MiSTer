@@ -325,8 +325,14 @@ module dataController_top(
 		3'b111;                     // No interrupt
 		
 
-	reg [15:0] cpu_data;
-	always @(posedge clk32) if (cpuBusControl && memoryLatch) cpu_data <= memoryDataIn;
+	// Phase C (branch cpu-enhancements): the memory leg of the CPU read mux
+	// passes memoryDataIn straight through. Upstream it is the SDRAM
+	// controller's held cpu_dout register (captured once per demand access,
+	// stable from capture until AS release), so the old slot-tick sample
+	// (`cpu_data <= memoryDataIn` at cpuBusControl && memoryLatch, passthrough
+	// on that one tick) is no longer needed — and would be wrong: a demand
+	// access is not slot-aligned, so the CPU FSM's din_r latch tick need not
+	// coincide with a cpu-slot memoryLatch tick.
 
 	// CPU-side data output mux
     wire [15:0] viaDataOut_full = viaDataOut;
@@ -356,7 +362,7 @@ module dataController_top(
                         // conventional "open bus" value that the probe's
                         // write-pattern/read-mismatch check correctly rejects.
                         selectUnmapped ? 16'hFFFF :
-                        (cpuBusControl && memoryLatch) ? memoryDataIn : cpu_data;
+                        memoryDataIn;
 
 
     always @(posedge clk32) begin

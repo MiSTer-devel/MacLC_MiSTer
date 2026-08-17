@@ -38,11 +38,30 @@ module sdram
 	input               clk_8,      // 8MHz chipset clock to which sdram state machine is synchonized
 
 	input [15:0]        din,        // data input from chipset/cpu
-	output reg [15:0]   dout,       // data output to chipset/cpu
+	output reg [15:0]   dout,       // data output to chipset/cpu (floppy-window reads)
 	input [23:0]        addr,       // 24 bit word address
 	input [1:0]         ds,         // upper/lower data strobe
 	input               oe,         // cpu/chipset requests read
-	input               we          // cpu/chipset requests write
+	input               we,         // cpu/chipset requests write
+
+	// ── demand-start CPU service (Phase C, branch cpu-enhancements) ────────
+	// oe/we + addr/din/ds form a LEVEL request (held while _cpuAS is low, or
+	// while a download write is presented). The sequencer starts an access at
+	// the next clk_64 edge instead of waiting for a bus-slot boundary; that
+	// removes the mod-4 slot quantization that pinned every CPU memory access
+	// to >=8 clk_sys (docs/CPU_Perf_Log.md).
+	input               flp_win,    // floppy fetch window (old slot timing, pending-gated
+	                                // in addrController): serve `addr` into `dout`, priority
+	input               flp_guard,  // a pending floppy window opens soon: don't START a
+	                                // CPU access that would still occupy the chip then
+	output reg          cpu_done,   // request served: read data will be stable in cpu_dout
+	                                // before a consumer sampling done can latch it 2 ticks
+	                                // later (early-done: set at ACTIVE+3 clk_64, capture at
+	                                // ACTIVE+6); for writes set at ACTIVE (posted). Holds
+	                                // until the request level drops (AS release), so the
+	                                // CPU glue can use it as an async DTACK directly.
+	output reg [15:0]   cpu_dout    // held CPU read data (private register: floppy-window
+	                                // reads land in `dout` and can no longer clobber it)
 );
 
 localparam RASCAS_DELAY   = 3'd2;   // tRCD=20ns -> 3 cycles@128MHz
@@ -127,11 +146,57 @@ assign sd_dqm = sd_addr[12:11];
 
 reg oe_latch, we_latch;
 
+// ── Demand sequencer state (Phase C, branch cpu-enhancements) ────────────
+// One access = the same 8-clk_64 command schedule the old slot machine used
+// (ACTIVE at start, READ/WRITE+auto-precharge at STATE_CMD_CONT, capture at
+// STATE_READ with its empirically-margined +2) — only the START is now any
+// idle clk_64 edge instead of a bus-slot boundary. Floppy windows (flp_win)
+// take priority and still run slot-aligned by construction (the window IS
+// the old slot), so floppy.v and its fetch-freshness protocol see identical
+// timing. Refresh is explicit now that idle slots no longer auto-refresh:
+// tREF needs one AUTO_REFRESH per 7.8 us (~508 clk_64); opportunistic when
+// idle past REF_OPP, request-blocking past REF_FORCE. (The old design
+// refreshed every idle slot — orders of magnitude more than required.)
+reg [2:0]  seq;          // position within a running access (1..7; ACTIVE at start)
+reg        seq_busy;
+reg        src_cpu;      // running access belongs to the CPU/download (vs floppy)
+// Request values frozen at ACTIVE: the download path's din/ds/addr muxes are
+// gated on dioBusControl (a 4-tick window), so an access that starts late —
+// e.g. delayed behind a refresh — could otherwise see them flip mid-access.
+reg [15:0] din_q;
+reg [1:0]  ds_q;
+reg [8:0]  col_q;        // {addr[22], addr[7:0]} for the CAS phase
+reg        flp_served;   // this floppy window already got its access
+reg        ref_busy;
+reg [2:0]  ref_cnt;
+reg [9:0]  ref_due;      // clk_64 ticks since last refresh (saturating)
+reg [23:0] served_addr;  // write re-arm: a held `we` with a new address (download
+                         // bursts) is a new request; same-address repeats are not
+localparam REF_OPP   = 10'd300;  // idle refresh threshold
+localparam REF_FORCE = 10'd480;  // block new CPU starts, refresh first
+
+wire cpu_rearm = we && (addr != served_addr);
+wire req_flp   = flp_win && !flp_served;
+// t[0] parity gate: only start CPU accesses on clk_64 edges that coincide
+// with a clk_sys edge (the free-running ladder counter t wraps at the clk_8
+// boundary, so an edge evaluating an ODD t begins an even-t period = an
+// integer clk_sys tick). This pins the STATE_READ capture edge to a clk_sys
+// boundary, so cpu_dout -> clk_sys consumer paths are timed at a full
+// 30.8 ns period by STA — no cross-clock multicycle, no half-period races.
+// Costs at most one clk_64 of start latency.
+wire req_cpu   = (oe || we) && !flp_win && !flp_guard && t[0]
+                 && (!cpu_done || cpu_rearm) && (ref_due < REF_FORCE);
+
 always @(posedge clk_64) begin
 	sd_cmd <= CMD_INHIBIT;  // default: idle
 	sd_data <= 16'bZZZZZZZZZZZZZZZZ;
 
 	if(reset != 0) begin
+		seq_busy   <= 0;
+		ref_busy   <= 0;
+		ref_due    <= 0;
+		cpu_done   <= 0;
+		flp_served <= 0;
 		// init ladder, one command slot per chipset cycle (~123ns apart):
 		// 1023..65 = NOP wait, 64 = PRECHARGE ALL, 56/52/../28 = 8x AUTO
 		// REFRESH, 2 = LOAD MODE. tRP/tRFC/tMRD are all satisfied by orders
@@ -153,35 +218,71 @@ always @(posedge clk_64) begin
 
 		end
 	end else begin
-		// normal operation
+		// normal operation (demand-start)
 
-		// RAS phase
-		// -------------------  cpu/chipset read/write ----------------------
-		if(t == STATE_CMD_START) begin
-			{oe_latch, we_latch} <= {oe, we};
-			if (we || oe) begin
-				sd_cmd <= CMD_ACTIVE;
-				sd_addr <= { 1'b0, addr[19:8] };
-				sd_ba <= addr[21:20];
+		// request-level bookkeeping
+		if (!(oe || we)) cpu_done <= 0;    // AS released / request withdrawn
+		if (!flp_win)    flp_served <= 0;
+		if (ref_due != 10'h3FF) ref_due <= ref_due + 10'd1;
+
+		if (seq_busy) begin
+			seq <= seq + 3'd1;
+			// CAS phase (auto-precharge), from the values frozen at ACTIVE
+			if (seq == STATE_CMD_CONT) begin
+				sd_cmd <= we_latch ? CMD_WRITE : CMD_READ;
+				if (we_latch) sd_data <= din_q;
+				// always return both bytes in a read. The cpu may not
+				// need it, but the caches need to be able to store everything
+				sd_addr <= { we_latch ? ~ds_q : 2'b00, 2'b10, col_q };  // auto precharge
 			end
-		// ------------------------ no access --------------------------
-			else begin
-				sd_cmd <= CMD_AUTO_REFRESH;
+			// early-done for CPU reads: 3 clk_64 (1.5 clk_sys) before capture.
+			// The CPU bus FSM samples done, then latches din TWO clk_sys ticks
+			// later (S_WAIT exit -> S_TAIL2), so cpu_dout is stable a full
+			// clk_sys tick before the consumer's latch edge. Do not move done
+			// earlier than STATE_CMD_CONT+1 without redoing that arithmetic.
+			if (seq == STATE_CMD_CONT + 3'd1 && src_cpu && oe_latch) cpu_done <= 1;
+			// Data ready
+			if (seq == STATE_READ) begin
+				if (src_cpu) begin
+					if (oe_latch) cpu_dout <= sd_data;
+				end else begin
+					dout <= sd_data;   // floppy-window data (legacy consumer path)
+				end
 			end
+			if (seq == 3'd7) seq_busy <= 0;
+		end else if (ref_busy) begin
+			ref_cnt <= ref_cnt + 3'd1;
+			if (ref_cnt == 3'd4) ref_busy <= 0;   // 5 clk_64 = 77 ns > tRFC
+		end else if (req_flp || req_cpu) begin
+			sd_cmd  <= CMD_ACTIVE;
+			sd_addr <= { 1'b0, addr[19:8] };
+			sd_ba   <= addr[21:20];
+			din_q   <= din;
+			ds_q    <= ds;
+			col_q   <= { addr[22], addr[7:0] };
+			seq      <= 3'd1;
+			seq_busy <= 1;
+			src_cpu  <= !req_flp;
+			we_latch <= req_flp ? 1'b0 : we;
+			oe_latch <= req_flp ? 1'b1 : oe;
+			if (req_flp) begin
+				flp_served <= 1;
+			end else begin
+				served_addr <= addr;
+				if (we) cpu_done <= 1;   // posted write: ack at ACTIVE; din/ds
+				                         // stay valid (AS held) through CAS
+			end
+		end else if (ref_due >= REF_OPP && !flp_guard && !flp_win) begin
+			// !flp_guard/!flp_win: a refresh started just before a floppy
+			// window would push the window's capture past its end — floppy.v
+			// latches on its own (post-window) enables and would read stale
+			// data. The guard zone gives refresh a hard keep-out; plenty of
+			// other idle edges exist (tREF needs one refresh per ~508 clk_64).
+			sd_cmd   <= CMD_AUTO_REFRESH;
+			ref_busy <= 1;
+			ref_cnt  <= 0;
+			ref_due  <= 0;
 		end
-
-		// CAS phase 
-		if(t == STATE_CMD_CONT && (we_latch || oe_latch)) begin
-			sd_cmd <= we_latch?CMD_WRITE:CMD_READ;
-			if (we_latch) sd_data <= din;
-			// always return both bytes in a read. The cpu may not
-			// need it, but the caches need to be able to store everything
-			sd_addr <= { we_latch ? ~ds : 2'b00, 2'b10, addr[22], addr[7:0] };  // auto precharge
-		end
-
-		// Data ready
-		if (t == STATE_READ && oe_latch) dout <= sd_data;
-
 	end
 end
 

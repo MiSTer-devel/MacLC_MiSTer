@@ -907,6 +907,7 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
+	wire flp_guard;
 	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
@@ -934,41 +935,20 @@ module emu
 	wire [21:0] dskReadAddrExt;
 
 	// dtack generation for 16 MHz mode
-	reg  dtack_en, mem_latch_d, as_low_q;
+	// Phase C (branch cpu-enhancements): RAM/ROM/VRAM DTACK comes straight
+	// from the SDRAM controller's demand handshake (sdram_cpu_done) — the
+	// old slot-aligned grant (cpuBusControl & mem_latch_d strobe at each
+	// cpu-slot start) is gone, and with it the mod-4 quantization that
+	// pinned every memory access to >=8 clk_sys. dtack_en now serves ONLY
+	// the immediate peripheral/unmapped path (never SDRAM-backed targets).
+	reg  dtack_en;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
-			as_low_q <= 0;
 		end
 		else begin
-			// mem_latch_d = registered memoryLatch: high at busPhase 0, i.e. the
-			// START of each busCycle. (cpuBusControl & mem_latch_d) therefore
-			// strobes once at the start of EVERY cpu slot.
-			mem_latch_d <= memoryLatch;
-			// as_low_q = AS was low through the PREVIOUS tick. The mem-slot
-			// grant requires it: the SDRAM controller samples oe/we at the
-			// slot's first clk_64 edge (~8 ns into the busPhase-0 tick), so a
-			// slot may only be granted if AS/addr/oe were already stable when
-			// that edge fired. The old bus FSM asserted AS only at phi1 ticks
-			// (busPhase 1/3 boundaries), which made this impossible to
-			// violate; the Phase-B FSM (branch cpu-enhancements) asserts AS on
-			// ANY tick, so an AS landing exactly on a slot boundary must wait
-			// for the next slot instead of being granted a slot whose read
-			// command never issued (= stale-dout serve, the fill-capture
-			// hazard class).
-			as_low_q <= !_cpuAS;
 			if (_cpuAS) dtack_en <= 0;
-			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
-			// so it must take the slot-aligned DTACK path (a cpu-slot start),
-			// NOT the immediate !ROM&!RAM peripheral path. Excluding selectVRAM
-			// here stops DTACK asserting before the SDRAM cpu-slot commits the
-			// read/write (was truncating longword writes / sampling stale data).
-			// H1: this was `!cpuBusControl_d & cpuBusControl` (rising edge), which
-			// gave each ISOLATED cpu slot one DTACK opportunity. With slot 00 now
-			// also a cpu slot the three slots are contiguous (one rising edge per
-			// round), so we strobe at each cpu-slot start instead — same busPhase-0
-			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
-			if (!_cpuAS & ((cpuBusControl & mem_latch_d & as_low_q) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			if (!_cpuAS & !selectROM & !selectRAM & !selectVRAM) dtack_en <= 1;
 		end
 	end
 
@@ -1104,7 +1084,13 @@ module emu
 	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
-	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+	                        // Phase C: SDRAM-backed targets ack via the demand
+	                        // handshake (early-done: data is in cpu_dout before
+	                        // the FSM's exit+2 din_r latch; writes post at ACTIVE)
+	                        (!_cpuAS && (selectRAM || selectROM || selectVRAM)) ? ~sdram_cpu_done :
+	                        // $Fxxxxx VPA peripherals stay un-acked here (E/VMA
+	                        // paced); everything else non-mem = immediate ack
+	                        (~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en);
 
 	// ── Programmer's switch / Level-7 NMI (debug aid) ───────────────────────────
 	// An OSD button (status[5], the "R5" momentary trigger) fires a non-maskable
@@ -1302,6 +1288,8 @@ module emu
 		._ramWE(_ramWE),
 		.dioBusControl(dioBusControl),
 		.cpuBusControl(cpuBusControl),
+		.flp_guard(flp_guard),
+		.cpu_wr_ack(sdram_cpu_done),
 		.selectSCSI(selectSCSI),
 		.selectSCSIDMA(selectSCSIDMA),
 		.selectSCC(selectSCC),
@@ -2427,9 +2415,13 @@ module emu
 	                                          !_ramWE;
 	wire        sdram_oe   = download_cycle ? 1'b0 :
 	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
+	// Phase C: CPU reads come from the SDRAM controller's held cpu_dout
+	// register (captured once per demand access), not the shared slot-domain
+	// dout — floppy windows can no longer clobber CPU read data, and the
+	// value stays valid through the CPU FSM's late din_r latch.
 	wire [15:0] sdram_do   = download_cycle ? 16'hffff :
 	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
-	                                                            sdram_out_patched;
+	                                                            cpu_dout_patched;
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
@@ -2461,8 +2453,12 @@ module emu
 	// untouched; catches both overlay and direct-ROM fetches (both selectROM->$52322F).
 	// Replaces the reverted sdram.init warm-reset hacks (d88c098 / 50d0c32), which
 	// broke cold boot. Keep in sync with verilator/sim.v.
-	wire [15:0] sdram_out_patched =
-		(!_romOE && memoryAddr == 23'h52322F && sdram_out == 16'h6600) ? 16'h6000 : sdram_out;
+	// Phase C: the patch applies to the CPU's private read register (cpu_dout);
+	// memoryAddr is still the live CPU translation while AS is held low.
+	wire [15:0] sdram_cpu_dout;
+	wire        sdram_cpu_done;
+	wire [15:0] cpu_dout_patched =
+		(!_romOE && memoryAddr == 23'h52322F && sdram_cpu_dout == 16'h6600) ? 16'h6000 : sdram_cpu_dout;
 
 	assign SDRAM_CKE = 1;
 
@@ -2518,7 +2514,20 @@ module emu
 		.ds             ( sdram_ds                 ),
 		.we             ( sdram_we                 ),
 		.oe             ( sdram_oe                 ),
-		.dout           ( sdram_out                )
+		.dout           ( sdram_out                ),
+
+		// Phase C demand-start service (branch cpu-enhancements).
+		// !dio_download on both: during a download, dio writes are only
+		// PRESENTED during dioBusControl ticks — the very ticks floppy
+		// windows claim — and the guard zone covers them, so a pending
+		// floppy fetch would deadlock the HPS download (ioctl_wait never
+		// clears). The old slot machine equivalently served dio in slot 2
+		// during downloads (oe forced 0). Floppy pending state persists and
+		// is served after the download.
+		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
+		.flp_guard      ( flp_guard && !dio_download ),
+		.cpu_done       ( sdram_cpu_done           ),
+		.cpu_dout       ( sdram_cpu_dout           )
 	);
 
 endmodule
