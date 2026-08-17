@@ -224,6 +224,105 @@ end
 	end
 	wire berr_held = berr | berr_hold;
 
+`ifdef SIMULATION
+	// ── Step-0 bus-cycle histogram (branch cpu-enhancements) ─────────────────
+	// Measures clk (clk_sys) ticks per completed bus cycle — the clkena-to-
+	// clkena period — binned by busstate and a coarse target class, plus the
+	// count of internal (busstate==01) kernel steps. Dumped to bus_hist.log
+	// once per simulated second (32.5M ticks); counters reset each window.
+	// Parse with scripts/bus_hist_report.py. Sim-only: invisible to Quartus.
+	integer bh_file;
+	integer bh_len;
+	integer bh_hist [0:2][0:5][0:63];
+	integer bh_ticksum [0:2][0:5];
+	reg        bh_active;
+	reg [1:0]  bh_bs;
+	reg [2:0]  bh_cls;
+	reg        bh_sawvma;
+	integer bh_ticks, bh_busy, bh_int_clkena, bh_win;
+	integer bh_i, bh_j, bh_k;
+	initial begin
+		bh_file = $fopen("bus_hist.log", "w");
+		bh_active = 0; bh_len = 0; bh_ticks = 0; bh_busy = 0;
+		bh_int_clkena = 0; bh_win = 0;
+		for (bh_i = 0; bh_i < 3; bh_i = bh_i + 1) begin
+			for (bh_j = 0; bh_j < 6; bh_j = bh_j + 1) begin
+				bh_ticksum[bh_i][bh_j] = 0;
+				for (bh_k = 0; bh_k < 64; bh_k = bh_k + 1)
+					bh_hist[bh_i][bh_j][bh_k] = 0;
+			end
+		end
+	end
+	// Coarse target class from the kernel address (stable across the cycle):
+	// 0=RAM ($0-$9FFFFF; includes overlay-ROM reads during early boot)
+	// 1=ROM ($Axxxxx)  2=VRAM ($F40000-$FBFFFF)  3=VPA peripheral
+	// 4=DTACK I/O in $Fxxxxx (SCSI pseudo-DMA / unmapped)  5=other/32-bit
+	// NB: high address bits DON'T route to class 5 wholesale — the ROM drives
+	// I/O through 32-bit aliases ($50Fxxxxx) that the V8 serves via 24-bit
+	// truncation. Only NuBus/PDS slot space ($F1-$FE) is genuinely separate.
+	wire [2:0] bh_class_w =
+		((tg68_addr[31:24] >= 8'hF1) &&
+		 (tg68_addr[31:24] <= 8'hFE)) ? 3'd5 :
+		(tg68_addr[23:20] == 4'hA)  ? 3'd1 :
+		(tg68_addr[23:20] <  4'hA)  ? 3'd0 :
+		(tg68_addr[23:20] == 4'hF)  ? (((tg68_addr[19:18] == 2'b01) ||
+		                                (tg68_addr[19:18] == 2'b10)) ? 3'd2 : 3'd3) :
+		                              3'd5;
+	always @(posedge clk) begin
+		if (!reset) begin
+			bh_ticks = bh_ticks + 1;
+			if (bh_active) begin
+				bh_len  = bh_len + 1;
+				bh_busy = bh_busy + 1;
+				if (!rVma) bh_sawvma = 1;
+			end
+			if (phi1 && tg68_busstate == 2'b01) bh_int_clkena = bh_int_clkena + 1;
+			// cycle END: the kernel-clocking edge (s_state 7 at phi1)
+			if (bh_active && phi1 && s_state == 3'd7) begin
+				bh_i = (bh_bs == 2'b00) ? 0 : ((bh_bs == 2'b10) ? 1 : 2);
+				bh_j = ((bh_cls == 3'd3) && !bh_sawvma) ? 4 : {29'd0, bh_cls};
+				bh_k = (bh_len > 63) ? 63 : bh_len;
+				bh_hist[bh_i][bh_j][bh_k] = bh_hist[bh_i][bh_j][bh_k] + 1;
+				bh_ticksum[bh_i][bh_j] = bh_ticksum[bh_i][bh_j] + bh_len;
+				bh_active = 0;
+			end
+			// cycle START: the edge that moves s_state 0 -> 1 (phi2, non-internal)
+			if (!bh_active && phi2 && s_state == 3'd0 && tg68_busstate != 2'b01
+			    && !(busreq_ack || bus_granted)) begin
+				bh_active = 1;
+				bh_len    = 1;
+				bh_sawvma = 0;
+				bh_bs     = tg68_busstate;
+				bh_cls    = bh_class_w;
+			end
+			// window dump: once per simulated second
+			if (bh_ticks >= 32500000) begin
+				$fwrite(bh_file, "WINDOW %0d ticks=%0d busy=%0d int_clkena=%0d\n",
+				        bh_win, bh_ticks, bh_busy, bh_int_clkena);
+				for (bh_i = 0; bh_i < 3; bh_i = bh_i + 1) begin
+					for (bh_j = 0; bh_j < 6; bh_j = bh_j + 1) begin
+						if (bh_ticksum[bh_i][bh_j] != 0) begin
+							$fwrite(bh_file, "T %0d %0d %0d\n",
+							        bh_i, bh_j, bh_ticksum[bh_i][bh_j]);
+							bh_ticksum[bh_i][bh_j] = 0;
+						end
+						for (bh_k = 0; bh_k < 64; bh_k = bh_k + 1) begin
+							if (bh_hist[bh_i][bh_j][bh_k] != 0) begin
+								$fwrite(bh_file, "H %0d %0d %0d %0d\n",
+								        bh_i, bh_j, bh_k, bh_hist[bh_i][bh_j][bh_k]);
+								bh_hist[bh_i][bh_j][bh_k] = 0;
+							end
+						end
+					end
+				end
+				$fflush(bh_file);
+				bh_ticks = 0; bh_busy = 0; bh_int_clkena = 0;
+				bh_win = bh_win + 1;
+			end
+		end
+	end
+`endif
+
 	TG68KdotC_Kernel tg68k (
 		.clk            ( clk           ),
 		.nReset         ( ~reset        ),
