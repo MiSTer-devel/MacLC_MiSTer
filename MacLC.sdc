@@ -58,6 +58,25 @@ set_multicycle_path -setup -end 2 -to [get_keepers {*periph_din_reg*}]
 set_multicycle_path -hold  -end 1 -to [get_keepers {*periph_din_reg*}]
 
 # ----------------------------------------------------------------------------
+# Phase C: clk_sys -> SDRAM demand sequencer (clk_mem) request paths.
+# ----------------------------------------------------------------------------
+# The demand sequencer (rtl/sdram.v) consumes clk_sys-domain request data
+# (addr through the V8 translation adders, din/ds, oe/we, the served_addr
+# rearm compare) only at clk_64 edges that COINCIDE with a clk_sys edge:
+# CPU starts are gated on t[0] parity (see req_cpu), and floppy/download
+# windows are slot-aligned with their values held for multiple ticks. So the
+# launched data is always >= 1 full clk_sys period (2 clk_64 periods, 30.8ns)
+# old when the capturing edge fires — the worst-case single-period pairing
+# STA assumes (15.4ns) cannot occur by construction. Credit 2 destination
+# periods. Scope: only clk_sys-launched paths INTO the sdram instance; the
+# sequencer's clk_64-internal paths and the return direction (cpu_done /
+# cpu_dout into clk_sys consumers) stay single-cycle.
+# (Without this the fit hovers at ~0ns and flips sign on netlist deltas —
+# the 2026-08-17 -0.208ns fail was the V8 translation cone into sd_addr.)
+set_multicycle_path -setup -end 2 -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[1].gpll~PLL_OUTPUT_COUNTER|divclk}] -to [get_keepers {emu|sdram|*}]
+set_multicycle_path -hold  -end 1 -from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[1].gpll~PLL_OUTPUT_COUNTER|divclk}] -to [get_keepers {emu|sdram|*}]
+
+# ----------------------------------------------------------------------------
 # Pixel-clock domain (pll_video) CDC — false-path the 2FF synchronizer heads.
 # ----------------------------------------------------------------------------
 # The V8 scanout runs on clk_vid (pll_video, reconfigured 25.175/15.664/58.742
