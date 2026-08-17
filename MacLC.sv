@@ -934,16 +934,29 @@ module emu
 	wire [21:0] dskReadAddrExt;
 
 	// dtack generation for 16 MHz mode
-	reg  dtack_en, mem_latch_d;
+	reg  dtack_en, mem_latch_d, as_low_q;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
+			as_low_q <= 0;
 		end
 		else begin
 			// mem_latch_d = registered memoryLatch: high at busPhase 0, i.e. the
 			// START of each busCycle. (cpuBusControl & mem_latch_d) therefore
 			// strobes once at the start of EVERY cpu slot.
 			mem_latch_d <= memoryLatch;
+			// as_low_q = AS was low through the PREVIOUS tick. The mem-slot
+			// grant requires it: the SDRAM controller samples oe/we at the
+			// slot's first clk_64 edge (~8 ns into the busPhase-0 tick), so a
+			// slot may only be granted if AS/addr/oe were already stable when
+			// that edge fired. The old bus FSM asserted AS only at phi1 ticks
+			// (busPhase 1/3 boundaries), which made this impossible to
+			// violate; the Phase-B FSM (branch cpu-enhancements) asserts AS on
+			// ANY tick, so an AS landing exactly on a slot boundary must wait
+			// for the next slot instead of being granted a slot whose read
+			// command never issued (= stale-dout serve, the fill-capture
+			// hazard class).
+			as_low_q <= !_cpuAS;
 			if (_cpuAS) dtack_en <= 0;
 			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
 			// so it must take the slot-aligned DTACK path (a cpu-slot start),
@@ -955,7 +968,7 @@ module emu
 			// also a cpu slot the three slots are contiguous (one rising edge per
 			// round), so we strobe at each cpu-slot start instead — same busPhase-0
 			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
-			if (!_cpuAS & ((cpuBusControl & mem_latch_d) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			if (!_cpuAS & ((cpuBusControl & mem_latch_d & as_low_q) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
 		end
 	end
 
@@ -1177,10 +1190,10 @@ module emu
 	// 6800-style VPA cycle — NOT the async-DTACK path RAM/ROM/VRAM use. (Verified:
 	// for this region _cpuDTACK is held DEASSERTED above and _cpuVPA asserted, so the
 	// CPU is paced by VMA/E, never by dtack_en.) The VPA cycle is E-paced (E≈812kHz
-	// ⇒ ~40 clk_sys per E period) and the kernel latches read data LATE: at s_state 6,
-	// only after stalling at s_state 4 for xVma (= eCntr==8, one tick before E-fall —
-	// rtl/tg68k/tg68k.v:107,115,135). So from address/select settle (AS at s_state 1)
-	// to the data sample is ALWAYS ≥5 clk_sys.
+	// ⇒ ~40 clk_sys per E period) and the kernel latches read data LATE: at S_TAIL2,
+	// only after stalling at S_WAIT for the E-paced (phi2 && xVma) exit (= eCntr==8,
+	// one tick before E-fall — rtl/tg68k/tg68k.v). So from address/select settle
+	// (AS at S_WAIT entry) to the data sample is ALWAYS ≥5 clk_sys.
 	//
 	// The bit that makes this read fit-sensitive is CSR bit6 / scsi_bsy — the deepest
 	// cone in the whole read mux: scsi.v phase reg → bsy=(phase!=IDLE) → |target_bsy

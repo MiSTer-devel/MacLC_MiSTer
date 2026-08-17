@@ -40,7 +40,24 @@ module tg68k (
 );
 
 wire  [1:0] tg68_busstate;
-wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01);
+
+// Bus FSM states (machine itself is below; declared here so tg68_clkena can
+// reference them without forward references).
+localparam S_IDLE  = 3'd0,
+           S_WAIT  = 3'd1,
+           S_TAIL1 = 3'd2,
+           S_TAIL2 = 3'd3,
+           S_ENDC  = 3'd4;
+reg   [2:0] s_state;
+reg         clkena_d;   // tg68_clkena one tick ago (kernel-spacing gate)
+
+// clkena: once per bus cycle at S_ENDC, and every OTHER tick for internal
+// (busstate==01) kernel steps. The !clkena_d gate is what guarantees the
+// >=2-clk_sys spacing between consecutive kernel updates that the SDC
+// kernel-internal multicycle (MacLC.sdc) depends on — the old walker got the
+// same guarantee from clocking only at phi1. Do not remove it.
+wire        tg68_clkena = (s_state == S_ENDC) ||
+                          (s_state == S_IDLE && tg68_busstate == 2'b01 && !clkena_d);
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -65,62 +82,72 @@ assign      uds_n = uds_n_r;
 assign      lds_n = lds_n_r;
 assign      rw_n = rw_r;
 
-reg   [2:0] s_state;
+// ── Bus-cycle state machine (Phase B, branch cpu-enhancements) ─────────────
+// Replaces the classic 68000 8-state walker (one s_state step per clk tick,
+// AS at s1-phi1, DTACK sampled only at s4-phi2, latch s6-phi2, clkena
+// s7-phi1 — a fixed 8+ tick cycle). New shape:
+//   S_IDLE  — between cycles. Internal (busstate==01) kernel steps clock at
+//             every other tick via tg68_clkena's !clkena_d gate.
+//   S_WAIT  — AS+RW+UDS/LDS asserted at IDLE exit (the first edge after the
+//             kernel presents the access — either phi phase). Exit sampled
+//             EVERY tick: berr_held | !dtack_n | the E-paced (phi2 && xVma).
+//   S_TAIL1 — settle tick: slot-granted SDRAM data lands at the granting
+//             slot's busPhase-3 tick = exit+2, the same spacing the old
+//             s4→s6 walk provided. All async responders (SCSI DREQ, PDS ack)
+//             keep the identical exit→sample distance. Do not shorten.
+//   S_TAIL2 — tg68_din_r latches (a load-bearing STA register boundary: it
+//             keeps the SDRAM-mux→kernel-datapath cone out of a single
+//             period) and AS/strobes release at this tick's end — old s6.
+//   S_ENDC  — clkena; kernel steps at this tick's end — old s7.
+// Contracts preserved (see docs/CPU_Perf_Log.md): >=2-tick clkena spacing
+// (SDC kernel multicycle), din_r one full tick before clkena, VPA/E pacing
+// and tail identical to the old walker, berr_hold spans the cycle, E/VMA
+// block still keys on s_state != 0 (S_IDLE == 0).
+// Write strobes now assert WITH AS (old walker: s3, two ticks later). SDRAM
+// samples ds two clk_64 into the granting slot and VPA targets are E-paced,
+// so nothing observes the earlier assertion; gated by tb_scsi_pf + boot.
+// (State localparams + s_state/clkena_d declared above with tg68_clkena.)
+
+wire wait_exit = berr_held | ~dtack_n | (phi2 & xVma);
 
 always @(posedge clk) begin
 	if (reset) begin
-		s_state <= 0;
+		s_state <= S_IDLE;
 		as_n_r <= 1;
 		rw_r <= 1;
 		uds_n_r <= 1;
 		lds_n_r <= 1;
+		clkena_d <= 0;
 	end else begin
 		addr <= tg68_addr;
+		clkena_d <= tg68_clkena;
 
-		if (phi1) begin
-
-			if (s_state != 4) s_state <= s_state + 1'd1;
-			if (busreq_ack || bus_granted) s_state <= s_state;
-			if (tg68_busstate == 2'b01) s_state <= 0;
-
-			case (s_state)
-				1: if (tg68_busstate != 2'b01) begin
-					rw_r <= tg68_rw;
-					if (tg68_rw) begin
-						uds_n_r <= tg68_uds_n;
-						lds_n_r <= tg68_lds_n;
-					end
-					as_n_r <= 0;
+		case (s_state)
+			S_IDLE:
+				if (tg68_busstate != 2'b01 && !(busreq_ack || bus_granted)) begin
+					as_n_r  <= 0;
+					rw_r    <= tg68_rw;
+					uds_n_r <= tg68_uds_n;
+					lds_n_r <= tg68_lds_n;
+					s_state <= S_WAIT;
 				end
-				3: if (tg68_busstate != 2'b01) begin
-					if (!tg68_rw) begin
-						uds_n_r <= tg68_uds_n;
-						lds_n_r <= tg68_lds_n;
-					end
-				end
-				7: rw_r <= 1;
-				default :;
-			endcase
-
-		end else if (phi2) begin
-
-			if (s_state != 4 || tg68_busstate == 2'b01 || !dtack_n || xVma || berr)
-				s_state <= s_state + 1'd1;
-			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
-			if (tg68_busstate == 2'b01) s_state <= 0;
-
-			case (s_state)
-
-				6: begin
-					tg68_din_r <= tg68_din;
-					uds_n_r <= 1;
-					lds_n_r <= 1;
-					as_n_r <= 1;
-				end
-				default :;
-			endcase
-
-		end
+			S_WAIT:
+				if (wait_exit) s_state <= S_TAIL1;
+			S_TAIL1:
+				s_state <= S_TAIL2;
+			S_TAIL2: begin
+				tg68_din_r <= tg68_din;
+				uds_n_r <= 1;
+				lds_n_r <= 1;
+				as_n_r  <= 1;
+				s_state <= S_ENDC;
+			end
+			S_ENDC: begin
+				rw_r <= 1;
+				s_state <= S_IDLE;
+			end
+			default: s_state <= S_IDLE;
+		endcase
 	end
 end
 
@@ -208,16 +235,16 @@ always @(posedge clk) begin
 end
 
 	// Hold BERR across the bus cycle. The external berr (e.g. FC=7 CPU-space probe)
-	// is gated on AS being asserted, but AS deasserts at s_state 6 while the kernel
-	// only samples berr at s_state 7 (when tg68_clkena pulses). Without holding it,
+	// is gated on AS being asserted, but AS deasserts at S_TAIL2 while the kernel
+	// only samples berr at S_ENDC (when tg68_clkena pulses). Without holding it,
 	// the kernel sees berr=0 at the sample point and never latches make_berr, so the
 	// bus-error exception is missed. Latch berr for the duration of the cycle and
-	// clear it at the next cycle boundary (s_state 0).
+	// clear it between cycles (S_IDLE, after the kernel's S_ENDC sample).
 	reg berr_hold;
 	always @(posedge clk) begin
 		if (reset)
 			berr_hold <= 1'b0;
-		else if (phi1 && s_state == 0)
+		else if (s_state == S_IDLE)
 			berr_hold <= 1'b0;
 		else if (berr)
 			berr_hold <= 1'b1;
@@ -276,9 +303,9 @@ end
 				bh_busy = bh_busy + 1;
 				if (!rVma) bh_sawvma = 1;
 			end
-			if (phi1 && tg68_busstate == 2'b01) bh_int_clkena = bh_int_clkena + 1;
-			// cycle END: the kernel-clocking edge (s_state 7 at phi1)
-			if (bh_active && phi1 && s_state == 3'd7) begin
+			if (tg68_clkena && tg68_busstate == 2'b01) bh_int_clkena = bh_int_clkena + 1;
+			// cycle END: the kernel-clocking edge (S_ENDC tick)
+			if (bh_active && s_state == S_ENDC) begin
 				bh_i = (bh_bs == 2'b00) ? 0 : ((bh_bs == 2'b10) ? 1 : 2);
 				bh_j = ((bh_cls == 3'd3) && !bh_sawvma) ? 4 : {29'd0, bh_cls};
 				bh_k = (bh_len > 63) ? 63 : bh_len;
@@ -286,8 +313,8 @@ end
 				bh_ticksum[bh_i][bh_j] = bh_ticksum[bh_i][bh_j] + bh_len;
 				bh_active = 0;
 			end
-			// cycle START: the edge that moves s_state 0 -> 1 (phi2, non-internal)
-			if (!bh_active && phi2 && s_state == 3'd0 && tg68_busstate != 2'b01
+			// cycle START: the IDLE-exit tick (AS asserts at its end edge)
+			if (!bh_active && s_state == S_IDLE && tg68_busstate != 2'b01
 			    && !(busreq_ack || bus_granted)) begin
 				bh_active = 1;
 				bh_len    = 1;

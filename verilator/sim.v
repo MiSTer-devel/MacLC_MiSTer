@@ -254,16 +254,27 @@ module emu
 	wire [21:0] dskReadAddrExt;
 
 	// dtack generation for 16 MHz mode
-	reg  dtack_en, mem_latch_d;
+	reg  dtack_en, mem_latch_d, as_low_q;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
+			as_low_q <= 0;
 		end
 		else begin
 			// mem_latch_d = registered memoryLatch: high at busPhase 0, i.e. the
 			// START of each busCycle. (cpuBusControl & mem_latch_d) therefore
 			// strobes once at the start of EVERY cpu slot.
 			mem_latch_d <= memoryLatch;
+			// as_low_q = AS was low through the PREVIOUS tick. The mem-slot
+			// grant requires it: the SDRAM controller samples oe/we at the
+			// slot's first clk_64 edge, so a slot may only be granted if
+			// AS/addr/oe were already stable when that edge fired. The Phase-B
+			// bus FSM (branch cpu-enhancements) asserts AS on ANY tick, so an
+			// AS landing exactly on a slot boundary must wait for the next
+			// slot instead of being granted a slot whose read command never
+			// issued (= stale-dout serve). Mirror of MacLC.sv — keep both
+			// tops identical.
+			as_low_q <= !_cpuAS;
 			if (_cpuAS) dtack_en <= 0;
 			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
 			// so it must take the slot-aligned DTACK path (a cpu-slot start),
@@ -275,7 +286,7 @@ module emu
 			// also a cpu slot the three slots are contiguous (one rising edge per
 			// round), so we strobe at each cpu-slot start instead — same busPhase-0
 			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
-			if (!_cpuAS & ((cpuBusControl & mem_latch_d) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			if (!_cpuAS & ((cpuBusControl & mem_latch_d & as_low_q) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
 		end
 	end
 

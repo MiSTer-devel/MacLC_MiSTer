@@ -88,6 +88,49 @@ are calibrated against current pacing).
 
 ## Entries
 
+### 2 — 2026-08-17: Phase B — collapsed bus FSM (tg68k wrapper) + DTACK-grant qualifier
+
+**Core RTL (ports to Pocket): `rtl/tg68k/tg68k.v`.** The 8-state per-tick
+walker (AS at s1-phi1, DTACK sampled only at s4-phi2, latch s6, clkena s7)
+is replaced by S_IDLE/S_WAIT/S_TAIL1/S_TAIL2/S_ENDC:
+
+- AS+RW+UDS/LDS assert at the first edge after the kernel presents the
+  access (any phi phase) — one tick earlier than before, and write strobes
+  now assert WITH AS (was: two ticks later at s3; safe because SDRAM samples
+  ds two clk_64 into the granting slot and VPA targets are E-paced).
+- S_WAIT samples exit EVERY tick: `berr_held | !dtack_n | (phi2 && xVma)`.
+  The VPA exit keeps its phi2 qualification = E-pacing identical.
+- Tail is tick-identical to the old walker: exit +2 = din_r latch +
+  AS/strobe release (old s6), +3 = clkena (old s7). Slot-granted SDRAM data
+  lands at the granting slot's busPhase-3 tick = exit+2 exactly.
+- clkena = S_ENDC, plus internal (busstate==01) steps in S_IDLE gated by
+  `!clkena_d` — preserves the ≥2-clk_sys kernel-update spacing the SDC
+  multicycle needs (internal steps stay 2 ticks; they now phase-drift
+  instead of phi1-locking, which breaks the 8-tick parity lock more often).
+- berr_hold clears in S_IDLE (after the kernel's S_ENDC berr sample).
+- E/VMA block untouched (its `s_state != 0` guard still works: S_IDLE==0).
+- Instrumentation start/end conditions updated to the new states; target
+  classifier fixed (32-bit $50Fxxxxx I/O aliases were landing in "other";
+  only slot space $F1-$FE is genuinely non-24-bit).
+
+**Top glue (re-derive per platform): `MacLC.sv` + `verilator/sim.v`** — the
+mem-slot DTACK grant gains an `as_low_q` qualifier (AS low through the
+whole previous tick). The SDRAM controller samples oe/we at the slot's
+first clk_64 edge; the old FSM could never present AS at a slot boundary
+(phi1-only assert), the new one can, and granting such a slot would serve
+stale dout (the fill-capture hazard class from the MacIIvi 2026-08-16
+lesson). No cost against old-FSM-timing cases.
+
+**`MacLC.sdc`**: kernel-multicycle + periph_din_reg comment justifications
+rewritten for the new gating (constraints themselves unchanged). Pocket
+port: whatever the Pocket's timing constraints are, the same two invariants
+must hold there — ≥2-cycle kernel spacing, and din_r/periph settle windows.
+
+Expected effect (model): locked fetch streams stay at the 8-tick slot
+floor; the 10/12-tick misalignment and transient cases compress toward
+6-9; DTACK-immediate targets (slot space, SCSI-DMA when DREQ pending)
+complete in 5-6 ticks vs 8. Measured effect: see entry 3.
+
 ### 1 — 2026-08-17: Step-0 measurement instrumentation (sim-only)
 
 - `rtl/tg68k/tg68k.v`: `ifdef SIMULATION` block — histograms every completed
