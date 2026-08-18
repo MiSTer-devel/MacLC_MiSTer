@@ -100,6 +100,7 @@ module emu
 		"OA,Monitor @Reset,640x480 VGA,512x384 12in;",
 		"-;",
 		"O4,Memory,2MB,10MB;",
+		"OB,CPU I-Cache,Disabled,Enabled;",
 		"-;",
 		"P1,MT32-pi;",
 		"P1-;",
@@ -1091,6 +1092,7 @@ module emu
 
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space || pds_card_sel) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        icache_hit ? 1'b0 :        // fetch-cache hit answers now
 	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
@@ -1160,6 +1162,7 @@ module emu
 	wire        tg68_fc2;
 	wire [15:0] tg68_dout;
 	wire [31:0] tg68_a;
+	wire [31:0] tg68_a_early;   // pre-AS address for the fetch cache
 	wire        tg68_reset_n;
 	wire        tg68_longword;   // 32-bit access flag — drives SCSI pseudo-DMA byte packing
 
@@ -1180,6 +1183,37 @@ module emu
 	// value-checking probes ($A4BEB0 reads $FE000010/$1C) see a dead slot
 	// instead of phantom-card garbage, and nothing depends on TG68 berr.
 	wire cpu_berr = (fc7_berr && !_cpuAS) || sdma_berr;
+
+	// ── Fetch cache (ported 2026-08-18, branch cpu-icache) ──────────────────
+	// OSD-gated (status[11], default DISABLED) exactly as the 2026-07-07 build
+	// shipped: it FILLS AND SNOOPS ALWAYS and `enable` gates only the answer
+	// path, so the switch can be flipped mid-session for a same-build live A/B
+	// against an already-warm, already-coherent cache.
+	// ★ Fed the EARLY address (tg68_a_early = the kernel's combinational
+	// output): the Phase-B FSM registers cpuAddr on the same edge AS falls, so
+	// the module's correspondence guard rejects every fetch on the registered
+	// address — 100% miss, silently. See rtl/fetch_cache.sv.
+	// ★ DEFAULT OFF IS DELIBERATE: with the cache enabled the 2026-07-07
+	// session corrupted a file on the boot image, and that root cause is still
+	// UNFOUND (docs/resume_icache_corruption_2026-07-07.md). Do not enable it
+	// on a disk image you care about without a backup.
+	wire        icache_hit;
+	wire [15:0] icache_data;
+	fetch_cache #(.LOG2_WORDS(9)) icache (
+		.clk        ( clk_sys ),
+		.reset      ( ~_cpuReset ),
+		.flush_bits ( {memoryOverlayOn, dio_download} ),
+		.enable     ( status[11] ),
+		.cpuAddr    ( tg68_a_early[23:0] ),
+		.as_n       ( _cpuAS ),
+		.rw         ( _cpuRW ),
+		.fc         ( cpuFC ),
+		.cacheable  ( selectRAM || selectROM ),
+		.snoopable  ( selectRAM ),
+		.mem_din    ( dataControllerDataOut ),
+		.hit        ( icache_hit ),
+		.hit_data   ( icache_data )
+	);
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// SCSI / peripheral read-path fit-stabilization (Layer 1 — the structural fix).
@@ -1214,6 +1248,7 @@ module emu
 	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
 	wire [15:0] cpu_din_muxed = pds_card_sel   ? pds_dout :
 	                            slot_space     ? 16'hFFFF :
+	                            icache_hit     ? icache_data :
 	                            vpa_periph_read ? periph_din_reg :
 	                                              dataControllerDataOut;
 `ifdef SIMULATION
@@ -1259,7 +1294,8 @@ module emu
 				.din        ( cpu_din_muxed ),
 				.dout       ( tg68_dout ),
 				.longword   ( tg68_longword ),
-				.addr       ( tg68_a )
+				.addr       ( tg68_a ),
+				.addr_early ( tg68_a_early )
 			);
 	
 	// On-chip framebuffer (BRAM): packed CPU VRAM write mirror (port A) +
