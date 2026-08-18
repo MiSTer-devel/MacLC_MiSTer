@@ -88,6 +88,64 @@ are calibrated against current pacing).
 
 ## Entries
 
+### 6 — 2026-08-18: I-cache ported and HW-tested — WORKS IN SIM, HANGS ON HARDWARE
+
+**Ported** `rtl/fetch_cache.sv` (branch `i-cache` @`b393eaf`) onto the Phase B+C
+tree, branch `cpu-icache`. One correction was mandatory:
+
+★ **The hit path needs an address valid one clk BEFORE AS falls.** The
+pre-Phase-B walker gave that free (addr at s0, AS at s1); the Phase-B FSM
+registers `addr` and asserts `as_n_r` on the SAME edge, so on the registered
+address the module's correspondence guard (`rd_idx_d == idx`) rejects every
+fetch — a 100% miss, silently. `tg68k.v` now exposes `addr_early` (the kernel's
+combinational output) and the cache is fed from it.
+
+**Everything offline says it is good:**
+- Hit rate **99.96%** (3,998,471 / 4,000,000; 1,529 cold misses).
+- Fetch cycle **8.00 → 6.00 ticks flat**; data reads unchanged at 8.00.
+- `verilator/tb_fetch_cache.v` (NEW): coherency torture — self-modifying code,
+  zero-gap write/fetch, index aliasing, generation flush, 256-iteration
+  interleave. **958 hit-data checks, zero violations.**
+- `scripts/icache_trace_diff.py` (NEW): cache-ON vs cache-OFF PC→opcode
+  identity. PASS — but weak: the diskless sim runs 5.2M instructions across only
+  ~1,000 distinct PCs.
+- Sim BOOTS with the cache enabled (5.3M instructions, no hang).
+- Fit clean: setup +0.330 / hold +0.242 design-wide; RAM 503 → 506 blocks.
+- STA probe on the cache's own paths: worst **+3.326 ns** in, +20 ns out,
+  +0.424 ns hold. Nothing like the −6.710 ns Phase C was hiding.
+
+**★★★ AND YET: enabling it on hardware HANGS the machine.** Deployed
+(md5 5331d64e), booted with the switch off — Speedometer matched the release
+within noise (mix 3.048 vs 3.067, colour 1.029 vs 1.030), confirming the gate
+isolates the answer path. Flipping **CPU I-Cache → Enabled** mid-session froze
+the guest: screen pixel-identical after cursor movement (the definitive liveness
+oracle here, since the menubar clock is frozen anyway). No Sad Mac, no bomb — a
+HANG, which reads as the CPU spinning on garbage rather than faulting. Recovered
+by reloading the core; the volume booted fine and the pre-flip backup
+(`MacLC_7-5-5.PRE-ICACHE-BACKUP.hda`) is intact and byte-verified.
+
+**★ LEADING HYPOTHESIS — the July audit's margin was consumed by Phase B+C.**
+The module header states the fill's M10K read-during-write garbage *"is provably
+never consumed (next AS-fall ≥2 clk)"*. That guarantee came from the OLD 8-tick
+cycle and its longer tail. Phase B+C compressed the cycle to 6 ticks with a
+single-tick S_IDLE, so the distance from the fill (at AS-rise) to the next
+fetch's AS-fall has SHRUNK. Supporting detail: `tag_ram`/`data_ram` are declared
+`(* ramstyle = "M10K" *)` **without** `no_rw_check`, so their real
+read-during-write behaviour need not match Verilog's non-blocking semantics —
+exactly the class of thing simulation models ideally and silicon does not, which
+is why every offline test passes.
+
+**★ Fix direction (do this before trying hardware again):** stop relying on a
+timing margin and make the cache RDW-immune by construction — detect
+`write_index == read_index` in the same cycle and either force a miss or
+bypass-forward the written data. Then extend `tb_fetch_cache.v` with an explicit
+same-cycle fill-vs-lookup case (it does NOT currently cover that) and re-run
+before refitting.
+
+**Status: the cache ships OSD-gated OFF and is safe to deploy; do not enable it
+on an image you care about until the above is done.**
+
+
 ### 2 — 2026-08-17: Phase B — collapsed bus FSM (tg68k wrapper) + DTACK-grant qualifier
 
 **Core RTL (ports to Pocket): `rtl/tg68k/tg68k.v`.** The 8-state per-tick
