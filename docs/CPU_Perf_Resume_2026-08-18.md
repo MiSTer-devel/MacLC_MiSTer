@@ -100,18 +100,39 @@ engine. **Do not chase the CLUT/Ariel again — that path is settled.**
 
 ### Suspects, ranked, with the test for each
 
-1. **The SDC multicycle `b48b60c` may be masking a real race.** It credits
-   clk_sys→`emu|sdram|*` paths 2 destination periods, justified by "CPU
-   starts are `t[0]`-parity-gated so the request data is ≥1 full clk_sys old
-   at capture". Re-derive that claim rigorously: clk_mem is exactly 2×
-   clk_sys, so *some* clk_64 edges coincide with clk_sys edges — if ACTIVE
-   can fire on the very edge that launched AS/addr/din, the true path is
-   ~0 ns and STA was told to ignore it. This repo's classic trap is
-   STA-met-but-HW-fails. **Test: delete those two SDC lines, refit.** If it
-   now fails STA (~-0.2 ns as the pre-multicycle fit did), the paths are
-   genuinely tight and need a structural fix — register the whole request
-   (addr/din/ds/oe/we) into the clk_mem domain one stage before the
-   sequencer uses it, rather than a constraint promise.
+★ The user's read (2026-08-18) is that **the demand engine's interaction
+with the MiSTer SDRAM is simply wrong**, which is the classic cause of
+F-line-class corruption after an SDRAM change. The analysis below supports
+that directly — suspect 1 is a genuine CDC unsoundness, not just tight
+timing, and it also explains cleanly why Phase B is fine.
+
+1. **★★★ PRIME: the clk_sys→clk_mem request capture is unsound, and the
+   SDC multicycle `b48b60c` hides it.** Derivation: `clk_mem` (65 MHz) is
+   exactly 2× `clk_sys` (32.5 MHz) off the same PLL, so every other clk_64
+   edge coincides with a clk_sys edge. The ladder counter `t` counts 0..7
+   per `clk_8` period and — because 8 clk_64 == 1 clk_8 exactly — never
+   stalls in steady state, so `t[0]` selects *alternate* clk_64 edges: EITHER
+   all the clk_sys-coincident ones OR all the half-period ones, fixed at
+   runtime by where the clk_8 sync landed. Therefore a request launched from
+   a clk_sys flop (AS/addr/din/ds/oe/we) is captured by the ACTIVE branch
+   either **~0 ns later (coincident case = a straight race)** or **15.4 ns
+   later (half-period case)** — never the "≥1 full clk_sys = 30.8 ns" the
+   multicycle comment claims. The V8 address translation cone (SIMM
+   compare, mirror subtract, mux) into `sd_addr`/`col_q` plausibly exceeds
+   15.4 ns on its own. So STA was told to ignore paths that are real.
+   **This also explains why Phase B is clean**: it never touched `sdram.v`,
+   where the old slot machine sampled at `t == STATE_CMD_START` with the CPU
+   holding address/data stable for the WHOLE 4-clk_sys slot (~123 ns of
+   margin). Phase C threw that margin away.
+   **Fix (structural, not a constraint):** gate `req_cpu` on a clk_sys-domain
+   "request has been stable for ≥1 full tick" qualifier — the same shape as
+   Phase B's `as_low_q` — so addr/din/ds are provably ≥30.8 ns old before any
+   clk_64 edge can capture them; only THEN is the 2-period multicycle honest
+   (standard data+valid CDC: data multicycled, valid single-cycle). Costs
+   ~1 tick of start latency; the 7-tick read may become 8, still far better
+   than the 8–14 baseline. **Test first: delete the two SDC lines and refit
+   as-is** — if STA now reports a violation on these paths, the diagnosis is
+   confirmed outright.
 2. **Write-data capture at ACTIVE is too early.** `din_q <= din` samples the
    kernel's `data_write` through the top-level mux, and Phase B moved the
    write strobes to assert WITH AS (old walker: two ticks later at s3), so
@@ -134,6 +155,22 @@ Bisect cheaply by reverting one thing at a time — each fit is ~20 min. A
 faster discriminator for #3 alone: boot with the floppy encoder quiesced
 (no floppy image mounted AND `flp_pend_*` forced 0 in a probe fit); if the
 bomb disappears, it is refresh/guard interaction.
+
+### On trying other SEEDS for Phase C
+
+**Not tried — both Phase-C fits were seed 7 only.** Worth running as a
+DIAGNOSTIC, not as a fix:
+- If another seed (5, 6, 3) bombs *identically* at "System Update" error 10,
+  that is strong evidence of a **systematic** protocol/CDC error (suspect 1),
+  because placement luck would not reproduce the same failure point.
+- If different seeds fail differently or one boots, that says **marginal
+  timing** — which points at the same unsound-constraint root cause anyway.
+
+★ **Do not accept a passing seed as the fix.** With the multicycle in place
+STA is not even checking the suspect paths, so a "good" seed would be a
+placement that happens to meet a path nobody is verifying — latent
+corruption shipped, and exactly the trap this repo's per-seed gating law
+exists to catch. Fix the constraint/structure first, THEN gate seeds.
 
 ## What happens next (in order)
 
