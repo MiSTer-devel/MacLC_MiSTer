@@ -268,6 +268,7 @@ end
 	reg        bh_sawvma;
 	integer bh_ticks, bh_busy, bh_int_clkena, bh_win;
 	integer bh_i, bh_j, bh_k;
+	integer bh_wait_ctr = 0;
 	initial begin
 		bh_file = $fopen("bus_hist.log", "w");
 		bh_active = 0; bh_len = 0; bh_ticks = 0; bh_busy = 0;
@@ -321,6 +322,15 @@ end
 				bh_sawvma = 0;
 				bh_bs     = tg68_busstate;
 				bh_cls    = bh_class_w;
+			end
+			// hang watchdog (magenta hunt): a bus cycle stuck in S_WAIT names itself
+			if (s_state == S_WAIT) begin
+				bh_wait_ctr = bh_wait_ctr + 1;
+				if (bh_wait_ctr == 20000)
+					$display("BUS-HANG: addr=%08x busstate=%b rw=%b dtack_n=%b vpa_n=%b vma_n=%b berr=%b eCntr=%0d @%0t",
+					         addr, tg68_busstate, rw_r, dtack_n, vpa_n, rVma, berr, eCntr, $time);
+			end else begin
+				bh_wait_ctr = 0;
 			end
 			// window dump: once per simulated second
 			if (bh_ticks >= 32500000) begin

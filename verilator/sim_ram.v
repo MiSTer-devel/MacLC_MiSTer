@@ -107,9 +107,22 @@ end
 // Allow ROM/RAM initialization from simulation
 // verilator tracing_off
 /* verilator lint_off UNUSED */
+integer init_i;
 initial begin
-	// Memory will be initialized by the simulation testbench
-	// via ioctl_download mechanism
+	// Deterministic power-up content. With Verilator's --x-initial fast the
+	// uninitialized array pattern VARIES PER BUILD, and the boot ROM's
+	// VRAM/video probe reads unwritten bytes — so adding a mere $display
+	// could change which boot path the ROM takes (seen 2026-08-17 during
+	// the magenta hunt: two builds of the same RTL took different
+	// mode-probe branches). 16'hFFFF is chosen DELIBERATELY: it selects
+	// the diskless ?-icon probe branch — the harder path, whose
+	// probe-writes-into-ROM-space idiom caught two real Phase-C bugs
+	// (docs/CPU_Perf_Log.md). Boot gate on this path: grey dither desktop
+	// + arrow cursor + centered flashing-? disk icon at frame 450.
+	for (init_i = 0; init_i < 8388608; init_i = init_i + 1)
+		mem[init_i] = 16'hFFFF;
+	cpu_dout = 16'h0000;
+	dout     = 16'h0000;
 end
 /* verilator lint_on UNUSED */
 // verilator tracing_on

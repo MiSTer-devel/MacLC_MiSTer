@@ -940,7 +940,16 @@ module emu
 	// old slot-aligned grant (cpuBusControl & mem_latch_d strobe at each
 	// cpu-slot start) is gone, and with it the mod-4 quantization that
 	// pinned every memory access to >=8 clk_sys. dtack_en now serves ONLY
-	// the immediate peripheral/unmapped path (never SDRAM-backed targets).
+	// the immediate paths the demand engine never serves:
+	//   - peripheral/unmapped space (as before), and
+	//   - ROM-region WRITES (ack-and-discard, 68000/V8 style). A ROM write
+	//     asserts neither oe nor we, so the engine never answers it — but
+	//     the boot ROM's device-probe code WRITES into ROM space behind a
+	//     temporary vector-$8 handler and requires the cycle to complete
+	//     (ack or bus-error; the old slot glue acked every mem-region
+	//     access regardless of oe/we). Without this the diskless ?-icon
+	//     phase deadlocks at a byte write to $A6C3xx — the 2026-08-17
+	//     magenta-screen boot stall.
 	reg  dtack_en;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
@@ -948,7 +957,8 @@ module emu
 		end
 		else begin
 			if (_cpuAS) dtack_en <= 0;
-			if (!_cpuAS & !selectROM & !selectRAM & !selectVRAM) dtack_en <= 1;
+			if (!_cpuAS & ( (!selectROM & !selectRAM & !selectVRAM)
+			              | (selectROM & !_cpuRW) )) dtack_en <= 1;
 		end
 	end
 
@@ -1086,8 +1096,10 @@ module emu
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        // Phase C: SDRAM-backed targets ack via the demand
 	                        // handshake (early-done: data is in cpu_dout before
-	                        // the FSM's exit+2 din_r latch; writes post at ACTIVE)
-	                        (!_cpuAS && (selectRAM || selectROM || selectVRAM)) ? ~sdram_cpu_done :
+	                        // the FSM's exit+2 din_r latch; writes post at ACTIVE).
+	                        // ROM WRITES are excluded: the engine never serves
+	                        // them (no oe/we) — they ack-and-discard via dtack_en.
+	                        (!_cpuAS && (selectRAM || selectVRAM || (selectROM && _cpuRW))) ? ~sdram_cpu_done :
 	                        // $Fxxxxx VPA peripherals stay un-acked here (E/VMA
 	                        // paced); everything else non-mem = immediate ack
 	                        (~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en);

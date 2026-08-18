@@ -257,8 +257,12 @@ module emu
 	// dtack generation for 16 MHz mode
 	// Phase C (branch cpu-enhancements): RAM/ROM/VRAM DTACK comes straight
 	// from the RAM model's demand handshake (ram_cpu_done) — the old
-	// slot-aligned grant is gone. dtack_en now serves ONLY the immediate
-	// peripheral/unmapped path. Mirror of MacLC.sv — keep both tops identical.
+	// slot-aligned grant is gone. dtack_en serves the immediate
+	// peripheral/unmapped path AND ROM-region WRITES (ack-and-discard: the
+	// engine never serves them since they assert neither oe nor we, but the
+	// boot ROM's device probe writes into ROM space behind a temp vector-$8
+	// handler and needs the cycle to complete — see MacLC.sv, keep both
+	// tops identical; this was the 2026-08-17 magenta boot stall).
 	reg  dtack_en;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
@@ -266,7 +270,8 @@ module emu
 		end
 		else begin
 			if (_cpuAS) dtack_en <= 0;
-			if (!_cpuAS & !selectROM & !selectRAM & !selectVRAM) dtack_en <= 1;
+			if (!_cpuAS & ( (!selectROM & !selectRAM & !selectVRAM)
+			              | (selectROM & !_cpuRW) )) dtack_en <= 1;
 		end
 	end
 
@@ -349,8 +354,9 @@ module emu
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        // Phase C: SDRAM-backed targets ack via the demand
-	                        // handshake — mirror of MacLC.sv, keep identical
-	                        (!_cpuAS && (selectRAM || selectROM || selectVRAM)) ? ~ram_cpu_done :
+	                        // handshake — mirror of MacLC.sv, keep identical.
+	                        // ROM WRITES excluded: ack-and-discard via dtack_en.
+	                        (!_cpuAS && (selectRAM || selectVRAM || (selectROM && _cpuRW))) ? ~ram_cpu_done :
 	                        (~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en);
 
 	// Programmer's switch / Level-7 NMI — mirror of MacLC.sv (there the trigger is

@@ -152,15 +152,19 @@ always @(posedge clk_sys)
 reg ariel_armed;
 wire req_stb = ariel_armed && req && mem_latch && (~uds_n | ~lds_n);
 
-`ifdef SIMULATION
-// Phase-C magenta hunt (2026-08-17): trace every CPU register action the
-// RAMDAC takes so CLUT programming is observable. Remove when resolved.
-integer dbg_ariel_wr = 0;
+`ifdef ARIEL_TRACE
+// Magenta-hunt telemetry (2026-08-17, resolved — see docs/CPU_Perf_Log.md):
+// per-access register trace incl. READS (REG_PALETTE reads auto-advance the
+// shared RGB phase, so unlogged reads look like phantom phase jumps; RMW
+// instructions like BSET/NOT on the data port legitimately produce
+// read+write pairs). Re-enable with +define+ARIEL_TRACE.
+integer dbg_ariel_n = 0;
 always @(posedge clk_sys) begin
-	if (req_stb && we) begin
-		dbg_ariel_wr = dbg_ariel_wr + 1;
-		$display("ARIEL WR[%0d]: breg=%0d data=%02x paddr=%02x comp=%0d @%0t",
-		         dbg_ariel_wr, byte_reg, data_in, palette_addr, color_comp, $time);
+	if (req_stb) begin
+		dbg_ariel_n = dbg_ariel_n + 1;
+		$display("ARIEL %s[%0d]: breg=%0d a=%03x uds=%b lds=%b data=%02x paddr=%02x comp=%0d @%0t",
+		         we ? "WR" : "RD", dbg_ariel_n, byte_reg, reg_addr,
+		         ~uds_n, ~lds_n, data_in, palette_addr, color_comp, $time);
 	end
 end
 `endif

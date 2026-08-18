@@ -215,6 +215,47 @@ RMW reads. **Pocket port note: this is THE trap class for any port of
 the demand engine — every request-done handshake must key on the
 requester's OWN level, never on a mux shared with another master.**
 
+**Magenta, act 2 (open at this writing):** the oe fix was real but not
+sufficient — the screen persisted on the next build. Precision so far:
+the visible "magenta" is the 1bpp B/W desktop dither rendered through
+two mis-programmed CLUT entries — 0x7F = (7F,FF,7F) light green, 0xFF =
+(7F,00,7F) dark magenta (pixel-counted from the HW screenshot: exactly
+307,200 pixels split 50/50) — produced when the guest's final 2-entry
+CLUT program is phase-shifted by ONE extra READ-decoded ariel access
+after each of its writes (REG_PALETTE reads auto-advance the shared RGB
+counter — semantics verified identical in MAME ariel.cpp, the model's
+ground truth). The failing boot branch is selected by what the ROM's
+video probe reads from UNWRITTEN memory, so Verilator's per-build
+--x-initial fast pattern made instrumented rebuilds dodge the path;
+sim_ram now deterministically fills mem[] (zeros → clean path; trying
+FFFF). Next discriminator: the instruction stream between consecutive
+DAC writes in a magenta run's cpu_trace.log — real guest reads of
+$F24xxx (⇒ our readback DATA is wrong) vs none (⇒ fabricated bus
+cycles). MAME reference sequence via the run_mame.sh rig if needed.
+
+**Magenta RESOLVED — root cause: unanswered ROM-region WRITES.** The
+trail in full: the shredded CLUT was a red herring — the Phase-B
+baseline executes the IDENTICAL RMW-based B/W patch with the identical
+transient shred (the RD/WR pairs are the read halves of BSET #7 /
+NOT.B-class instructions on the DAC data port; the "reads" were real),
+and then ~32 frames later the boot's next stage reprograms the full CLUT
+correctly. Phase C never reached that stage: a bus-hang watchdog named
+the stall — a byte WRITE to $A6C3D5, ROM space, issued by the ROM's
+device-probe code behind a temporary vector-$8 handler. A ROM write
+asserts neither oe (read-gated) nor we (RAM/VRAM-gated), so the demand
+engine never serves it; the old slot glue acked every mem-region access
+at the slot start REGARDLESS of oe/we — ack-and-discard, 68000/V8
+style — which is what the ROM requires (ack or BERR; hang is the one
+illegal outcome). Fix: ROM-region writes take the immediate dtack_en
+path (ack-and-discard) in both tops; the demand leg serves
+RAM/VRAM/ROM-reads only. The pre-oe-fix builds sometimes LOOKED alive
+under magenta because the stale-done bug phantom-acked these writes —
+two bugs stacked on one symptom. **Pocket port law #2: every access
+class the memory engine does NOT serve must still be terminated
+(ack-and-discard or BERR) — enumerate them (ROM writes are the classic)
+before first boot.** Repro determinism: sim_ram mem[] init value picks
+the ROM's probe branch; 16'hFFFF reproduces the failing (?-icon) path.
+
 ### 1 — 2026-08-17: Step-0 measurement instrumentation (sim-only) + BASELINE
 
 - `rtl/tg68k/tg68k.v`: `ifdef SIMULATION` block — histograms every completed

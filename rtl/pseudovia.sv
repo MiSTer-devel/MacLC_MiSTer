@@ -211,8 +211,8 @@ always @(posedge clk_sys) begin
                             $display("PVIA: WRITE Video Config = %02x (bpp mode = %d) addr=%h @%0t",
                                      data_in, data_in[2:0], addr, $time);
                             `endif
-                            `ifdef SIMULATION
-                            // Phase-C magenta hunt: always-on mode-write trace
+                            `ifdef ARIEL_TRACE
+                            // mode-write trace (level-repeats per commit tick)
                             $display("PVIA VIDMODE=%02x @%0t", data_in, $time);
                             `endif
                         end
