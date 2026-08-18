@@ -9,7 +9,13 @@ carries its own core rows; this one is MacLC only).
 MC68020 / no FPU / Mac II AMU / 10240K physical / ROM $067C 512K — an
 apples-to-apples match for the physical Mac LC rows. Captured 2026-08-17 at
 640x480; the capture does not stamp the RBF, so pin the build hash here when
-known.
+known. **Provenance settled 2026-08-18:** this row predates the CPU-perf
+mission entirely — the file arrived untracked and was first committed as
+`cfd62ec`, when the branch tip was `a43d5e0` (the `MacLC_20260815.rbf`
+release), so the build was almost certainly that release (inferred from the
+tip, not stamped by the capture). Phase A of the mission was
+`ifdef SIMULATION`-only instrumentation and never entered a bitstream, so the
+only mission change ever measured on hardware is Phase B (row below).
 
 Ratio columns are Speedometer's own: CPU tests are Mac Classic = 1.0, color
 tests are Mac II = 1.0. Higher is better for KWhetstones/Dhrystones and for
