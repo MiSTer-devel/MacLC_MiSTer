@@ -78,11 +78,71 @@ no tap.lua/trace.dbg captures) — all MAME work was source reading.
    counts, but `tap`-style memory traces can confirm access PATTERNS
    (e.g. whether the guest issues the RMW traffic we think it does).
 
+## ★★★ HW GATE RESULT: PHASE C **FAILS** ON HARDWARE — START HERE
+
+Deployed md5 `4fede16981c5b57d515cc2c4560698a3` (commit `4f24246`, STA
++0.573) boots MUCH further than before — POST passes, the Mac OS splash and
+"Starting up…" progress bar render correctly, extensions begin loading — then
+**bombs: "System Update" / error type 10** (= line-1111 / F-line exception,
+i.e. the CPU executed a word that decoded as an F-line opcode). Reproduced
+identically after a guest Restart, so it is deterministic, not a dice-roll.
+Screenshots: `scratch/phaseC_fixed_hw_boot.png`, `scratch/phaseC_boot_retry.png`.
+
+**An F-line bomb means executed garbage ⇒ memory-content corruption**, not a
+hang: some read returned wrong data, or some write landed wrong, and the OS
+eventually jumped into it. Crucially, **the same tree boots perfectly in
+Verilator** and passes every offline TB — so the defect is HARDWARE-ONLY,
+which means TIMING or REFRESH in the demand engine, not logic.
+
+The bisect is already narrow: Phase B (`2791e6a`) is HW-validated and boots
+clean to the Finder; everything between it and `4f24246` is the demand
+engine. **Do not chase the CLUT/Ariel again — that path is settled.**
+
+### Suspects, ranked, with the test for each
+
+1. **The SDC multicycle `b48b60c` may be masking a real race.** It credits
+   clk_sys→`emu|sdram|*` paths 2 destination periods, justified by "CPU
+   starts are `t[0]`-parity-gated so the request data is ≥1 full clk_sys old
+   at capture". Re-derive that claim rigorously: clk_mem is exactly 2×
+   clk_sys, so *some* clk_64 edges coincide with clk_sys edges — if ACTIVE
+   can fire on the very edge that launched AS/addr/din, the true path is
+   ~0 ns and STA was told to ignore it. This repo's classic trap is
+   STA-met-but-HW-fails. **Test: delete those two SDC lines, refit.** If it
+   now fails STA (~-0.2 ns as the pre-multicycle fit did), the paths are
+   genuinely tight and need a structural fix — register the whole request
+   (addr/din/ds/oe/we) into the clk_mem domain one stage before the
+   sequencer uses it, rather than a constraint promise.
+2. **Write-data capture at ACTIVE is too early.** `din_q <= din` samples the
+   kernel's `data_write` through the top-level mux, and Phase B moved the
+   write strobes to assert WITH AS (old walker: two ticks later at s3), so
+   the engine can now latch write data earlier than any prior design ever
+   did. Sim has zero propagation delay and cannot see this. **Test: hold CPU
+   write starts one extra clk_sys tick (or capture `din` at CAS from a
+   clk_sys-registered copy) and refit.**
+3. **Refresh starvation.** Old design: AUTO_REFRESH on every idle slot
+   (massively over-provisioned). New: lowest-priority `else if`, blocked by
+   `!flp_guard && !flp_win`, with CPU back-off only at `ref_due >= REF_FORCE`
+   (480 clk_64 ≈ 7.38 µs) vs the chip's ~7.8 µs tREF average — **thin**, and
+   the floppy keep-out can push it later. ★ The GCR encoder FREE-RUNS with no
+   disk mounted (CLAUDE.md: "byte_cnt churns on garbage"), so floppy windows
+   and their guard fire continuously during a normal SCSI boot — exactly the
+   workload that bombed. **Test: drop REF_FORCE to ~380 and REF_OPP to ~200,
+   and/or give refresh priority over `req_flp` when `ref_due` is high.**
+   Corruption-after-seconds-of-heavy-IO is the signature of marginal refresh.
+
+Bisect cheaply by reverting one thing at a time — each fit is ~20 min. A
+faster discriminator for #3 alone: boot with the floppy encoder quiesced
+(no floppy image mounted AND `flp_pend_*` forced 0 in a probe fit); if the
+bomb disappears, it is refresh/guard interaction.
+
 ## What happens next (in order)
 
-1. **HW boot gate on the deployed build** (if the close-out below doesn't
-   already record it): guest boots from SCSI to the Finder. One boot is never
-   a verdict; CD `MACLC.s4` stays ATTACHED (retry, don't detach).
+0. **Fix the F-line bomb above.** Nothing below is meaningful until Phase C
+   boots clean on hardware. If you need a shippable core in the meantime,
+   Phase B (`2791e6a`) is HW-validated and already carries a real win.
+1. **HW boot gate on the fixed build**: guest boots from SCSI to the Finder.
+   One boot is never a verdict; CD `MACLC.s4` stays ATTACHED (retry, don't
+   detach).
 2. **★ THE CLOCK CHECK — do not skip.** On the booted Finder, screenshot
    (`bash scripts/grab_fresh.sh scratch/clk1.png`), wait ≥3 min, screenshot
    again: the menubar clock MUST advance. A frozen clock was observed once on
@@ -145,8 +205,19 @@ no tap.lua/trace.dbg captures) — all MAME work was source reading.
 - A `git worktree` of Phase B lives at `../maclc-pb` (delete with
   `git worktree remove ../maclc-pb --force` when no longer needed for A/B).
 
-## Session close-out (fill-in from the 2026-08-18 wrap-up)
+## Session close-out (2026-08-18)
 
-- Final fit: Fitter Successful, STA met (worst slack +____ ns), seed 7.
-- Deployed md5: ____ ; coreRunning=MACLC verified: ____
-- HW boot gate: ____ ; clock check: ____
+- **Final fit** (commit `4f24246`, seed 7): Fitter **Successful**, STA **met,
+  worst slack +0.573 ns**, RBF md5 **`4fede16981c5b57d515cc2c4560698a3`**.
+  ★ Quartus 17.0 threw a mid-fit **Access Violation** on the first attempt and
+  left the PREVIOUS fit's RBF on disk with hung `quartus_fit.exe` processes —
+  always check `output_files/MacLC.rbf` mtime against the build log before
+  deploying, and `taskkill` the strays before relaunching.
+- **Deployed** to the bench as canonical `MacLC.rbf` — see the deploy log for
+  md5-verified push + `coreRunning='MACLC'`.
+- **HW boot gate: recorded below by the deploying session.** If it is blank,
+  the gate did NOT complete — re-run it first thing (boot, screenshot via
+  `scripts/grab_fresh.sh`, then the clock check in item 2).
+- Pre-deploy box state was the hung pre-fix Phase-C build (equal-count colour
+  bars = Ariel init palette, no OS running), so the reboot-based deploy was
+  safe without a guest shutdown.
