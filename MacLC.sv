@@ -2458,7 +2458,12 @@ module emu
 	// fetch window, so the live bit is coherent with the returning word. Keep in
 	// sync with verilator/sim.v.
 	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
-	wire [15:0] extra_rom_data_demux = dsk_byte_odd?
+	// Phase C fix: select with the parity REGISTERED alongside the request
+	// bundle, so it matches the address the access was actually issued with
+	// (the live signal is one tick ahead of the registered window now).
+	reg  sdram_dskodd_q;
+	always @(posedge clk_sys) sdram_dskodd_q <= dsk_byte_odd;
+	wire [15:0] extra_rom_data_demux = sdram_dskodd_q?
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
 
@@ -2479,6 +2484,45 @@ module emu
 	wire        sdram_cpu_done;
 	wire [15:0] cpu_dout_patched =
 		(!_romOE && memoryAddr == 23'h52322F && sdram_cpu_dout == 16'h6600) ? 16'h6000 : sdram_cpu_dout;
+
+	// ── Phase C fix (2026-08-18): pipeline the SDRAM request in clk_sys ──────
+	// STA on the post-fit netlist (scratch/sta_sdram_summary.txt) measured the
+	// clk_sys->clk_mem request paths at **-6.710 ns** with a 15.381 ns window:
+	// the V8 address-translation cone (tg68k|addr -> SIMM compare / mirror
+	// subtract / mux -> sdram|sd_addr) needs ~22 ns, but a clk_64 capture edge
+	// gives it only ONE clk_64 period. The demand sequencer was therefore
+	// latching a HALF-SETTLED ROW/COLUMN ADDRESS — reads and writes landing at
+	// the wrong location, i.e. the RAM corruption behind the "System Update"
+	// F-line bomb of 2026-08-17. (The earlier b48b60c multicycle "fixed" this
+	// on paper by granting 2 destination periods; the silicon never got them.
+	// It is deleted with this change — the fix must be structural.)
+	//
+	// The old slot machine never had this problem: it sampled at a fixed slot
+	// phase with the CPU holding address and data stable across the WHOLE
+	// 4-clk_sys slot (~123 ns of settling). This restores that guarantee the
+	// cheap way — one clk_sys register stage on the whole request bundle:
+	//   * the deep translation cone now terminates at a clk_sys flop and gets
+	//     a full 30.76 ns period (22 ns needed -> genuine positive slack);
+	//   * the sequencer captures from an adjacent register, a short route that
+	//     closes inside one clk_64 period with room to spare.
+	// Cost is one clk_sys tick of request latency per access.
+	// The WHOLE bundle registers together (including flp_win/flp_guard) so the
+	// floppy window stays coherent with the address it is muxing — floppy.v
+	// latches its fetch a full clk8 period later, which absorbs the shift.
+	reg [24:0] sdram_addr_q;
+	reg [15:0] sdram_din_q;
+	reg  [1:0] sdram_ds_q;
+	reg        sdram_we_q, sdram_oe_q;
+	reg        sdram_flpwin_q, sdram_flpguard_q;
+	always @(posedge clk_sys) begin
+		sdram_addr_q     <= sdram_addr;
+		sdram_din_q      <= sdram_din;
+		sdram_ds_q       <= sdram_ds;
+		sdram_we_q       <= sdram_we;
+		sdram_oe_q       <= sdram_oe;
+		sdram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download;
+		sdram_flpguard_q <= flp_guard && !dio_download;
+	end
 
 	assign SDRAM_CKE = 1;
 
@@ -2527,25 +2571,27 @@ module emu
 		.sd_cas         ( SDRAM_nCAS               ),
 
 
-		// cpu/chipset interface
+		// cpu/chipset interface — the clk_sys-REGISTERED request bundle (see
+		// the pipeline note above; feeding the combinational nets here is what
+		// broke the 2026-08-17 build).
 		// map rom to sdram word address $200000 - $20ffff
-		.din            ( sdram_din                ),
-		.addr           ( sdram_addr               ),
-		.ds             ( sdram_ds                 ),
-		.we             ( sdram_we                 ),
-		.oe             ( sdram_oe                 ),
+		.din            ( sdram_din_q              ),
+		.addr           ( sdram_addr_q             ),
+		.ds             ( sdram_ds_q               ),
+		.we             ( sdram_we_q               ),
+		.oe             ( sdram_oe_q               ),
 		.dout           ( sdram_out                ),
 
 		// Phase C demand-start service (branch cpu-enhancements).
-		// !dio_download on both: during a download, dio writes are only
-		// PRESENTED during dioBusControl ticks — the very ticks floppy
-		// windows claim — and the guard zone covers them, so a pending
-		// floppy fetch would deadlock the HPS download (ioctl_wait never
-		// clears). The old slot machine equivalently served dio in slot 2
-		// during downloads (oe forced 0). Floppy pending state persists and
-		// is served after the download.
-		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
-		.flp_guard      ( flp_guard && !dio_download ),
+		// !dio_download on both (applied at the register above): during a
+		// download, dio writes are only PRESENTED during dioBusControl ticks —
+		// the very ticks floppy windows claim — and the guard zone covers
+		// them, so a pending floppy fetch would deadlock the HPS download
+		// (ioctl_wait never clears). The old slot machine equivalently served
+		// dio in slot 2 during downloads (oe forced 0). Floppy pending state
+		// persists and is served after the download.
+		.flp_win        ( sdram_flpwin_q           ),
+		.flp_guard      ( sdram_flpguard_q         ),
 		.cpu_done       ( sdram_cpu_done           ),
 		.cpu_dout       ( sdram_cpu_dout           )
 	);

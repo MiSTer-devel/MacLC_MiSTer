@@ -1128,25 +1128,52 @@ module emu
 	// note at the matching demux in MacLC.sv — the old bit selected the wrong
 	// byte on odd addresses and corrupted every floppy sector. Keep in sync.
 	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
-	wire [15:0] extra_rom_data_demux = dsk_byte_odd ?
+	// Phase C fix: parity registered with the request bundle — mirror of MacLC.sv
+	reg  ram_dskodd_q;
+	always @(posedge clk_sys) ram_dskodd_q <= dsk_byte_odd;
+	wire [15:0] extra_rom_data_demux = ram_dskodd_q ?
 						   {ram_do_raw[7:0],ram_do_raw[7:0]}:{ram_do_raw[15:8],ram_do_raw[15:8]};
+
+	// ── Phase C fix (2026-08-18): pipeline the request bundle in clk_sys ─────
+	// Mirror of MacLC.sv — keep both tops identical. On the FPGA this stage is
+	// load-bearing: STA measured the unregistered clk_sys->clk_mem address path
+	// at -6.710 ns (15.381 ns window vs a ~22 ns V8-translation cone), so the
+	// controller was latching a half-settled row/column address and corrupting
+	// memory. Sim has no propagation delay and cannot see that, but the stage
+	// is mirrored here so the ONE-TICK REQUEST LATENCY it adds is modelled —
+	// otherwise the sim's cycle counts would flatter the FPGA.
+	reg [24:0] ram_addr_q;
+	reg [15:0] ram_din_q;
+	reg  [1:0] ram_ds_q;
+	reg        ram_we_q, ram_oe_q;
+	reg        ram_flpwin_q, ram_flpguard_q;
+	always @(posedge clk_sys) begin
+		ram_addr_q     <= ram_addr;
+		ram_din_q      <= ram_din;
+		ram_ds_q       <= ram_ds;
+		ram_we_q       <= ram_we;
+		ram_oe_q       <= ram_oe;
+		ram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download;
+		ram_flpguard_q <= flp_guard && !dio_download;
+	end
 
 	sim_ram ram
 	(
 		.clk            ( clk_sys     ),
 		.reset          ( reset       ),
-		.din            ( ram_din     ),
-		.addr           ( ram_addr    ),
-		.ds             ( ram_ds      ),
-		.we             ( ram_we      ),
-		.oe             ( ram_oe      ),
+		.din            ( ram_din_q   ),
+		.addr           ( ram_addr_q  ),
+		.ds             ( ram_ds_q    ),
+		.we             ( ram_we_q    ),
+		.oe             ( ram_oe_q    ),
 		.dout           ( ram_do_raw  ),
 
 		// Phase C demand-start handshake (latency-matched to rtl/sdram.v).
-		// !dio_download mirrors MacLC.sv: floppy windows + guard pause during
-		// downloads so dio writes can't be starved (see the note there).
-		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
-		.flp_guard      ( flp_guard && !dio_download ),
+		// !dio_download applied at the register above: during a download, dio
+		// writes are only presented during dioBusControl ticks — the very ticks
+		// floppy windows claim — so a pending floppy fetch would starve them.
+		.flp_win        ( ram_flpwin_q ),
+		.flp_guard      ( ram_flpguard_q ),
 		.cpu_done       ( ram_cpu_done ),
 		.cpu_dout       ( ram_cpu_dout ),
 		.frame_count    ( sim_frame_count )
