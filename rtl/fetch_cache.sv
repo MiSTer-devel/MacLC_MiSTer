@@ -116,7 +116,35 @@ module fetch_cache #(
 	reg [LOG2_WORDS-1:0] miss_idx;
 	reg [TAGW-1:0]       miss_tag;
 
+	// ── RDW IMMUNITY (2026-08-18) ────────────────────────────────────────────
+	// The continuous lookup reads tag_ram/data_ram EVERY clock while the snoop
+	// and the fill write them. When a write targets the very entry being read,
+	// M10K read-during-write behaviour is NOT guaranteed to match Verilog's
+	// non-blocking semantics (these arrays carry `ramstyle = "M10K"` with no
+	// explicit RDW mode), so silicon may return the new tag beside stale data —
+	// a HIT CARRYING THE WRONG INSTRUCTION WORD. The module previously relied
+	// on a timing argument ("the fill's garbage is never consumed, next AS-fall
+	// >= 2 clk"), but that margin came from the pre-Phase-B 8-tick bus cycle;
+	// the Phase-B/C cycle is 6 ticks with a single-tick S_IDLE, so the next
+	// fetch's address arrives sooner relative to the fill and the window is
+	// reachable. Enabling the cache on that tree HUNG the machine while every
+	// offline test passed — see docs/CPU_Perf_Log.md entry 6.
+	//
+	// Fix by construction, not by margin: if the entry read this cycle was
+	// written this cycle, the registered lookup is untrustworthy, so force a
+	// MISS. Costs one refill in a rare case and removes the hazard class
+	// entirely, whatever RDW mode the fitter picks.
+	reg  rdw_collide_d = 1'b0;
+	wire rdw_collide = (tag_we && (tag_waddr == idx))
+	                || (as_rise && miss_pend && (miss_idx == idx));
+
+`ifdef FETCH_CACHE_NO_RDW_FIX
+	// NEGATIVE CONTROL (TB only): the pre-fix expression, so the testbench can
+	// demonstrate it actually catches the bug rather than passing vacuously.
 	wire lookup_match = (tag_q == {gen, tag}) && (rd_idx_d == idx);
+`else
+	wire lookup_match = (tag_q == {gen, tag}) && (rd_idx_d == idx) && !rdw_collide_d;
+`endif
 
 	// SINGLE write port for tag_ram (M10K is 1R+1W): the snoop kill (AS-fall
 	// of a write cycle) and the miss fill (AS-rise of a fetch cycle) are on
@@ -130,6 +158,7 @@ module fetch_cache #(
 
 	always @(posedge clk) begin
 		as_n_d   <= as_n;
+		rdw_collide_d <= rdw_collide;   // travels with tag_q/data_q/rd_idx_d
 		rst_d    <= reset;
 		flush_d  <= flush_bits;
 		enable_r <= enable;
@@ -144,7 +173,19 @@ module fetch_cache #(
 			tag_ram[tag_waddr] <= tag_wdata;
 
 		// continuous lookup — every clock, unconditional
+`ifdef FETCH_CACHE_HOSTILE_RDW
+		// TB-ONLY FAULT INJECTION (never synthesised). Verilog's non-blocking
+		// semantics always return OLD data on a read-during-write, so a plain
+		// simulation CANNOT reproduce the silicon behaviour that hangs the
+		// machine. Model the WORST realistic M10K mix: the tag reads
+		// write-first (NEW) while the data reads read-first (OLD) — which is
+		// precisely what turns a collision into a hit carrying a stale
+		// instruction word. tb_fetch_cache.v runs with this defined to prove
+		// the rdw_collide guard above actually protects against it.
+		tag_q    <= (tag_we && (tag_waddr == idx)) ? tag_wdata : tag_ram[idx];
+`else
 		tag_q    <= tag_ram[idx];
+`endif
 		data_q   <= data_ram[idx];
 		rd_idx_d <= idx;
 
