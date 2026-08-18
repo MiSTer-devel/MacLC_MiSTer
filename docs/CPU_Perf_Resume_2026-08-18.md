@@ -1,11 +1,16 @@
-# RESUME PROMPT — CPU perf mission: Phase C validated offline, HW gate + Speedometer next
+# RESUME PROMPT — CPU perf mission: Phase B+C SHIPPED (+10.7%), I-cache is next
 
 Paste this file as the opening prompt of a session in this repo
-(`C:\Temp\mistercore\MacLC_MiSTer`, branch **`cpu-enhancements`**). It is the
+(`C:\Temp\mistercore\MacLC_MiSTer`, branch **`cpu-phase-c-fix`**). It is the
 continuation of `docs/CPU_Improvements_Prompt.md` (the original mission brief)
 after the 2026-08-17/18 session. **Read `docs/CPU_Perf_Log.md` first** — it is
 the complete engineering log (mechanisms, laws, Pocket-port notes) and the
 scoreboard lives in `docs/Speedometer_3-23_Benchmarks.md`.
+
+Jump to **"STATUS: PHASE C SHIPPED"** and **"THE REMAINING LADDER"** below;
+the sections before them are the historical record of how the bug was found
+(kept because the METHOD — STA-probing a post-fit netlist instead of trusting
+a constraint — is the transferable lesson).
 
 ## Where the mission stands
 
