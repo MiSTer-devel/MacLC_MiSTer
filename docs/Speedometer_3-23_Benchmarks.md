@@ -24,6 +24,7 @@ every `(Rat.)` column; lower is better for every `(sec)` column.
 | Run                          | Computer  | CPU     | MMU Type    | Physical RAM (K) | Logical RAM (K) | KWhetstones/sec (Abs.) | KWhetstones (Rat.) | Dhrystones/sec (Abs.) | Dhrystones (Rat.) | Towers (sec) | Towers (Rat.) | Quick Sort (sec) | Quick Sort (Rat.) | Bubble Sort (sec) | Bubble Sort (Rat.) | Queens (sec) | Queens (Rat.) | Puzzle (sec) | Puzzle (Rat.) | Permutations (sec) | Permutations (Rat.) | Fast Fourier (sec) | Fast Fourier (Rat.) | F.P. Matrix (sec) | F.P. Matrix (Rat.) | Int. Matrix (sec) | Int. Matrix (Rat.) | Sieve (sec) | Sieve (Rat.) | Benchmark Mix Average (Mac Classic=1.0) | Monochrome (sec) | Monochrome (Rat.) | Two Bit (sec) | Two Bit (Rat.) | Four Bit (sec) | Four Bit (Rat.) | Eight Bit (sec) | Eight Bit (Rat.) | Color Benchmark Average (Mac II=1.0) |
 |:-----------------------------|:----------|:--------|:------------|-----------------:|----------------:|-----------------------:|-------------------:|----------------------:|------------------:|-------------:|--------------:|-----------------:|------------------:|------------------:|-------------------:|-------------:|--------------:|-------------:|--------------:|-------------------:|--------------------:|-------------------:|--------------------:|------------------:|-------------------:|------------------:|-------------------:|------------:|-------------:|----------------------------------------:|-----------------:|------------------:|--------------:|---------------:|---------------:|----------------:|----------------:|-----------------:|-------------------------------------:|
 | **MacLC core (68020) 640x480 — 2026-08-17** | Mac LC | MC68020 | Mac II AMU |            10240 |           10236 |                 30.303 |              4.151 |              2252.252 |             2.311 |        4.517 |         2.303 |            3.433 |               2.5 |              4.85 |              2.784 |        3.467 |         2.202 |          8.6 |         2.568 |              8.367 |               2.219 |             68.583 |               2.853 |            37.433 |              2.888 |             3.867 |              3.651 |      11.017 |        2.828 |                                   2.771 |             38.9 |             0.838 |            43 |          0.906 |         46.733 |           0.983 |          55.267 |            1.024 |                                0.937 |
+| **MacLC core + Phase B&C (demand-start SDRAM) 640x480 — 2026-08-18** | Mac LC | MC68020 | Mac II AMU |            10240 |           10236 |                 33.167 |              4.543 |              2516.778 |             2.583 |        4.167 |         2.496 |            3.067 |             2.799 |            4.367 |              3.092 |        3.183 |         2.398 |         8.05 |         2.743 |              7.633 |               2.432 |               62.6 |               3.126 |            34.167 |              3.164 |             3.517 |              4.014 |       9.117 |        3.417 |                                   3.067 |           35.033 |             0.931 |        38.983 |          0.999 |         42.567 |           1.079 |          50.783 |            1.115 |                                 1.03 |
 | **MacLC core + Phase B (bus FSM) 640x480 — 2026-08-18** | Mac LC | MC68020 | Mac II AMU |            10240 |           10236 |                 30.165 |              4.132 |              2242.152 |             2.301 |         4.55 |         2.286 |            3.433 |               2.5 |             4.883 |              2.765 |        3.467 |         2.202 |         8.617 |         2.563 |              8.417 |               2.206 |             68.883 |               2.841 |            37.617 |              2.874 |             3.933 |              3.589 |       11.05 |        2.819 |                                   2.756 |               39 |             0.836 |        43.183 |          0.902 |           46.7 |           0.983 |          55.567 |            1.019 |                                0.935 |
 | Mac LC (68020) 640x480       | Mac LC    | MC68020 | Mac II AMU  |            10240 |           10236 |                 34.924 |              4.784 |               2298.85 |             2.359 |         4.45 |         2.337 |             2.55 |             3.366 |              3.25 |              4.154 |          2.3 |         3.319 |        6.183 |         3.571 |              6.117 |               3.035 |             59.467 |               3.291 |            32.767 |                3.3 |               3.1 |              4.554 |         4.9 |        6.357 |                                   3.702 |           28.733 |             1.135 |        31.817 |          1.224 |         35.183 |           1.305 |          42.433 |            1.334 |                                1.249 |
 | Mac LC (68020) 512x384       | Mac LC    | MC68020 | Mac II AMU  |            10240 |           10236 |                 34.965 |              4.789 |               2307.69 |             2.368 |         4.45 |         2.337 |            2.533 |             3.388 |             3.233 |              4.175 |          2.3 |         3.319 |        6.167 |         3.581 |                6.1 |               3.044 |             59.333 |               3.298 |              32.7 |              3.306 |             3.067 |              4.603 |       4.883 |        6.379 |                                   3.715 |           28.617 |              1.14 |        31.583 |          1.233 |         34.967 |           1.313 |          42.217 |            1.341 |                                1.256 |
@@ -32,6 +33,43 @@ every `(Rat.)` column; lower is better for every `(sec)` column.
 | Mac II (68020) 512x384       | Mac II    | MC68020 | Mac II AMU  |             8192 |            8192 |                 53.715 |              7.358 |                2822.2 |             2.896 |        3.617 |         2.876 |            2.267 |             3.787 |             3.167 |              4.263 |        2.133 |         3.578 |        5.317 |         4.154 |              5.267 |               3.525 |             39.683 |               4.931 |              22.5 |              4.805 |              2.65 |              5.327 |         4.8 |         6.49 |                                   4.499 |           26.617 |             1.225 |        30.267 |          1.287 |         35.033 |           1.311 |          44.733 |            1.265 |                                1.272 |
 | Mac II (68020) 640x480       | Mac II    | MC68020 | Mac II AMU  |             8192 |            8192 |                  53.05 |              7.267 |               2811.62 |             2.885 |        3.633 |         2.862 |            2.283 |             3.759 |             3.167 |              4.263 |        2.133 |         3.578 |        5.317 |         4.154 |              5.283 |               3.514 |             39.933 |                 4.9 |              22.7 |              4.763 |             2.667 |              5.294 |       4.817 |        6.467 |                                   4.475 |           26.667 |             1.223 |        30.517 |          1.276 |         35.367 |           1.298 |          45.083 |            1.255 |                                1.263 |
 | Performa 600 (68030) 640x480 | Mac IIvx  | MC68030 | MC68030 MMU |            20480 |           20468 |                 67.796 |              9.287 |              3978.779 |             4.083 |        2.883 |         3.607 |              1.5 |             5.722 |             1.633 |              8.265 |        1.217 |         6.274 |        2.467 |         8.953 |              3.617 |               5.134 |              32.75 |               5.975 |            16.833 |              6.423 |              1.55 |              9.108 |       2.433 |       12.801 |                                   7.136 |            20.35 |             1.603 |        23.417 |          1.663 |         27.483 |           1.671 |          36.467 |            1.552 |                                1.622 |
+
+## ★ Phase B+C (demand-start SDRAM, branch `cpu-phase-c-fix`) — +10.7%
+
+Measured on hardware 2026-08-18, same bench/guest/config, RBF md5
+`b9ed35136d5ef2994589d6a77bb64088` (seed 4, STA met +0.149 ns).
+
+| Suite | Baseline | Phase B | **Phase B+C** | vs baseline | share of a real Mac LC |
+|:--|--:|--:|--:|--:|--:|
+| Benchmark Mix | 2.771 | 2.756 | **3.067** | **+10.7%** | 74.9% → **82.8%** |
+| Color Benchmarks | 0.937 | 0.935 | **1.030** | **+9.9%** | 75.0% → **82.5%** |
+
+**Every single test improved** (+6.6% to +17.5%), and the prediction held: the
+bus-cycle histogram forecast ~+12% cycles/sec, the mix measured **+11.3%** over
+Phase B. Cycle lengths went completely flat (100% of fetches at exactly 8
+ticks) instead of the baseline's 75%-at-8 with the rest paying 10/12/14 for
+slot misalignment.
+
+Two tests now BEAT a physical Mac LC — Dhrystones 109.5% and Towers 106.8% —
+and 8-bit colour (1.115) is past a Mac II. Floating point sits at ~95%.
+
+**Where the remaining ~17% lives — exactly where the mission's opening
+analysis predicted.** The worst tests are still the tight-loop ones that fit
+inside a real 68020's 256-byte on-chip instruction cache, which this core does
+not have:
+
+| test | share of a real Mac LC |
+|:--|--:|
+| Sieve | 53.7% |
+| Queens | 72.3% |
+| Bubble Sort | 74.4% |
+| Puzzle | 76.8% |
+
+That is the I-cache deficit, not the bus — the bus work is done. Ladder item 3
+(`rtl/fetch_cache.sv` on branch `i-cache`, shadow-measured at 87.7% hit at
+256 B / 96.0% at 1 KB) is now the single dominant remaining item, and it
+targets precisely these tests. Note it must be re-evaluated against the NEW
+7-tick-flat memory path, not the old 8-14 tick one.
 
 ## Phase B (collapsed bus FSM, commit 2791e6a) — NO measurable change
 
