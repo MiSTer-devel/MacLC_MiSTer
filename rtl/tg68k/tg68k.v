@@ -34,6 +34,11 @@ module tg68k (
 	output [15:0] dout,
 	output longword,        // 1 = current access is a 32-bit (longword) access
 	output reg [31:0] addr,
+	// EARLY address: the kernel's combinational address output, valid one full
+	// clk BEFORE `addr`/AS (which the Phase-B FSM registers on the same edge).
+	// The fetch cache needs this for its continuous-lookup correspondence guard
+	// — see the port note in rtl/fetch_cache.sv.
+	output [31:0] addr_early,
 
 	// Debug outputs
 	output [1:0] busstate
@@ -389,5 +394,6 @@ end
 	`endif
 // Expose busstate for debugging
 assign busstate = tg68_busstate;
+assign addr_early = tg68_addr;
 
 endmodule

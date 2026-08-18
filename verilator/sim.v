@@ -350,6 +350,7 @@ module emu
 
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space || pds_card_sel) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        icache_hit ? 1'b0 :        // fetch-cache hit answers now
 	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
@@ -410,6 +411,7 @@ module emu
 	wire        tg68_fc2;
 	wire [15:0] tg68_dout;
 	wire [31:0] tg68_a;
+	wire [31:0] tg68_a_early;   // pre-AS address for the fetch cache
 	wire        tg68_reset_n;
 	wire        tg68_longword;   // 32-bit access flag — drives SCSI pseudo-DMA byte packing
 	wire [1:0]  tg68_busstate;
@@ -488,11 +490,46 @@ module emu
 
 		.ipl        ( _cpuIPL ),
 		.berr       ( cpu_berr ),
-		.din        ( pds_card_sel ? pds_dout : slot_space ? 16'hFFFF : dataControllerDataOut ),
+		.din        ( pds_card_sel ? pds_dout : slot_space ? 16'hFFFF :
+		              icache_hit ? icache_data : dataControllerDataOut ),
 		.dout       ( tg68_dout ),
 		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
+		.addr_early ( tg68_a_early ),
 		.busstate   ( tg68_busstate )
+	);
+
+	// ── Fetch cache (ported 2026-08-18 from branch i-cache @b393eaf) ─────────
+	// Answers instruction fetches from on-chip BRAM. It is fed the EARLY
+	// address (see the port note in rtl/fetch_cache.sv): the Phase-B FSM
+	// registers cpuAddr on the same edge AS falls, so the module's
+	// continuous-lookup correspondence guard would reject every fetch if it
+	// were given the registered address.
+	// The cache FILLS AND SNOOPS ALWAYS; `enable` gates only the answer path,
+	// so +icache selects between a cache-ON and cache-OFF run of the SAME
+	// binary with an identically warm/coherent cache — that is the A/B the
+	// 2026-07-07 session could not run (sim runs were banned then) and which
+	// is the deterministic catch for the disk-corruption blocker: diff
+	// cpu_trace.log between the two, and the first divergent instruction names
+	// the coherency hole.
+	reg icache_en = 1'b0;
+	initial if ($test$plusargs("icache")) icache_en = 1'b1;
+	wire        icache_hit;
+	wire [15:0] icache_data;
+	fetch_cache #(.LOG2_WORDS(9)) icache (
+		.clk        ( clk_sys ),
+		.reset      ( ~_cpuReset ),
+		.flush_bits ( {memoryOverlayOn, dio_download} ),
+		.enable     ( icache_en ),
+		.cpuAddr    ( tg68_a_early[23:0] ),
+		.as_n       ( _cpuAS ),
+		.rw         ( _cpuRW ),
+		.fc         ( cpuFC ),
+		.cacheable  ( selectRAM || selectROM ),
+		.snoopable  ( selectRAM ),
+		.mem_din    ( dataControllerDataOut ),
+		.hit        ( icache_hit ),
+		.hit_data   ( icache_data )
 	);
 
 	// CPU debug - capture PC and opcode during instruction fetch

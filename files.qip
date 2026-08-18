@@ -24,6 +24,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret_behavioral.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ariel_ramdac.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/maclc_v8_video.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/vram_bram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fetch_cache.sv
 set_global_assignment -name VERILOG_FILE rtl/pll_video.v
 set_global_assignment -name QIP_FILE sys/pll_cfg.qip
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/pseudovia.sv
