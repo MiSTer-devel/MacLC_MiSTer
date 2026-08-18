@@ -143,6 +143,70 @@ Desktop windows: fetch 8.60, VRAM read 9.50, VRAM write 10.10.
 canonical MacLC.rbf; coreRunning=MACLC; booted System 7.5 to the Finder
 desktop with clean video and colour icons (scratch/phaseB_hw_boot1.png).
 
+### 4 — 2026-08-18: Phase C FIX — pipeline the request bundle (branch `cpu-phase-c-fix`)
+
+**The F-line bomb was a genuine timing failure, and STA proved it.** With the
+`b48b60c` multicycle disabled, timing analysis on the post-fit netlist
+reported:
+
+```
+slack -6.710 ns   WINDOW 15.381 ns   tg68k|addr[16] -> sdram|sd_addr[12]
+```
+
+The capture window is ONE clk_64 period (15.381 ns) — so the `t[0]` start gate
+selects the half-period edges, not the coincident ones — while the V8
+address-translation cone (SIMM compare, mirror subtract, mux) needs ~22 ns.
+The demand sequencer was latching a **half-settled row/column address**, so
+reads and writes landed at the wrong locations. That is the RAM corruption
+behind the "System Update" error-type-10 (F-line) bomb: the guest eventually
+executed garbage. The multicycle had been granting 2 destination periods
+(30.76 ns) that the silicon never had — the textbook STA-met-but-HW-fails trap.
+
+**Why Phase B never had this problem:** it did not touch `sdram.v`. The old
+slot machine sampled at a fixed slot phase with the CPU holding address and
+data stable across the WHOLE 4-clk_sys slot — about 123 ns of settling. Phase C
+discarded that margin and replaced it with a promise in a constraint file.
+
+**Fix (core RTL + both tops):** register the entire SDRAM request bundle in
+clk_sys before it reaches the controller — `addr`, `din`, `ds`, `oe`, `we`,
+`flp_win`, `flp_guard`, plus the floppy byte-parity select so it stays coherent
+with the address it was issued with. The deep cone now terminates at a clk_sys
+flop with a full 30.76 ns period (22 ns needed → genuine positive slack), and
+the sequencer captures from an adjacent register over a short route. Both legs
+are honest single-cycle paths STA actually checks. **The multicycle is deleted**
+with a DO-NOT-RE-ADD note in `MacLC.sdc`.
+
+**Verified:** SDRAM paths **−6.710 → +3.817 ns**; design-wide worst setup back
+to the framework ascal at +0.424 ns. Sim boots clean (frame 450 = dither
+desktop + cursor + flashing-? icon).
+
+**Cost and result — one clk_sys tick of request latency:**
+
+| | baseline | Phase B | Phase C (broken) | Phase C + fix |
+|---|--:|--:|--:|--:|
+| ROM fetch | 8.96 avg (75% at len 8) | 8.93 | 7.00 | **8.00 flat (100%)** |
+| VRAM read | ~11.6 | 9.50 | 7.00 | **8.00** |
+| VRAM write | ~10.1 | 10.10 | 6.00 | **7.00** |
+| desktop cycles/sec | — | 3.20 M | 4.44 M | **3.59 M (+12% over Phase B)** |
+
+The win is smaller than the broken build advertised (+12% vs +38%) but it is
+real. **Everything is now FLAT** — 100% of fetches at exactly 8 ticks, versus a
+baseline where only 75% hit the floor and the rest paid 10/12/14 for slot
+misalignment. That flatness is the demand engine working as designed.
+
+**Idea for Phase C2 (recovering the lost tick, 8 → 7):** translate the address
+speculatively from the kernel's combinational `tg68_addr` and register THAT, so
+the translated address is valid at the same edge AS asserts instead of one tick
+later. Needs a timing check on the kernel-output cone, which is already long.
+
+**Seed note:** the seed-7 placement of this fix left an unrelated 19 ps HOLD
+violation in the CD-audio MLAB write-address path (`cd_audio|t43_wa[5]` →
+`cd_sdp_mlab` LUT-RAM address regs) — a module this change never touched,
+exposed because any netlist edit re-rolls the unpinned RAMs. Refit on seed 4.
+★ That is the LEGITIMATE use of a reseed (placement marginality on an unrelated
+module); using one to make the address-path violation "pass" would have been
+the illegitimate use, and is exactly what the deleted multicycle was doing.
+
 ### 3 — 2026-08-17: Phase C — demand-start SDRAM service (the slot-floor break)
 
 **Core RTL (ports to Pocket): `rtl/sdram.v`** — the operational branch of
