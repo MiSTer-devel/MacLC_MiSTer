@@ -78,99 +78,93 @@ no tap.lua/trace.dbg captures) — all MAME work was source reading.
    counts, but `tap`-style memory traces can confirm access PATTERNS
    (e.g. whether the guest issues the RMW traffic we think it does).
 
-## ★★★ HW GATE RESULT: PHASE C **FAILS** ON HARDWARE — START HERE
+## ★ STATUS: PHASE C SHIPPED AND MEASURED (2026-08-18)
 
-Deployed md5 `4fede16981c5b57d515cc2c4560698a3` (commit `4f24246`, STA
-+0.573) boots MUCH further than before — POST passes, the Mac OS splash and
-"Starting up…" progress bar render correctly, extensions begin loading — then
-**bombs: "System Update" / error type 10** (= line-1111 / F-line exception,
-i.e. the CPU executed a word that decoded as an F-line opcode). Reproduced
-identically after a guest Restart, so it is deterministic, not a dice-roll.
-Screenshots: `scratch/phaseC_fixed_hw_boot.png`, `scratch/phaseC_boot_retry.png`.
+**Released as `releases/MacLC_20260817.rbf`** (md5
+`b9ed35136d5ef2994589d6a77bb64088`, seed 4, STA met +0.149 ns, branch
+`cpu-phase-c-fix`, not pushed — the user pushes unstables themselves).
 
-**An F-line bomb means executed garbage ⇒ memory-content corruption**, not a
-hang: some read returned wrong data, or some write landed wrong, and the OS
-eventually jumped into it. Crucially, **the same tree boots perfectly in
-Verilator** and passes every offline TB — so the defect is HARDWARE-ONLY,
-which means TIMING or REFRESH in the demand engine, not logic.
+| Suite | Baseline | Phase B | **Phase B+C** | vs baseline | share of a real Mac LC |
+|:--|--:|--:|--:|--:|--:|
+| Benchmark Mix | 2.771 | 2.756 | **3.067** | **+10.7%** | 74.9% → **82.8%** |
+| Color Benchmarks | 0.937 | 0.935 | **1.030** | **+9.9%** | 75.0% → **82.5%** |
 
-The bisect is already narrow: Phase B (`2791e6a`) is HW-validated and boots
-clean to the Finder; everything between it and `4f24246` is the demand
-engine. **Do not chase the CLUT/Ariel again — that path is settled.**
+Every test improved (+6.6% to +17.5%); predicted +12% from the histogram,
+measured +11.3%. Dhrystones (109.5%) and Towers (106.8%) now beat a physical
+Mac LC. The F-line bomb was root-caused by STA (a -6.710 ns half-settled SDRAM
+address) and fixed structurally — full forensics in `docs/CPU_Perf_Log.md`
+entry 4. **Do not re-add a multicycle on the SDRAM request paths.**
 
-### Suspects, ranked, with the test for each
+## ★ THE REMAINING LADDER, RE-PRIORITISED BY THE MEASURED DATA
 
-★ The user's read (2026-08-18) is that **the demand engine's interaction
-with the MiSTer SDRAM is simply wrong**, which is the classic cause of
-F-line-class corruption after an SDRAM change. The analysis below supports
-that directly — suspect 1 is a genuine CDC unsoundness, not just tight
-timing, and it also explains cleanly why Phase B is fine.
+The residual gap is no longer uniform — the per-test shares say exactly where
+it lives:
 
-1. **★★★ PRIME: the clk_sys→clk_mem request capture is unsound, and the
-   SDC multicycle `b48b60c` hides it.** Derivation: `clk_mem` (65 MHz) is
-   exactly 2× `clk_sys` (32.5 MHz) off the same PLL, so every other clk_64
-   edge coincides with a clk_sys edge. The ladder counter `t` counts 0..7
-   per `clk_8` period and — because 8 clk_64 == 1 clk_8 exactly — never
-   stalls in steady state, so `t[0]` selects *alternate* clk_64 edges: EITHER
-   all the clk_sys-coincident ones OR all the half-period ones, fixed at
-   runtime by where the clk_8 sync landed. Therefore a request launched from
-   a clk_sys flop (AS/addr/din/ds/oe/we) is captured by the ACTIVE branch
-   either **~0 ns later (coincident case = a straight race)** or **15.4 ns
-   later (half-period case)** — never the "≥1 full clk_sys = 30.8 ns" the
-   multicycle comment claims. The V8 address translation cone (SIMM
-   compare, mirror subtract, mux) into `sd_addr`/`col_q` plausibly exceeds
-   15.4 ns on its own. So STA was told to ignore paths that are real.
-   **This also explains why Phase B is clean**: it never touched `sdram.v`,
-   where the old slot machine sampled at `t == STATE_CMD_START` with the CPU
-   holding address/data stable for the WHOLE 4-clk_sys slot (~123 ns of
-   margin). Phase C threw that margin away.
-   **Fix (structural, not a constraint):** gate `req_cpu` on a clk_sys-domain
-   "request has been stable for ≥1 full tick" qualifier — the same shape as
-   Phase B's `as_low_q` — so addr/din/ds are provably ≥30.8 ns old before any
-   clk_64 edge can capture them; only THEN is the 2-period multicycle honest
-   (standard data+valid CDC: data multicycled, valid single-cycle). Costs
-   ~1 tick of start latency; the 7-tick read may become 8, still far better
-   than the 8–14 baseline. **Test first: delete the two SDC lines and refit
-   as-is** — if STA now reports a violation on these paths, the diagnosis is
-   confirmed outright.
-2. **Write-data capture at ACTIVE is too early.** `din_q <= din` samples the
-   kernel's `data_write` through the top-level mux, and Phase B moved the
-   write strobes to assert WITH AS (old walker: two ticks later at s3), so
-   the engine can now latch write data earlier than any prior design ever
-   did. Sim has zero propagation delay and cannot see this. **Test: hold CPU
-   write starts one extra clk_sys tick (or capture `din` at CAS from a
-   clk_sys-registered copy) and refit.**
-3. **Refresh starvation.** Old design: AUTO_REFRESH on every idle slot
-   (massively over-provisioned). New: lowest-priority `else if`, blocked by
-   `!flp_guard && !flp_win`, with CPU back-off only at `ref_due >= REF_FORCE`
-   (480 clk_64 ≈ 7.38 µs) vs the chip's ~7.8 µs tREF average — **thin**, and
-   the floppy keep-out can push it later. ★ The GCR encoder FREE-RUNS with no
-   disk mounted (CLAUDE.md: "byte_cnt churns on garbage"), so floppy windows
-   and their guard fire continuously during a normal SCSI boot — exactly the
-   workload that bombed. **Test: drop REF_FORCE to ~380 and REF_OPP to ~200,
-   and/or give refresh priority over `req_flp` when `ref_due` is high.**
-   Corruption-after-seconds-of-heavy-IO is the signature of marginal refresh.
+| where the core still trails | share of a real LC | the cause |
+|:--|--:|:--|
+| Sieve / Queens / Bubble / Puzzle | 54-77% | **no I-cache** (tight loops fit a 68020's 256 B cache) |
+| QuickDraw colour suite | ~82% | VRAM reads still round-trip SDRAM |
+| Floating point (Whet/FFT/FPM) | ~95% | essentially parity — nothing to win |
+| Dhrystones / Towers | 107-110% | already faster than the real machine |
 
-Bisect cheaply by reverting one thing at a time — each fit is ~20 min. A
-faster discriminator for #3 alone: boot with the floppy encoder quiesced
-(no floppy image mounted AND `flp_pend_*` forced 0 in a probe fit); if the
-bomb disappears, it is refresh/guard interaction.
+**1. I-CACHE — now the single dominant item.** Branch `i-cache` @ `b393eaf`
+already has `rtl/fetch_cache.sv` (1 KB direct-mapped, write snoop + generation
+flush, OSD-gated but always filling so one build gives a live A/B) plus
+`docs/resume_icache_corruption_2026-07-07.md`. Shadow-measured 87.7% hit at
+256 B / 96.0% at 1 KB. Parked on disk corruption with the cache ON + a mono
+regression. ★ Two things changed that make it far more tractable now:
+  - The parked doc's prime suspect was "the combinational DTACK join being
+    STA-met-but-HW-marginal". After what Phase C just taught us, that suspicion
+    is much more credible — and `scratch/sta_sdram_probe.tcl` is the ready-made
+    tool to check it (point it at the cache's keepers instead).
+  - It must be re-evaluated against the NEW 8-tick-flat path, not the old 8-14
+    tick one: a hit is worth less than it was, so re-measure before assuming
+    the old projections hold.
 
-### On trying other SEEDS for Phase C
+**2. Phase D — CPU VRAM reads from `vram_bram` port A.** `a_dout` is still
+unused (`rtl/vram_bram.sv:31-32` says "reserved for a later phase"), and
+`addrController_top.v:200-222` routes `selectVRAM` reads to the SDRAM shadow at
+word `0x580000`. The histogram shows VRAM reads are **20-38% of desktop bus
+traffic**, all currently paying the full 8-tick SDRAM path when they could be
+served from on-chip BRAM in ~5-6. Zero M10K cost (the port exists). This is the
+cheap, well-scoped win and it targets the colour suite directly.
 
-**Not tried — both Phase-C fits were seed 7 only.** Worth running as a
-DIAGNOSTIC, not as a fix:
-- If another seed (5, 6, 3) bombs *identically* at "System Update" error 10,
-  that is strong evidence of a **systematic** protocol/CDC error (suspect 1),
-  because placement luck would not reproduce the same failure point.
-- If different seeds fail differently or one boots, that says **marginal
-  timing** — which points at the same unsound-constraint root cause anyway.
+**3. Phase C2 — recover the lost tick (8 → 7).** The pipeline stage that fixed
+the timing costs one clk_sys per access. Recovering it means translating the
+address speculatively from the kernel's combinational `tg68_addr` and
+registering THAT, so the translated address is valid at the same edge AS
+asserts. Worth roughly another +10% (the broken 7-tick build ran 4.44 M
+cycles/s vs 3.59 M at 8 ticks). Risk: the kernel's own output cone is long, so
+prove it with STA before believing it — and never with a multicycle.
 
-★ **Do not accept a passing seed as the fix.** With the multicycle in place
-STA is not even checking the suspect paths, so a "good" seed would be a
-placement that happens to meet a path nobody is verifying — latent
-corruption shipped, and exactly the trap this repo's per-seed gating law
-exists to catch. Fix the constraint/structure first, THEN gate seeds.
+**4. SCSI read ring 16 KB → 32 KB — still "measure first", still low
+priority.** `RING_LOG = 5` (`rtl/scsi.v:129`). Buys burst absorption, not
+bandwidth, so it will not move Speedometer. The blocker comment's M10K maths is
+stale (the mirror RAMs were deleted in the 2026-07-17 redesign); re-derive
+before trusting it, and watch `dbg_ring` first to see if the ring is even
+starved.
+
+**5. Refresh margin (a latent risk this mission introduced).** `REF_FORCE` =
+480 clk_64 ≈ 7.38 µs against the chip's ~7.8 µs tREF average, with refresh as
+the lowest-priority branch and blocked inside the floppy guard zone. It is
+inside spec today and the hardware is stable, but the margin is thin by design.
+Consider lowering `REF_OPP`/`REF_FORCE` or letting refresh pre-empt `req_flp`
+when `ref_due` is high.
+
+**Explicitly ruled out — do not revisit:** more framebuffer BRAM (already
+384 KB, video reads are single-cycle on port B), the DDR3 video channel
+(superseded, and DDR3 is broken on this core), porting the MacIIvi 68030 cache
+subsystem (bolted to the 030 kernel), and "video is slow" theories (both suites
+track each other to within 0.3 points).
+
+## Validation debt on the shipped build
+
+Passed: clean boot to the 7.5.5 Finder with colour icons, full Speedometer run,
+all offline TBs (tb_gcr_read at standard AND tightened pollgap, tb_mfm_idcensus,
+tb_ism_sony, tb_disk_swap, tb_scsi_pf, tb_scc_midi, check_boot, full-boot sim
+gate), STA clean with no masking constraints.
+**Still owed:** multi-boot Finder soak (one boot is never a verdict),
+floppy/SCSI/CD hardware regression pass.
 
 ## What happens next (in order)
 
