@@ -180,14 +180,36 @@ exists to catch. Fix the constraint/structure first, THEN gate seeds.
 1. **HW boot gate on the fixed build**: guest boots from SCSI to the Finder.
    One boot is never a verdict; CD `MACLC.s4` stays ATTACHED (retry, don't
    detach).
-2. **★ THE CLOCK CHECK — do not skip.** On the booted Finder, screenshot
-   (`bash scripts/grab_fresh.sh scratch/clk1.png`), wait ≥3 min, screenshot
-   again: the menubar clock MUST advance. A frozen clock was observed once on
-   the Phase-B HW boot (cursor alive, clock stuck) and is still UNEXPLAINED —
-   it may be pre-existing (verify against the 08-15 release build
-   `releases/MacLC_20260815.rbf`) or a Phase-B/C regression. Timer-class
-   breakage skews every self-timed benchmark (see the system-tick-halved
-   lore), so this must be settled before trusting Speedometer numbers.
+2. **★ THE CLOCK CHECK — MEASURED 2026-08-18, IT IS FROZEN.** On the
+   redeployed Phase-B build (boots clean to the 7.5.5 desktop, colour icons
+   fine, cursor alive) the menubar clock read **6:37 AM in two screenshots
+   taken ~4 minutes apart** (`scratch/phaseB_redeploy_boot.png`,
+   `scratch/phaseB_clock_t2.png`; captures verified fresh by filename
+   timestamp). So the freeze is NOT Phase-C-specific and is reproducible.
+
+   **What it probably is — and why it probably does NOT invalidate
+   Speedometer:** the Mac's time-of-day advances off the **1 Hz** path
+   (`onesec = (tickCount == 59)` → VIA1 **CA2**, `rtl/dataController_top.sv`
+   ~line 707), while `TickCount`/Time Manager — what Speedometer and every
+   self-timed benchmark use — runs off the **60 Hz** path (`tick_60hz` →
+   VIA1 **CA1**, same block). Those are separate signals off the same
+   counter, so a dead 1 Hz clock with a healthy 60 Hz tick is entirely
+   possible (and the boot completing at sane speed argues the 60 Hz tick is
+   alive). Note `onesec` is a LEVEL that is high for one whole 60 Hz tick
+   period (~16.7 ms) once per second, not a pulse — check how VIA CA2 edge
+   detection and the PCR mode the OS programs interact with that.
+
+   **Do these, in order:**
+   a. A/B against the shipped release: deploy `releases/MacLC_20260815.rbf`
+      and repeat the two-screenshot check. Frozen there too ⇒ **pre-existing**,
+      unrelated to this mission (log it and move on). Advancing there ⇒ a
+      **Phase-B regression**, and the suspect is the FSM's changed AS/VMA
+      timing feeding the VIA's E-paced register access.
+   b. Either way, confirm the 60 Hz tick independently before trusting
+      benchmark numbers — e.g. time a known-duration operation in the guest
+      against a wall clock, or compare a Speedometer run's absolute times
+      against the 2026-08-17 baseline row (which was captured on the 08-15
+      release, i.e. under whatever clock behaviour that build has).
 3. **Speedometer 3.23 run** (the user runs it; bench guest 7.5.5 at 640x480,
    10 MB — same config as the scoreboard's core row). Add a new row to
    `docs/Speedometer_3-23_Benchmarks.md` labeled with commit `4f24246` and
