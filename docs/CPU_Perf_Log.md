@@ -199,6 +199,14 @@ speculatively from the kernel's combinational `tg68_addr` and register THAT, so
 the translated address is valid at the same edge AS asserts instead of one tick
 later. Needs a timing check on the kernel-output cone, which is already long.
 
+**★ HW GATE: PASS (2026-08-18 09:53).** Seed-4 fit (STA met, +0.149 ns, no
+violations) deployed as canonical MacLC.rbf: the guest boots straight to the
+System 7.5.5 Finder desktop with colour icons intact and NO bomb. The
+"System Update" error-type-10 crash is gone. This closes the loop opened by
+the 2026-08-17 failure: sim-clean + STA-clean + HW-clean, with the timing
+proven rather than asserted. Speedometer re-run is the remaining step (expect
+~+12% on the mix per the histogram; Phase B alone measured as noise).
+
 **Seed note:** the seed-7 placement of this fix left an unrelated 19 ps HOLD
 violation in the CD-audio MLAB write-address path (`cd_audio|t43_wa[5]` →
 `cd_sdp_mlab` LUT-RAM address regs) — a module this change never touched,
