@@ -327,8 +327,27 @@ module addrController_top(
 			end
 		end
 	end
-	assign dskReadAckInt = (extraBusControl == 1'b1) && (extra_slot_count == 0) && flp_pend_int;
-	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1) && flp_pend_ext;
+	// ★★★ !dio_download is LOAD-BEARING (2026-08-18). The floppy window and the
+	// download slot are THE SAME SLOT (extraBusControl == dioBusControl), and a
+	// window does more than request a fetch: it switches `memoryAddr` to the
+	// floppy image address and forces both data strobes. That was harmless only
+	// because a window also blocks CPU starts (flp_win/flp_guard in sdram.v).
+	// During a download flp_win is deliberately suppressed at the top level, so
+	// nothing blocks the CPU — and with the old `download_cycle` mux gone, the
+	// CPU's own request now reaches the controller with the FLOPPY address on
+	// memoryAddr. Reads then return image bytes instead of the guest's memory
+	// (and writes land in the image). Observed on hardware as a mount that
+	// freezes the guest with a sprayed framebuffer.
+	// The encoder free-runs with no disk, so these windows fire continuously
+	// during a normal boot — this is not a corner case.
+	// Suppressing the ack here (rather than only flp_win at the top) keeps
+	// memoryAddr, the data strobes, flp_win_any and the sdram_do source mux all
+	// consistent: during a download there is simply no floppy window. The
+	// pending state persists (and flp_valid is cleared by the download anyway),
+	// so the fetch is served, fresh, once the download ends.
+	wire flp_ok = !dio_download;
+	assign dskReadAckInt = (extraBusControl == 1'b1) && (extra_slot_count == 0) && flp_pend_int && flp_ok;
+	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1) && flp_pend_ext && flp_ok;
 	// extra_slot_count == 2 is now idle (legacy sound DMA removed)
 
 	// flp_guard: a pending floppy window fires this rotation — hold off new
@@ -340,7 +359,7 @@ module addrController_top(
 	// race-free against the sequencer's clk_64 sampling.
 	assign flp_guard = ((extra_slot_count == 2'd0 && flp_pend_int) ||
 	                    (extra_slot_count == 2'd1 && flp_pend_ext)) &&
-	                   ((busCycle == 2'b01) || (busCycle == 2'b10));
+	                   ((busCycle == 2'b01) || (busCycle == 2'b10)) && flp_ok;
 
 	// Final SDRAM word address output
 	assign memoryAddr =

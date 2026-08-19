@@ -88,10 +88,16 @@ always @(posedge clk) begin
 	if (flp_win) dout <= mem[flp_addr[22:0]];
 
 	// demand handshake
+	// NOTE: dl_ack is deliberately NOT cleared here. `reset` is held high for
+	// the whole ROM download (see the write-commit comment above — downloads
+	// must work during reset), so clearing the ack in this branch stalls the
+	// handshake forever and nothing ever loads. `if (!dl_req) dl_ack <= 0;`
+	// above already idles it. rtl/sdram.v does not have this hazard: its
+	// `reset` is the SDRAM init ladder, which has long finished by the time
+	// the HPS starts a download.
 	if (reset) begin
 		cpu_done <= 0;
 		req_d    <= 0;
-		dl_ack   <= 0;
 	end else if (!(oe || we)) begin
 		cpu_done <= 0;         // AS released / request withdrawn
 		req_d    <= 0;
