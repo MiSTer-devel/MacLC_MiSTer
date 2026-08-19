@@ -284,49 +284,44 @@ module addrController_top(
 	// ============================================================
 	// Extra bus slots (disk reads, sound)
 	// ============================================================
-	// Phase C: floppy fetch windows are PENDING-GATED — a window only fires
-	// when the encoder's fetch address has changed since the last served
-	// fetch (or none was served yet). The old design read SDRAM every
-	// rotation regardless (the MacIIvi-noted spurious read); under demand-
-	// start those idle windows would steal CPU bandwidth for nothing. The
-	// window itself keeps the exact old slot alignment, so floppy.v's
-	// ack/latch protocol (dskReadAckD at cen, fetch-freshness after an
-	// address advance) sees identical timing — one ack per address, which is
-	// precisely what the freshness protocol needs. Served state is marked at
-	// the window's memoryLatch tick (data captured into sdram dout by then).
-	reg [21:0] flp_addr_int_q, flp_addr_ext_q;
-	reg        flp_valid_int,  flp_valid_ext;
-	wire flp_pend_int = !flp_valid_int || (dskReadAddrInt != flp_addr_int_q);
-	wire flp_pend_ext = !flp_valid_ext || (dskReadAddrExt != flp_addr_ext_q);
+	// ── Floppy fetch windows: UNGATED, one fetch per rotation ──────────────
+	// Phase C made these windows PENDING-GATED (fire only when the encoder's
+	// address changed since the last served fetch) to stop idle windows
+	// stealing CPU bandwidth. That gate is REVERTED here (2026-08-19), back to
+	// the pre-Phase-C behaviour of reading SDRAM every rotation.
 	//
-	// ★★★ BUG FIX 2026-08-18 — dio_download MUST invalidate this.
-	// The gate remembers "address A was already served, skip it", but MOUNTING
-	// AN IMAGE REWRITES SDRAM AT THOSE SAME ADDRESSES. Without invalidation the
-	// encoder keeps feeding the guest the byte latched from the PREVIOUS image,
-	// so inserting a floppy delivers a garbage data stream — observed on
-	// hardware as an "illegal instruction" bomb right after a disk insert.
-	// (The offline floppy TBs cannot catch this: they drive the encoder
-	// directly and never exercise addrController's window gating or a
-	// download.) Clearing the valid bits while a download runs forces a fresh
-	// read of whatever address the encoder next asks for.
-	always @(posedge clk) begin
-		if (!_cpuReset) begin
-			flp_valid_int <= 0;
-			flp_valid_ext <= 0;
-		end else if (dio_download) begin
-			flp_valid_int <= 0;   // SDRAM contents changed under us
-			flp_valid_ext <= 0;
-		end else begin
-			if (dskReadAckInt && memoryLatch) begin
-				flp_addr_int_q <= dskReadAddrInt;
-				flp_valid_int  <= 1;
-			end
-			if (dskReadAckExt && memoryLatch) begin
-				flp_addr_ext_q <= dskReadAddrExt;
-				flp_valid_ext  <= 1;
-			end
-		end
-	end
+	// Why: with the download-corruption bug fixed, a mount no longer bombs the
+	// guest — but the volume then reports "This disk is unreadable" for BOTH an
+	// 800K GCR image and a 1.44MB MFM image, while the same GCR image mounts
+	// and reads perfectly on releases/MacLC_20260815.rbf (pre-mission). Failing
+	// identically across two completely different track encoders rules the
+	// encoders out and puts the defect in this shared fetch seam, which the
+	// gate is the only Phase C change to alter FUNCTIONALLY (everything else
+	// only moved timing).
+	//
+	// ★ The gate's stated premise — "one ack per address is precisely what the
+	// freshness protocol needs" — is provably WRONG. Read floppy.v's MFM
+	// delivery loop: on every byte it sets `mfm_ack_skip` (the ack still in
+	// flight belongs to the address it just advanced FROM) and clears
+	// `mfm_fresh`, then waits for an ack to set `mfm_fresh` again. That is
+	// **TWO acks per delivered byte** — one absorbed by the skip, one to arm
+	// the next byte. The pending gate delivers exactly ONE ack per address
+	// change; it is consumed by the skip, `mfm_fresh` never sets, and delivery
+	// stalls at the loop's own "payload byte not fetched yet" branch. The GCR
+	// path relies on repeated acks the same way (`if (dskReadAck) diskImageData
+	// <= dskReadDataEnc` re-samples every rotation, picking up the value
+	// dskReadDataLatch settled on a previous one). Both encoders were written
+	// against continuous every-rotation acks — which is exactly what this
+	// design provided before Phase C, and why BOTH a GCR and an MFM image fail
+	// identically with the gate in.
+	// It is fragile in a second way too: dskReadAddr is compared LIVE while the
+	// window is open, so an address advancing mid-window records the NEW
+	// address in flp_addr_q against data fetched for the OLD one.
+	//
+	// The bandwidth argument for the gate no longer applies: under demand-start
+	// the CPU is served from any idle clk_64 edge and does not need this slot.
+	// (The MacIIvi-noted "spurious read" is harmless — it re-reads an address
+	// the encoder is still pointing at.)
 	// ★★★ !dio_download is LOAD-BEARING (2026-08-18). The floppy window and the
 	// download slot are THE SAME SLOT (extraBusControl == dioBusControl), and a
 	// window does more than request a fetch: it switches `memoryAddr` to the
@@ -343,11 +338,11 @@ module addrController_top(
 	// Suppressing the ack here (rather than only flp_win at the top) keeps
 	// memoryAddr, the data strobes, flp_win_any and the sdram_do source mux all
 	// consistent: during a download there is simply no floppy window. The
-	// pending state persists (and flp_valid is cleared by the download anyway),
-	// so the fetch is served, fresh, once the download ends.
+	// so the encoder simply gets no data during the download and resumes
+	// fetching normally the moment it ends.
 	wire flp_ok = !dio_download;
-	assign dskReadAckInt = (extraBusControl == 1'b1) && (extra_slot_count == 0) && flp_pend_int && flp_ok;
-	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1) && flp_pend_ext && flp_ok;
+	assign dskReadAckInt = (extraBusControl == 1'b1) && (extra_slot_count == 0) && flp_ok;
+	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1) && flp_ok;
 	// extra_slot_count == 2 is now idle (legacy sound DMA removed)
 
 	// flp_guard: a pending floppy window fires this rotation — hold off new
@@ -357,8 +352,7 @@ module addrController_top(
 	// (not just its last 3 ticks) costs the CPU at most one extra slot only
 	// while a floppy fetch is actually pending, and makes the guard's rise
 	// race-free against the sequencer's clk_64 sampling.
-	assign flp_guard = ((extra_slot_count == 2'd0 && flp_pend_int) ||
-	                    (extra_slot_count == 2'd1 && flp_pend_ext)) &&
+	assign flp_guard = ((extra_slot_count == 2'd0) || (extra_slot_count == 2'd1)) &&
 	                   ((busCycle == 2'b01) || (busCycle == 2'b10)) && flp_ok;
 
 	// Final SDRAM word address output
