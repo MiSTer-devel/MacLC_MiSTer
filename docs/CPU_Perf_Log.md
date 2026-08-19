@@ -88,6 +88,35 @@ are calibrated against current pacing).
 
 ## Entries
 
+### ★ CORRECTION (2026-08-18): the floppy fixes are REASONED, not REPRODUCED
+
+The two floppy fixes below (entry 7) were motivated by hardware bombs seen
+right after mounting a `MacPPP-2.0.1-dani` floppy image. **The user then
+reported that that image is itself suspect**, so the symptom is NOT reliable
+evidence and the bombs may never have been caused by these bugs at all.
+
+What still stands on code analysis alone, independent of any image:
+- **Stale-image serve** — the window gate skips a fetch whose address repeats,
+  but mounting rewrites SDRAM at those addresses. A real hole; the fix
+  (invalidate on download) is correct regardless.
+- **One-tick data/latch skew** — `floppy.v` latches at busPhase 3 of the window
+  slot while the Phase-C request pipeline pushed the data capture to busPhase 0
+  of the next slot. The fix restores the pre-Phase-C relationship, i.e. it puts
+  the floppy path back to behaviour that shipped for months. Conservative
+  either way.
+
+**Neither fix is confirmed against a reproduction.** To get a trustworthy
+verdict use a known-good image — `Disk605.dsk` (also in `releases/`),
+`Fetch GCR800K.dsk` (used in the validated 800K GCR work), or
+`6.0.7 System Tools.dsk` — and check mount + catalog + a file read. Do not
+judge the floppy path on `MacPPP-2.0.1-dani`.
+
+★ The durable answer is the system-level media-change test (task #7): every
+existing floppy TB instantiates the encoder/SWIM directly and never touches
+`addrController` or the SDRAM controller, so this whole class of bug sits in an
+untested seam and can only be judged by hand on hardware today.
+
+
 ### 6 — 2026-08-18: I-cache ported and HW-tested — WORKS IN SIM, HANGS ON HARDWARE
 
 **Ported** `rtl/fetch_cache.sv` (branch `i-cache` @`b393eaf`) onto the Phase B+C
