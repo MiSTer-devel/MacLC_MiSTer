@@ -180,20 +180,40 @@ the full boot/shutdown/boot cycle. Still owed: the user's Speedometer
 re-run (expect Sieve 53.7% / Queens 72.3% / Bubble Sort 74.4% to move
 most).
 
-**Same-day field report, resolved:** "colors + 32-bit addressing reset
-every boot" was NOT an RTL regression — the box's `.nvr` was an all-zero
-512-byte file freshly written by an accidental OSD **R6 "Reset PRAM &
-Core"** during blind row-driving near the (now-removed) I-Cache toggle;
-P_CLR zeroes pram[] AND flushes the zeroed sector, and every later load
-finds invalid PRAM → OS defaults. Proven not-RTL by the new PRAM
-write-path witness in `egret_wrapper.sv` (SIMULATION-only): a zero-seed
-sim boot shows the ROM's validity writes landing in the canonical pram[]
-with the cache enabled. Fixed by restoring the real `releases/MacLC.nvr`
-seed; verified persistent across the release gate above. NOTE the standing
-design property this exposed: PRAM flushes to SD **only on OSD-open with
-dirty set** — a settings change followed by power-off without an OSD open
-is lost. Hardening candidate for a future release: flush on the Egret's
-guest Shut Down/Restart command as well.
+**Same-day field report — the FULL story (superseding the first R6-only
+theory).** "colors + 32-bit addressing reset every boot / settings don't
+stick" decomposed into THREE stacked facts, established in this order:
+1. The PRAM write/mirror path is HEALTHY — proven by the new SIMULATION
+   witness in `egret_wrapper.sv` (zero-seed boot: the ROM's validity
+   writes land in the canonical pram[]; warm framework reset via
+   `--reset-at-frame`: boot-copy re-runs, pram[] survives — R0 "Reset &
+   Apply" exonerated by experiment).
+2. **★★★ The guest SOFT-RESTART (Special ▸ Restart) HANGS at a flat grey
+   screen — deterministic (2/2 on the release), and LONG-STANDING: byte-
+   identical signature on `MacLC_20260815.rbf`, `MacLC_20260817.rbf`, and
+   `dea3649e`** (user concurs it may never have worked on this core).
+   All reproductions ran from the MacAtrium volume (first bootable SCSI
+   ID in the current mount set); the 08-08 "warm restart fixed, 3/3"
+   validation used a DIFFERENT volume set/System — whether the 6.0.8
+   System warm-restarts clean today is UNTESTED (cold boots always work).
+   OPEN INVESTIGATION for a follow-up session. Evidence set:
+   `scratch/after_restart*.png`, `b0815/b0817_after_restart*.png` (all
+   mean 127.0 / std 0.0), the Special-menu choreography in this session's
+   transcript, and the post-restart .nvr `37634172…` showing the OS's
+   legitimate shutdown-time PRAM writes (mirror healthy through restart).
+3. The user-facing loss mechanism: flush-on-OSD-open-only + routine hard
+   recovery from the hang = recent settings discarded. **FIXED by
+   `fc45705` (eager NVRAM persistence): every firmware PRAM write
+   restarts a ~2 s settle timer; expiry flushes the sector if dirty.**
+   OS write bursts coalesce; OSD-open flush retained; R6 unchanged.
+   The all-zero .nvr files remain attributable to R6/P_CLR (the only
+   all-zero writer; its row sat adjacent to R0 with coin-flip cursor —
+   both renamed/separated in `5185086`), with the hang forcing users
+   into that corner of the OSD in the first place.
+Bench-verification contract for the eager flush: deploy → cold boot →
+touch NOTHING → the .nvr md5 must change within ~30 s (the ROM/OS boot
+writes alone must trigger a flush), then a guest settings change must
+appear in the file without any OSD open.
 
 ### ★★ RESOLVED (2026-08-19): floppy mount AND read both work again
 
