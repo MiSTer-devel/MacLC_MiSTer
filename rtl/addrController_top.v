@@ -54,6 +54,8 @@ module addrController_top(
 	                       // sequencer must not start a CPU access (Phase C)
 	input  cpu_wr_ack,     // demand write acked (sdram cpu_done): strobes the
 	                       // VRAM BRAM write mirror once per CPU write cycle
+	input  flp_present,    // a disk is in either drive: only then do floppy fetch
+	                       // windows (and their CPU guard) run at all — see flp_ok
 	input  dio_download,   // HPS is writing SDRAM (image download) — invalidates
 	                       // the floppy served-address cache, see below
 
@@ -340,7 +342,18 @@ module addrController_top(
 	// consistent: during a download there is simply no floppy window. The
 	// so the encoder simply gets no data during the download and resumes
 	// fetching normally the moment it ends.
-	wire flp_ok = !dio_download;
+	// ★ flp_present is a PERFORMANCE gate, not a correctness one. The windows
+	// must fire every rotation while a disk is being read (see the two-acks-per-
+	// byte note above), and that costs the CPU: flp_guard blocks new starts
+	// through busCycle 01+10 on the rotations it covers, i.e. roughly a quarter
+	// of all start opportunities. But the GCR encoder FREE-RUNS with no disk
+	// inserted, so without this gate every SCSI-only boot — and every benchmark
+	// run — pays that quarter for fetches nobody reads. Keying on "a disk is
+	// present" (not "the motor is spinning") deliberately keeps the behaviour
+	// with a floppy mounted BYTE-FOR-BYTE identical to the configuration that
+	// was hardware-validated, and only reclaims the bandwidth in the case where
+	// the floppy path is provably idle.
+	wire flp_ok = !dio_download && flp_present;
 	assign dskReadAckInt = (extraBusControl == 1'b1) && (extra_slot_count == 0) && flp_ok;
 	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1) && flp_ok;
 	// extra_slot_count == 2 is now idle (legacy sound DMA removed)

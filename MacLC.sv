@@ -1306,8 +1306,12 @@ module emu
 	wire [17:0] v8_vram_raddr;
 	wire [15:0] v8_vram_rdata;
 
+	// Forward declarations: assigned with the rest of the disk-mount state
+	// further down; needed here for addrController's flp_present gate.
+	wire dsk_int_ins, dsk_ext_ins;
 	addrController_top ac0
 	(
+		.flp_present(dsk_int_ins | dsk_ext_ins),
 		.clk(clk_sys),
 		.clk8(clk8),
 		.clk8_en_p(clk8_en_p),
@@ -2326,8 +2330,8 @@ module emu
 	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
 
 	// any known type of disk image inserted?
-	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
+	assign dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
+	assign dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
