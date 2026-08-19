@@ -320,6 +320,7 @@ module emu
 	reg        pram_dirty;                      // PRAM changed since last save
 	reg        pram_rst_after;                  // pulse reset after the current save
 	reg        pram_load_pending, pram_flush_pending, pram_clr_pending;
+	reg [26:0] pram_settle;          // eager-flush settle timer (restarts on each PRAM write)
 	reg        old_pack, old_osd, old_mnt2, old_rstpram;
 	reg        pram_ready;        // -> Egret: pram[] loaded (or no image / timed out)
 	reg [31:0] pram_rdy_cnt;      // ready backstop so a missing image never hangs boot
@@ -343,6 +344,7 @@ module emu
 			pst <= P_IDLE; pram_rd <= 0; pram_wr_req <= 0; pram_load_wr <= 0;
 			pram_ena <= 0; pram_dirty <= 0; pram_force_reset <= 0; pram_rst_after <= 0;
 			pram_load_pending <= 0; pram_flush_pending <= 0; pram_clr_pending <= 0;
+			pram_settle <= 0;
 			old_pack <= 0; old_osd <= 0; old_mnt2 <= 0; old_rstpram <= 0; rst_hold <= 0;
 			pram_ready <= 0; pram_rdy_cnt <= 0;
 			pram_restart_after_load <= 0; pram_ld_wd <= 0; pram_ld_try <= 0;
@@ -369,6 +371,23 @@ module emu
 				else               pram_ready        <= 1'b1;  // no image: release the boot-copy now
 			end
 			if (OSD_STATUS && !old_osd && pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
+			// ── EAGER NVRAM PERSISTENCE (2026-08-19 user directive) ─────────
+			// Flush PRAM to SD whenever it has changed and the writes have
+			// settled (~2-4 s), instead of only on OSD-open. Rationale: the
+			// guest's soft-restart path hangs (long-standing, reproduced on
+			// 0815/0817/dea3649e alike), so hard recovery is routine — and
+			// hard recovery discards anything not yet flushed. With this,
+			// a settings change reaches the .nvr within seconds, no OSD
+			// open or clean shutdown required. The settle timer restarts on
+			// every firmware PRAM write, so the OS's burst writes coalesce
+			// into one sector save; the OSD-open flush above remains as a
+			// second trigger, and R6/P_CLR semantics are unchanged.
+			if (pram_wr_stb)                pram_settle <= 27'd65_000_000;  // ~2 s at 32.5 MHz clk_sys
+			else if (pram_settle > 27'd1)   pram_settle <= pram_settle - 1'b1;
+			else if (pram_settle == 27'd1) begin
+				pram_settle <= 27'd0;
+				if (pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
+			end
 			if (status[6] && !old_rstpram) pram_clr_pending <= 1'b1;
 
 			// PRAM-ready gate. The Egret's boot-copy seeds the 68k's working PRAM from
