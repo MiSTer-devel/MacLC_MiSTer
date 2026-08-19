@@ -54,6 +54,8 @@ module addrController_top(
 	                       // sequencer must not start a CPU access (Phase C)
 	input  cpu_wr_ack,     // demand write acked (sdram cpu_done): strobes the
 	                       // VRAM BRAM write mirror once per CPU write cycle
+	input  dio_download,   // HPS is writing SDRAM (image download) — invalidates
+	                       // the floppy served-address cache, see below
 
 	// peripherals:
 	output selectSCSI,
@@ -296,9 +298,23 @@ module addrController_top(
 	reg        flp_valid_int,  flp_valid_ext;
 	wire flp_pend_int = !flp_valid_int || (dskReadAddrInt != flp_addr_int_q);
 	wire flp_pend_ext = !flp_valid_ext || (dskReadAddrExt != flp_addr_ext_q);
+	//
+	// ★★★ BUG FIX 2026-08-18 — dio_download MUST invalidate this.
+	// The gate remembers "address A was already served, skip it", but MOUNTING
+	// AN IMAGE REWRITES SDRAM AT THOSE SAME ADDRESSES. Without invalidation the
+	// encoder keeps feeding the guest the byte latched from the PREVIOUS image,
+	// so inserting a floppy delivers a garbage data stream — observed on
+	// hardware as an "illegal instruction" bomb right after a disk insert.
+	// (The offline floppy TBs cannot catch this: they drive the encoder
+	// directly and never exercise addrController's window gating or a
+	// download.) Clearing the valid bits while a download runs forces a fresh
+	// read of whatever address the encoder next asks for.
 	always @(posedge clk) begin
 		if (!_cpuReset) begin
 			flp_valid_int <= 0;
+			flp_valid_ext <= 0;
+		end else if (dio_download) begin
+			flp_valid_int <= 0;   // SDRAM contents changed under us
 			flp_valid_ext <= 0;
 		end else begin
 			if (dskReadAckInt && memoryLatch) begin

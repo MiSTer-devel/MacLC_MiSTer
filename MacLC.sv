@@ -1338,6 +1338,7 @@ module emu
 		.cpuBusControl(cpuBusControl),
 		.flp_guard(flp_guard),
 		.cpu_wr_ack(sdram_cpu_done),
+		.dio_download(dio_download),
 		.selectSCSI(selectSCSI),
 		.selectSCSIDMA(selectSCSIDMA),
 		.selectSCC(selectSCC),
