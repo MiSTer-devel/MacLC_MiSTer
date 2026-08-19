@@ -66,6 +66,47 @@ module sdram
 	                                // exists to protect.
 	input               flp_guard,  // a pending floppy window opens soon: don't START a
 	                                // CPU access that would still occupy the chip then
+
+	// ── download (HPS image write) port ────────────────────────────────────
+	// ★★★ ROOT CAUSE of the "mounting a floppy bombs the guest" regression
+	// (found 2026-08-18, branch cpu-icache). The download used to ride the
+	// CPU's own oe/we/addr/din nets, muxed in for the dioBusControl slot
+	// (`download_cycle` in MacLC.sv / verilator/sim.v). That was sound under
+	// the OLD slot machine, where _ramOE/_ramWE were gated on cpuBusControl —
+	// the exact complement of dioBusControl — so a CPU request and a download
+	// write could not coexist. Phase C (f13d936) deleted that gating to make
+	// the CPU request a LEVEL held for the whole AS-low window, and the level
+	// now spans the download's slot. Two failures followed, both fatal:
+	//   1. While the mux pointed at the download, the CPU's request was
+	//      INVISIBLE here, and the download's posted-write ack landed in
+	//      `cpu_done` — which is the CPU's DTACK. When the slot ended and the
+	//      CPU's still-asserted `oe` came back, `!(oe||we)` was never true, so
+	//      cpu_done never cleared: the CPU completed a read it had never
+	//      issued and latched the PREVIOUS access's cpu_dout. Executing that
+	//      stale word is the "illegal instruction" / "coprocessor not
+	//      installed" bomb seen on every floppy mount since Phase C.
+	//   2. In slots where dio_write was low, oe/we were forced to 0, CLEARING
+	//      a legitimate in-flight CPU cpu_done mid-access.
+	// The ROM download at boot was immune only because MacLC.sv holds the CPU
+	// in reset while (dio_download && dio_index==0) — which is why booting
+	// always worked and only mounting broke.
+	// This port restores the mutual exclusion STRUCTURALLY: the download has
+	// its own request, its own frozen address/data, and never writes cpu_done.
+	input               dl_req,     // LEVEL: a download word is pending (= ioctl_wait)
+	input               dl_slot,    // its bus slot (dioBusControl) — gating the START
+	                                // here keeps the download to one word per bus
+	                                // round, exactly the pre-Phase-C rate, so the
+	                                // CPU/download bandwidth split is unchanged
+	input  [23:0]       dl_addr,    // SDRAM word address for that word
+	input  [15:0]       dl_din,     // the word
+	output reg          dl_ack,     // LEVEL, not a pulse: clk_64 is 2x clk_sys, so a
+	                                // one-tick pulse is not reliably sampleable over
+	                                // there. Held from issue until dl_req drops, i.e.
+	                                // until the clk_sys side has seen it and cleared
+	                                // ioctl_wait. Keying the release on the SLOT
+	                                // instead would drop the ack at the slot edge and
+	                                // hang the download when the two just missed.
+
 	output reg          cpu_done,   // request served: read data will be stable in cpu_dout
 	                                // before a consumer sampling done can latch it 2 ticks
 	                                // later (early-done: set at ACTIVE+3 clk_64, capture at
@@ -171,14 +212,16 @@ reg oe_latch, we_latch;
 // refreshed every idle slot — orders of magnitude more than required.)
 reg [2:0]  seq;          // position within a running access (1..7; ACTIVE at start)
 reg        seq_busy;
-reg        src_cpu;      // running access belongs to the CPU/download (vs floppy)
-// Request values frozen at ACTIVE: the download path's din/ds/addr muxes are
-// gated on dioBusControl (a 4-tick window), so an access that starts late —
-// e.g. delayed behind a refresh — could otherwise see them flip mid-access.
+reg        src_cpu;      // running access belongs to the CPU (vs floppy or download):
+                         // gates cpu_done / cpu_dout, which only the CPU may touch
+// Request values frozen at ACTIVE, so an access that starts late — e.g.
+// delayed behind a refresh, or a download word that had to wait out a CPU
+// access — cannot see its inputs change underneath it mid-access.
 reg [15:0] din_q;
 reg [1:0]  ds_q;
 reg [8:0]  col_q;        // {addr[22], addr[7:0]} for the CAS phase
 reg        flp_served;   // this floppy window already got its access
+reg        dl_served;    // this download window already got its access
 reg        ref_busy;
 reg [2:0]  ref_cnt;
 reg [9:0]  ref_due;      // clk_64 ticks since last refresh (saturating)
@@ -198,6 +241,11 @@ localparam REF_OPP   = 10'd300;  // idle refresh threshold
 localparam REF_FORCE = 10'd480;  // block new CPU starts, refresh first
 
 wire req_flp   = flp_win && !flp_served;
+// Download: served in its own bus slot, at most one word per window, ranked
+// between the floppy window and the CPU. If a CPU access happens to straddle
+// the whole window the word simply waits for the next one — dl_ack, not the
+// slot edge, is what releases ioctl_wait, so no word can be silently dropped.
+wire req_dl    = dl_req && dl_slot && !dl_served;
 // t[0] parity gate: only start CPU accesses on clk_64 edges that coincide
 // with a clk_sys edge (the free-running ladder counter t wraps at the clk_8
 // boundary, so an edge evaluating an ODD t begins an even-t period = an
@@ -218,6 +266,8 @@ always @(posedge clk_64) begin
 		ref_due    <= 0;
 		cpu_done   <= 0;
 		flp_served <= 0;
+		dl_served  <= 0;
+		dl_ack     <= 0;
 		// init ladder, one command slot per chipset cycle (~123ns apart):
 		// 1023..65 = NOP wait, 64 = PRECHARGE ALL, 56/52/../28 = 8x AUTO
 		// REFRESH, 2 = LOAD MODE. tRP/tRFC/tMRD are all satisfied by orders
@@ -244,6 +294,7 @@ always @(posedge clk_64) begin
 		// request-level bookkeeping
 		if (!(oe || we)) cpu_done <= 0;    // AS released / request withdrawn
 		if (!flp_win)    flp_served <= 0;
+		if (!dl_req)   begin dl_served <= 0; dl_ack <= 0; end
 		if (ref_due != 10'h3FF) ref_due <= ref_due + 10'd1;
 
 		if (seq_busy) begin
@@ -274,26 +325,32 @@ always @(posedge clk_64) begin
 		end else if (ref_busy) begin
 			ref_cnt <= ref_cnt + 3'd1;
 			if (ref_cnt == 3'd4) ref_busy <= 0;   // 5 clk_64 = 77 ns > tRFC
-		end else if (req_flp || req_cpu) begin
+		end else if (req_flp || req_dl || req_cpu) begin
 			sd_cmd  <= CMD_ACTIVE;
-			sd_addr <= req_flp ? { 1'b0, flp_addr[19:8] } : { 1'b0, addr[19:8] };
-			sd_ba   <= req_flp ? flp_addr[21:20]          : addr[21:20];
-			din_q   <= din;
-			ds_q    <= ds;
-			col_q   <= req_flp ? { flp_addr[22], flp_addr[7:0] }
+			sd_addr <= req_flp ? { 1'b0, flp_addr[19:8] } :
+			           req_dl  ? { 1'b0, dl_addr[19:8]  } : { 1'b0, addr[19:8] };
+			sd_ba   <= req_flp ? flp_addr[21:20]          :
+			           req_dl  ? dl_addr[21:20]           : addr[21:20];
+			din_q   <= req_dl ? dl_din : din;
+			ds_q    <= req_dl ? 2'b11  : ds;
+			col_q   <= req_flp ? { flp_addr[22], flp_addr[7:0] } :
+			           req_dl  ? { dl_addr[22],  dl_addr[7:0]  }
 			                   : { addr[22],     addr[7:0] };
 			seq      <= 3'd1;
 			seq_busy <= 1;
-			src_cpu  <= !req_flp;
-			we_latch <= req_flp ? 1'b0 : we;
-			oe_latch <= req_flp ? 1'b1 : oe;
+			src_cpu  <= !req_flp && !req_dl;
+			we_latch <= req_flp ? 1'b0 : req_dl ? 1'b1 : we;
+			oe_latch <= req_flp ? 1'b1 : req_dl ? 1'b0 : oe;
 			if (req_flp) begin
 				flp_served <= 1;
+			end else if (req_dl) begin
+				dl_served <= 1;
+				dl_ack    <= 1;          // ★ never touches cpu_done
 			end else begin
 				if (we) cpu_done <= 1;   // posted write: ack at ACTIVE; din/ds
 				                         // stay valid (AS held) through CAS
 			end
-		end else if (ref_due >= REF_OPP && !flp_guard && !flp_win) begin
+		end else if (ref_due >= REF_OPP && !flp_guard && !flp_win && !(dl_req && dl_slot)) begin
 			// !flp_guard/!flp_win: a refresh started just before a floppy
 			// window would push the window's capture past its end — floppy.v
 			// latches on its own (post-window) enables and would read stale

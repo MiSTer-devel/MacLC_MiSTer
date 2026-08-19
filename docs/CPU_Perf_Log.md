@@ -88,6 +88,98 @@ are calibrated against current pacing).
 
 ## Entries
 
+### 8 — 2026-08-18: ★ THE FLOPPY-MOUNT BOMB — root cause was the DOWNLOAD, not the floppy
+
+**Symptom.** Mounting any floppy image bombed the running guest with
+"illegal instruction" or "coprocessor not installed" — the executed-garbage
+signature. Reproduced across multiple images, so not a bad image.
+
+**The tell that cracked it.** Two *different* bomb IDs from the same
+operation. A broken datapath fails the same way every time; random bomb IDs
+mean random memory corruption. And a floppy that reads badly reports a disk
+error (`-69`, "not a Macintosh disk") — it does not bomb the CPU. So the
+corruption had to be hitting the *guest's own code*, during the download,
+before any disk read was attempted.
+
+**Root cause.** Pre-Phase-C, `_romOE` / `_ramOE` / `_ramWE` were gated on
+`cpuBusControl` — the exact complement of `dioBusControl`. The CPU and the
+image download could therefore never present a request at the same time:
+**mutual exclusion by construction.** Phase C (entry 3, `f13d936`) deleted
+that gating so the CPU's request became a LEVEL held for the whole AS-low
+window — and that level spans the download's slot. Both tops still muxed the
+download onto the CPU's own `addr`/`din`/`ds`/`we`/`oe` nets
+(`download_cycle = dio_download && dioBusControl`), so:
+
+1. While the mux pointed at the download, the CPU's request was **invisible**
+   to the controller.
+2. The download's posted-write ack landed in `cpu_done` — which *is* the
+   CPU's DTACK (`_cpuDTACK = ~sdram_cpu_done`). When the slot ended and the
+   CPU's still-asserted `oe` came back, `!(oe || we)` was never true, so
+   `cpu_done` never cleared: **the CPU completed a read it had never issued
+   and latched the previous access's `cpu_dout`.** Executing that stale word
+   is the bomb.
+3. Symmetrically, in slots where `dio_write` was low, `oe`/`we` were forced
+   to 0, *clearing* a legitimate in-flight `cpu_done`.
+
+This is the same class as the magenta bug (entry 4): **request-done must key
+on the requester's own level, never on a shared mux.** That fix removed
+`dskReadAck` from `oe` but left the download carrying the identical hazard.
+
+**Why only mounts.** `MacLC.sv` holds the CPU in reset while
+`(dio_download && dio_index == 0)`, so the boot ROM download is immune. Only
+floppy mounts (`dio_index` 1/2) run with the guest live — which is exactly why
+booting always worked and mounting always broke.
+
+**Fix.** A dedicated download port on the memory controller:
+`dl_req` (level, = `ioctl_wait`) / `dl_slot` (= `dioBusControl`) / `dl_addr` /
+`dl_din` / `dl_ack`, ranked `flp > dl > cpu`, with `src_cpu = 0` so it can
+never write `cpu_done`. The `download_cycle` mux is deleted from both tops —
+including the `sdram_do = 16'hffff` term, which was the same defect in the
+read direction (it corrupted any CPU read sampled inside a download slot).
+Keeping the start gated on `dl_slot` preserves the pre-Phase-C rate of one
+word per bus round, so the CPU/download bandwidth split is unchanged.
+
+Two subtleties worth porting:
+- **`ioctl_wait` now clears on `dl_ack`, not on the slot edge.** The old edge
+  protocol assumed the write had certainly been issued by the end of the slot;
+  under demand-start the sequencer can still be busy with a CPU access, and a
+  word that missed its slot was **silently dropped from the image**.
+- **`dl_ack` must be a LEVEL held until `dl_req` drops.** `clk_64` is 2x
+  `clk_sys`, so a one-tick pulse is not reliably sampleable on the other side;
+  releasing it on the *slot* instead hangs the download when the two just miss.
+
+**Evidence — two independent proofs.** (Both earlier floppy fixes were
+reasoned from code with no reproduction, and both failed on hardware. This
+entry is deliberately the opposite.)
+
+1. **Hardware A/B.** `releases/MacLC_20260815.rbf` (the tip before this
+   mission) mounts `Fetch GCR800K.dsk` perfectly — volume mounts, window
+   opens, `Fetch 2.1.2 / 482K / application` listed. The mission build bombs.
+   So it is a genuine Phase B/C regression. **This test had never been run.**
+2. **Fault injection.** `verilator/tb_dl_cpu_seam.v` drives CPU reads
+   concurrently with a download. Against the fix: 10/10 reads correct, PASS.
+   Rebuilt `+define+TB_LEGACY_MUX` (the pre-fix wiring, same DUT): **3/10
+   reads return stale data**, FAIL — e.g. `read 100001 returned af80, expected
+   a53d`. That is the bomb mechanism, deterministically, in seconds.
+
+**New tooling this entry depends on.**
+- `verilator/sim_main.cpp`: `--mount-floppy0-at <frame>` /
+  `--mount-floppy1-at <frame>` defer the ioctl download to a chosen frame, so
+  the sim can mount a floppy **with the guest live**. Every download used to be
+  queued at startup with the CPU in reset — structurally unable to exercise
+  this entire class of bug. This closes task #7's core gap.
+- `verilator/tb_dl_cpu_seam.v` + `verilator/altddio_out_stub.v`. The TB targets
+  `sim_ram.v` because **`rtl/sdram.v` cannot be Verilated** — it drives its
+  `sd_data` tristate from a non-blocking procedural assignment, which Verilator
+  5.x rejects. (That is why `sim_ram.v` exists at all.) The stub and an
+  `iverilog` command line for running the same test against the real controller
+  are in the TB header; Icarus is not installed in this WSL.
+
+**Pocket port:** core RTL (`rtl/sdram.v` ports) **and** top-level glue
+(`MacLC.sv`) — re-derive the glue per platform, but the port and the
+`dl_ack`-driven `ioctl_wait` handshake carry over unchanged. Any platform that
+kept a `download_cycle`-style mux while adopting Phase C has this bug.
+
 ### ★ CORRECTION (2026-08-18): the floppy fixes are REASONED, not REPRODUCED
 
 The two floppy fixes below (entry 7) were motivated by hardware bombs seen

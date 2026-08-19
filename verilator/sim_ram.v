@@ -27,6 +27,17 @@ module sim_ram
 	                                // the floppy path must bypass the request pipeline or
 	                                // its data lands one tick after floppy.v latches it)
 	input               flp_guard,
+
+	// download (HPS image write) port — mirrors rtl/sdram.v. The download
+	// used to ride the CPU's own oe/we/addr/din nets; under Phase C's level
+	// request that let its posted-write ack land in cpu_done and be consumed
+	// by the CPU as its OWN DTACK (root cause of the floppy-mount bomb).
+	input               dl_req,     // pending level (= ioctl_wait)
+	input               dl_slot,    // its bus slot (dioBusControl)
+	input  [23:0]       dl_addr,
+	input  [15:0]       dl_din,
+	output reg          dl_ack,
+
 	output reg          cpu_done,
 	output reg [15:0]   cpu_dout,
 
@@ -64,6 +75,13 @@ always @(posedge clk) begin
 		`endif
 	end
 
+	// download write — its own request, never touching cpu_done
+	if (dl_req && dl_slot && !dl_ack) begin
+		mem[dl_addr[22:0]] <= dl_din;
+		dl_ack <= 1;
+	end
+	if (!dl_req) dl_ack <= 0;
+
 	// floppy-window read serve (legacy dout path and timing). No oe
 	// qualifier: oe is pure CPU intent now; the window itself IS the
 	// floppy read request (mirrors rtl/sdram.v req_flp).
@@ -73,6 +91,7 @@ always @(posedge clk) begin
 	if (reset) begin
 		cpu_done <= 0;
 		req_d    <= 0;
+		dl_ack   <= 0;
 	end else if (!(oe || we)) begin
 		cpu_done <= 0;         // AS released / request withdrawn
 		req_d    <= 0;

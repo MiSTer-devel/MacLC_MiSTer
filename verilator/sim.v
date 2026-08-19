@@ -1087,8 +1087,10 @@ module emu
 	//   Floppy 2: $700000 + offset
 	reg [22:0] dio_a;
 	reg [15:0] dio_data;
-	reg        dio_write;
-	reg        dio_old_cyc = 0;
+
+	// Download request into the RAM model's dedicated port — keep in sync
+	// with MacLC.sv. Declared here because the handshake below consumes it.
+	wire        ram_dl_ack;
 
 	// DC42 write offset: active from the word after the magic (word 41)
 	wire [19:0] dio_flp_a = dc42_skip ? (dio_addr[19:0] - 20'd42) : dio_addr[19:0];
@@ -1116,39 +1118,31 @@ module emu
 			endcase
 			ioctl_wait <= 1;
 		end
-
-		dio_old_cyc <= dioBusControl;
-		if(~dioBusControl) dio_write <= ioctl_wait;
-		if(dio_old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
+		// Release the HPS on the RAM model's own acknowledgement — keep in
+		// sync with MacLC.sv (a word that misses its slot must wait for the
+		// next one, not be dropped).
+		else if (ram_dl_ack) ioctl_wait <= 0;
 	end
 
 	////////////////////////// RAM /////////////////////////////////
 
-	// For simulation with synchronous RAM, use simplified direct download path
-	wire download_cycle = dio_download && ioctl_wr;
-
-	// SDRAM word address mapping:
-	// memoryAddr[22:0] is already the SDRAM word address from addrController
-	// Download path uses dio_a_comb[22:0] directly
-	wire [22:0] dio_a_comb;
-	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 23'h600000 + {3'b0, ioctl_addr[20:1]} :  // Floppy 1
-	                    (ioctl_index[1:0] == 2'b10) ? 23'h700000 + {3'b0, ioctl_addr[20:1]} :  // Floppy 2
-	                    {5'b10100, ioctl_addr[18:1]};                                            // ROM at $500000 (must match addrController rom_sdram_word)
-
-	wire [24:0] ram_addr = download_cycle ? {2'b00, dio_a_comb[22:0]} :
-	                                        {2'b00, memoryAddr[22:0]};
-
-
-
-	// Use ioctl_dout directly for download (bypass registered dio_data)
-	wire [15:0] ram_din  = download_cycle ? ioctl_dout            : memoryDataOut;
-	wire  [1:0] ram_ds   = download_cycle ? 2'b11                 : { !_memoryUDS, !_memoryLDS };
-	// Use ioctl_wr directly as write enable during download (bypass registered dio_write)
-	wire        ram_we   = download_cycle ? 1'b1                  : !_ramWE;
+	// ★★★ 2026-08-18 — the `download_cycle` MUX IS GONE (keep in sync with
+	// MacLC.sv, which carries the full root-cause note). It stole the CPU's
+	// addr/din/ds/we/oe nets for the download; under Phase C's level request
+	// that both hid the CPU's request and let the download's posted-write ack
+	// land in cpu_done, which the CPU then consumed as its own DTACK —
+	// completing a read it never issued. Downloads now use their own port.
+	// This also removes a real sim-vs-FPGA divergence: the old sim path fired
+	// on `ioctl_wr` rather than the dioBusControl slot, and skipped the DC42
+	// header offset that MacLC.sv applies via dio_a.
+	wire [24:0] ram_addr = {2'b00, memoryAddr[22:0]};
+	wire [15:0] ram_din  = memoryDataOut;
+	wire  [1:0] ram_ds   = { !_memoryUDS, !_memoryLDS };
+	wire        ram_we   = !_ramWE;
 	// Phase C: oe is PURE CPU read intent — floppy windows request via
 	// flp_win (see the stale-read/lost-strobe note in MacLC.sv; keep both
 	// tops identical).
-	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE);
+	wire        ram_oe   = (!_ramOE || !_romOE);
 	wire [15:0] ram_do_raw;
 	wire        ram_cpu_done;
 	wire [15:0] ram_cpu_dout;
@@ -1160,7 +1154,7 @@ module emu
 	// Phase C: the patch applies to the CPU's private read register (cpu_dout).
 	wire [15:0] cpu_dout_patched =
 		(!_romOE && memoryAddr == 23'h52322F && ram_cpu_dout == 16'h6600) ? 16'h6000 : ram_cpu_dout;
-	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : cpu_dout_patched;
+	wire [15:0] ram_do   = (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : cpu_dout_patched;
 	// Disk byte-parity select: must be dskReadAddr[0], NOT memoryAddr[0] (which
 	// is dskReadAddr[1] after the >>1 word conversion drops bit 0). See the long
 	// note at the matching demux in MacLC.sv — the old bit selected the wrong
@@ -1184,6 +1178,9 @@ module emu
 	reg [15:0] ram_din_q;
 	reg  [1:0] ram_ds_q;
 	reg        ram_we_q, ram_oe_q;
+	reg        ram_dlreq_q, ram_dlslot_q;
+	reg [23:0] ram_dladdr_q;
+	reg [15:0] ram_dldin_q;
 	reg        ram_flpwin_q, ram_flpguard_q;
 	always @(posedge clk_sys) begin
 		ram_addr_q     <= ram_addr;
@@ -1191,6 +1188,10 @@ module emu
 		ram_ds_q       <= ram_ds;
 		ram_we_q       <= ram_we;
 		ram_oe_q       <= ram_oe;
+		ram_dlreq_q    <= ioctl_wait;
+		ram_dlslot_q   <= dioBusControl;
+		ram_dladdr_q   <= {1'b0, dio_a[22:0]};
+		ram_dldin_q    <= dio_data;
 		ram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download;
 		ram_flpguard_q <= flp_guard && !dio_download;
 	end
@@ -1213,6 +1214,14 @@ module emu
 		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
 		.flp_addr       ( ram_addr[23:0] ),
 		.flp_guard      ( ram_flpguard_q ),
+
+		// download port (see the root-cause note above / in rtl/sdram.v)
+		.dl_req         ( ram_dlreq_q  ),
+		.dl_slot        ( ram_dlslot_q ),
+		.dl_addr        ( ram_dladdr_q ),
+		.dl_din         ( ram_dldin_q  ),
+		.dl_ack         ( ram_dl_ack   ),
+
 		.cpu_done       ( ram_cpu_done ),
 		.cpu_dout       ( ram_cpu_dout ),
 		.frame_count    ( sim_frame_count )

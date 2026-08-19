@@ -2404,13 +2404,17 @@ module emu
 	//   Floppy 2: $700000 + offset
 	reg [22:0] dio_a;
 	reg [15:0] dio_data;
-	reg        dio_write;
+
+	// Download request into the SDRAM controller's dedicated port. One word
+	// per dioBusControl slot (the pre-Phase-C rate); dl_ack, not the slot
+	// edge, releases the HPS. Declared here because the handshake below
+	// consumes sdram_dl_ack.
+	wire        sdram_dl_ack;
 
 	// DC42 write offset: active from the word after the magic (word 41)
 	wire [19:0] dio_flp_a = dc42_skip ? (dio_addr[19:0] - 20'd42) : dio_addr[19:0];
 
 	always @(posedge clk_sys) begin
-		reg old_cyc = 0;
 		if(ioctl_write) begin
 			if (dio_index[1:0] != 2'b00) begin
 				// DC42 header detection (floppy downloads only)
@@ -2430,18 +2434,29 @@ module emu
 			endcase
 			ioctl_wait <= 1;
 		end
-
-		old_cyc <= dioBusControl;
-		if(~dioBusControl) dio_write <= ioctl_wait;
-		if(old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
+		// ★ Release the HPS on the SDRAM controller's OWN acknowledgement, not
+		// on the bus-slot edge. The old edge protocol assumed the write had
+		// certainly been issued by the time the slot ended; under demand-start
+		// the sequencer can still be busy with a CPU access, and a word that
+		// missed its slot was silently dropped from the image. dl_ack is a
+		// level (clk_64 is 2x clk_sys — a one-tick pulse is not sampleable),
+		// so this is a clean two-phase handshake: ioctl_wait 0->1 requests,
+		// dl_ack 0->1 acknowledges, and the word simply waits for the next
+		// window if this one was taken.
+		else if (sdram_dl_ack) ioctl_wait <= 0;
 	end
 
 	// (Floppy-download acceptance counters removed 2026-07-16 with their PFL1
 	// sel-3 readout — recover from git history with the floppy probes.)
 
 
-	// sdram used for ram/rom maps directly into 68k address space
-	wire download_cycle = dio_download && dioBusControl;
+	// ★★★ 2026-08-18 — the `download_cycle` MUX IS GONE. It used to steal the
+	// CPU's addr/din/ds/we/oe nets for the dioBusControl slot; see the long
+	// root-cause note on the dl_* port in rtl/sdram.v. Downloads now reach the
+	// controller through their own request, so a mount can no longer hijack a
+	// CPU access (or its DTACK) mid-flight. The window is still exactly one
+	// word per dioBusControl slot, so the download rate and the CPU/download
+	// bandwidth split are unchanged from the pre-Phase-C slot machine.
 
 	// ============================================================
 	// VRAM is left uninitialized — the Mac's video driver clears and
@@ -2454,14 +2469,10 @@ module emu
 	// SDRAM Address mapping for Mac LC (V8-style):
 	// memoryAddr[22:0] is already the SDRAM word address from addrController
 	// Download path uses dio_a[22:0] directly
-	wire [24:0] sdram_addr = download_cycle ? {2'b00, dio_a[22:0]} :
-	                                          {2'b00, memoryAddr[22:0]};
-	wire [15:0] sdram_din  = download_cycle ? dio_data :
-	                                          memoryDataOut;
-	wire  [1:0] sdram_ds   = download_cycle ? 2'b11 :
-	                                          { !_memoryUDS, !_memoryLDS };
-	wire        sdram_we   = download_cycle ? dio_write :
-	                                          !_ramWE;
+	wire [24:0] sdram_addr = {2'b00, memoryAddr[22:0]};
+	wire [15:0] sdram_din  = memoryDataOut;
+	wire  [1:0] sdram_ds   = { !_memoryUDS, !_memoryLDS };
+	wire        sdram_we   = !_ramWE;
 	// Phase C: oe is PURE CPU read intent — floppy windows request via
 	// flp_win, NOT via oe. Including dskReadAck here (as the slot machine
 	// needed) let a pending floppy window bridge the 2-3 tick AS-high gap
@@ -2470,14 +2481,17 @@ module emu
 	// PREVIOUS access's cpu_dout without ever touching SDRAM (stale-read
 	// class), and writes lost their done-RISE (vram_we strobes silently
 	// dropped -> the magenta-screen hunt of 2026-08-17).
-	wire        sdram_oe   = download_cycle ? 1'b0 :
-	                                          (!_ramOE || !_romOE);
+	wire        sdram_oe   = (!_ramOE || !_romOE);
 	// Phase C: CPU reads come from the SDRAM controller's held cpu_dout
 	// register (captured once per demand access), not the shared slot-domain
 	// dout — floppy windows can no longer clobber CPU read data, and the
 	// value stays valid through the CPU FSM's late din_r latch.
-	wire [15:0] sdram_do   = download_cycle ? 16'hffff :
-	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
+	// (The old `download_cycle ? 16'hffff` term — "so the screen is black
+	// during download" — was removed with the mux: video no longer reads
+	// SDRAM at all (BRAM framebuffer), and forcing $FFFF here corrupted any
+	// CPU read that happened to be sampled inside a download slot, which is
+	// the same defect class as the request mux itself.)
+	wire [15:0] sdram_do   = (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
 	                                                            cpu_dout_patched;
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
@@ -2551,6 +2565,9 @@ module emu
 	reg  [1:0] sdram_ds_q;
 	reg        sdram_we_q, sdram_oe_q;
 	reg        sdram_flpwin_q, sdram_flpguard_q;
+	reg        sdram_dlreq_q, sdram_dlslot_q;
+	reg [23:0] sdram_dladdr_q;
+	reg [15:0] sdram_dldin_q;
 	always @(posedge clk_sys) begin
 		sdram_addr_q     <= sdram_addr;
 		sdram_din_q      <= sdram_din;
@@ -2559,6 +2576,10 @@ module emu
 		sdram_oe_q       <= sdram_oe;
 		sdram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download;
 		sdram_flpguard_q <= flp_guard && !dio_download;
+		sdram_dlreq_q    <= ioctl_wait;
+		sdram_dlslot_q   <= dioBusControl;
+		sdram_dladdr_q   <= {1'b0, dio_a[22:0]};
+		sdram_dldin_q    <= dio_data;
 	end
 
 	assign SDRAM_CKE = 1;
@@ -2630,6 +2651,14 @@ module emu
 		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
 		.flp_addr       ( sdram_addr[23:0] ),
 		.flp_guard      ( sdram_flpguard_q         ),
+
+		// download port (see the root-cause note in rtl/sdram.v)
+		.dl_req         ( sdram_dlreq_q            ),
+		.dl_slot        ( sdram_dlslot_q           ),
+		.dl_addr        ( sdram_dladdr_q           ),
+		.dl_din         ( sdram_dldin_q            ),
+		.dl_ack         ( sdram_dl_ack             ),
+
 		.cpu_done       ( sdram_cpu_done           ),
 		.cpu_dout       ( sdram_cpu_dout           )
 	);
