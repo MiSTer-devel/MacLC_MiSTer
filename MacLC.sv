@@ -2627,7 +2627,8 @@ module emu
 		// (ioctl_wait never clears). The old slot machine equivalently served
 		// dio in slot 2 during downloads (oe forced 0). Floppy pending state
 		// persists and is served after the download.
-		.flp_win        ( sdram_flpwin_q           ),
+		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
+		.flp_addr       ( sdram_addr[23:0] ),
 		.flp_guard      ( sdram_flpguard_q         ),
 		.cpu_done       ( sdram_cpu_done           ),
 		.cpu_dout       ( sdram_cpu_dout           )

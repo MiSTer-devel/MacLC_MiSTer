@@ -51,7 +51,19 @@ module sdram
 	// removes the mod-4 slot quantization that pinned every CPU memory access
 	// to >=8 clk_sys (docs/CPU_Perf_Log.md).
 	input               flp_win,    // floppy fetch window (old slot timing, pending-gated
-	                                // in addrController): serve `addr` into `dout`, priority
+	                                // in addrController): serve `flp_addr` into `dout`, priority
+	input  [23:0]       flp_addr,   // UNREGISTERED floppy address. ★ The floppy path must
+	                                // NOT take the clk_sys request pipeline: floppy.v latches
+	                                // its byte at busPhase 3 of the window slot, and delaying
+	                                // the access by the pipeline's one tick pushes the data
+	                                // capture to busPhase 0 of the NEXT slot — one tick after
+	                                // the latch, so the guest receives the PREVIOUS byte and
+	                                // the disk stream is corrupt (observed on hardware as
+	                                // illegal-instruction / coprocessor bombs after a mount).
+	                                // Bypassing is safe here: this cone is a shallow add+mux
+	                                // and the encoder holds the address stable for the whole
+	                                // window, unlike the deep V8 CPU translation the pipeline
+	                                // exists to protect.
 	input               flp_guard,  // a pending floppy window opens soon: don't START a
 	                                // CPU access that would still occupy the chip then
 	output reg          cpu_done,   // request served: read data will be stable in cpu_dout
@@ -255,11 +267,12 @@ always @(posedge clk_64) begin
 			if (ref_cnt == 3'd4) ref_busy <= 0;   // 5 clk_64 = 77 ns > tRFC
 		end else if (req_flp || req_cpu) begin
 			sd_cmd  <= CMD_ACTIVE;
-			sd_addr <= { 1'b0, addr[19:8] };
-			sd_ba   <= addr[21:20];
+			sd_addr <= req_flp ? { 1'b0, flp_addr[19:8] } : { 1'b0, addr[19:8] };
+			sd_ba   <= req_flp ? flp_addr[21:20]          : addr[21:20];
 			din_q   <= din;
 			ds_q    <= ds;
-			col_q   <= { addr[22], addr[7:0] };
+			col_q   <= req_flp ? { flp_addr[22], flp_addr[7:0] }
+			                   : { addr[22],     addr[7:0] };
 			seq      <= 3'd1;
 			seq_busy <= 1;
 			src_cpu  <= !req_flp;

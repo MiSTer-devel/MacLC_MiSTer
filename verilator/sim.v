@@ -1210,7 +1210,8 @@ module emu
 		// !dio_download applied at the register above: during a download, dio
 		// writes are only presented during dioBusControl ticks — the very ticks
 		// floppy windows claim — so a pending floppy fetch would starve them.
-		.flp_win        ( ram_flpwin_q ),
+		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
+		.flp_addr       ( ram_addr[23:0] ),
 		.flp_guard      ( ram_flpguard_q ),
 		.cpu_done       ( ram_cpu_done ),
 		.cpu_dout       ( ram_cpu_dout ),

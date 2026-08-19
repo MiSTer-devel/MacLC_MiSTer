@@ -23,6 +23,9 @@ module sim_ram
 	// request is seen, writes post at the first edge. Keep the latencies in
 	// sync with the FPGA controller or the sim measures fiction.
 	input               flp_win,
+	input  [23:0]       flp_addr,   // unregistered floppy address (mirrors rtl/sdram.v:
+	                                // the floppy path must bypass the request pipeline or
+	                                // its data lands one tick after floppy.v latches it)
 	input               flp_guard,
 	output reg          cpu_done,
 	output reg [15:0]   cpu_dout,
@@ -66,7 +69,7 @@ always @(posedge clk) begin
 	// floppy-window read serve (legacy dout path and timing). No oe
 	// qualifier: oe is pure CPU intent now; the window itself IS the
 	// floppy read request (mirrors rtl/sdram.v req_flp).
-	if (flp_win) dout <= mem[addr[22:0]];
+	if (flp_win) dout <= mem[flp_addr[22:0]];
 
 	// demand handshake
 	if (reset) begin
