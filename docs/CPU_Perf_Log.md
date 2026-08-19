@@ -164,10 +164,36 @@ toggle ambiguity is what the hardwire exists to avoid):
   occupancy + gen flush + windows-vs-hits interleaving all exercised, the
   precise trigger geometry of the original hang.
 The RDW fix (entry 6) remains necessary — this was a SECOND, independent
-defect; do not fold them. Remaining before release: revert the enable
-hardwire to `status[11]`, refit, per-seed boot/icon/soak gates, and the
-Speedometer re-run (expect Sieve 53.7% / Queens 72.3% / Bubble Sort 74.4%
-to move most).
+defect; do not fold them.
+
+**RELEASED 2026-08-19 as `releases/MacLC_20260819.rbf`** (= hash-named
+`MacLC_dea3649e.rbf`, md5 `dea3649e1b9e81e3135b5cc558d244b2`, seed 5, STA
+met +0.189 ns). Release shape per user ruling: **I-cache ALWAYS ON, no OSD
+toggle** (CONF_STR row deleted, status[11] freed — the OSD map shifts:
+MT32-pi=12, NMI=13, R6=14, R0=15). Seed lottery on this netlist: seed 4
+drew −0.389 hold on sdram_addr_q→col_q (the known request-bundle class),
+seed 7 drew −0.036 hold on a cd_audio MLAB — both migrating-victim
+placement losses, neither in the new logic. Gates on dea3649e: 2× cold
+boot to colour desktop (near-identical frames), cursor liveness, colour
+icons clean, clean Shut Down choreography, .nvr byte-identical through
+the full boot/shutdown/boot cycle. Still owed: the user's Speedometer
+re-run (expect Sieve 53.7% / Queens 72.3% / Bubble Sort 74.4% to move
+most).
+
+**Same-day field report, resolved:** "colors + 32-bit addressing reset
+every boot" was NOT an RTL regression — the box's `.nvr` was an all-zero
+512-byte file freshly written by an accidental OSD **R6 "Reset PRAM &
+Core"** during blind row-driving near the (now-removed) I-Cache toggle;
+P_CLR zeroes pram[] AND flushes the zeroed sector, and every later load
+finds invalid PRAM → OS defaults. Proven not-RTL by the new PRAM
+write-path witness in `egret_wrapper.sv` (SIMULATION-only): a zero-seed
+sim boot shows the ROM's validity writes landing in the canonical pram[]
+with the cache enabled. Fixed by restoring the real `releases/MacLC.nvr`
+seed; verified persistent across the release gate above. NOTE the standing
+design property this exposed: PRAM flushes to SD **only on OSD-open with
+dirty set** — a settings change followed by power-off without an OSD open
+is lost. Hardening candidate for a future release: flush on the Egret's
+guest Shut Down/Restart command as well.
 
 ### ★★ RESOLVED (2026-08-19): floppy mount AND read both work again
 
