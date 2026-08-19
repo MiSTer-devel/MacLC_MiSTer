@@ -43,9 +43,7 @@ integer wr_count = 0;
 integer rom_rd_count = 0;
 
 reg        req_d;         // read request seen last edge (models ACTIVE->done)
-reg [24:0] served_addr;   // write re-arm on address change (download bursts)
 wire cpu_req  = (oe || we) && !flp_win && !flp_guard;
-wire wr_rearm = we && (addr != served_addr);
 
 always @(posedge clk) begin
 	// Writes are allowed even during reset (needed for ROM loading).
@@ -78,18 +76,16 @@ always @(posedge clk) begin
 	end else if (!(oe || we)) begin
 		cpu_done <= 0;         // AS released / request withdrawn
 		req_d    <= 0;
-	end else if (cpu_req && (!cpu_done || wr_rearm)) begin
+	end else if (cpu_req && !cpu_done) begin
 		if (we) begin
 			cpu_done    <= 1;  // posted write (commit is the block above)
-			served_addr <= addr;
 			req_d       <= 0;
 		end else begin
 			req_d <= 1;
 			if (req_d) begin
 				cpu_dout    <= mem[addr[22:0]];
 				cpu_done    <= 1;
-				served_addr <= addr;
-			end
+				end
 		end
 	end
 

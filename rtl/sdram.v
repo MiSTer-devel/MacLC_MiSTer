@@ -182,12 +182,21 @@ reg        flp_served;   // this floppy window already got its access
 reg        ref_busy;
 reg [2:0]  ref_cnt;
 reg [9:0]  ref_due;      // clk_64 ticks since last refresh (saturating)
-reg [23:0] served_addr;  // write re-arm: a held `we` with a new address (download
-                         // bursts) is a new request; same-address repeats are not
+// ── served_addr / cpu_rearm REMOVED (2026-08-18) ────────────────────────────
+// They existed to re-arm a write whose `we` stayed high across two DIFFERENT
+// addresses (imagined download bursts). That case cannot occur: during a
+// download `we` is only presented inside dioBusControl slots and drops between
+// them, and CPU writes always release AS between accesses — either way
+// cpu_done clears and the next write starts on its own. The compare cost a
+// 24-bit clk_sys -> clk_64 crossing that repeatedly produced marginal HOLD
+// violations (sdram_addr_q -> served_addr, seen at -0.216 ns and -0.037 ns on
+// different placements). Deleting it removes the hazard at its source rather
+// than reseeding around it. If a download ever hangs (ioctl_wait never
+// clearing, so the ROM never loads and nothing boots), this is the first thing
+// to reconsider.
 localparam REF_OPP   = 10'd300;  // idle refresh threshold
 localparam REF_FORCE = 10'd480;  // block new CPU starts, refresh first
 
-wire cpu_rearm = we && (addr != served_addr);
 wire req_flp   = flp_win && !flp_served;
 // t[0] parity gate: only start CPU accesses on clk_64 edges that coincide
 // with a clk_sys edge (the free-running ladder counter t wraps at the clk_8
@@ -197,7 +206,7 @@ wire req_flp   = flp_win && !flp_served;
 // 30.8 ns period by STA — no cross-clock multicycle, no half-period races.
 // Costs at most one clk_64 of start latency.
 wire req_cpu   = (oe || we) && !flp_win && !flp_guard && t[0]
-                 && (!cpu_done || cpu_rearm) && (ref_due < REF_FORCE);
+                 && !cpu_done && (ref_due < REF_FORCE);
 
 always @(posedge clk_64) begin
 	sd_cmd <= CMD_INHIBIT;  // default: idle
@@ -281,7 +290,6 @@ always @(posedge clk_64) begin
 			if (req_flp) begin
 				flp_served <= 1;
 			end else begin
-				served_addr <= addr;
 				if (we) cpu_done <= 1;   // posted write: ack at ACTIVE; din/ds
 				                         // stay valid (AS held) through CAS
 			end
