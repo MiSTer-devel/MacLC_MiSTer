@@ -855,6 +855,9 @@ module emu
 	assign sd_buff_din[1] = scsi_buff_din[1];
 	assign sd_buff_din[2] = cd_buff_din;
 
+	// Forward declaration: the floppy fetch byte is assigned further down,
+	// after the RAM instantiation that produces ram_do_raw.
+	wire [15:0] extra_rom_data_demux;
 	dataController_top #(SCSI_DEVS) dc0
 	(
 		.clk32(clk_sys),
@@ -901,6 +904,7 @@ module emu
 		.cpuBusControl(cpuBusControl),
 		.memoryDataOut(memoryDataOut),
 		.memoryDataIn(ram_do),
+		.dskReadDataIn(extra_rom_data_demux[7:0]),
 		.memoryLatch(memoryLatch),
 		.selectAriel(selectAriel),
 		.ariel_data_in(ariel_reg_dout),
@@ -1162,7 +1166,10 @@ module emu
 	// Phase C: the patch applies to the CPU's private read register (cpu_dout).
 	wire [15:0] cpu_dout_patched =
 		(!_romOE && memoryAddr == 23'h52322F && ram_cpu_dout == 16'h6600) ? 16'h6000 : ram_cpu_dout;
-	wire [15:0] ram_do   = (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : cpu_dout_patched;
+	// ★ Floppy leg removed from this mux — keep in sync with MacLC.sv (it is
+	// the memory leg of cpuDataOut; a window landing inside a demand access
+	// used to hand the CPU floppy bytes).
+	wire [15:0] ram_do   = cpu_dout_patched;
 	// Disk byte-parity select: must be dskReadAddr[0], NOT memoryAddr[0] (which
 	// is dskReadAddr[1] after the >>1 word conversion drops bit 0). See the long
 	// note at the matching demux in MacLC.sv — the old bit selected the wrong
@@ -1171,7 +1178,7 @@ module emu
 	// Phase C fix: parity registered with the request bundle — mirror of MacLC.sv
 	reg  ram_dskodd_q;
 	always @(posedge clk_sys) ram_dskodd_q <= dsk_byte_odd;
-	wire [15:0] extra_rom_data_demux = ram_dskodd_q ?
+	assign extra_rom_data_demux = ram_dskodd_q ?
 						   {ram_do_raw[7:0],ram_do_raw[7:0]}:{ram_do_raw[15:8],ram_do_raw[15:8]};
 
 	// ── Phase C fix (2026-08-18): pipeline the request bundle in clk_sys ─────

@@ -66,6 +66,19 @@ module dataController_top(
 	// RAM/ROM:
 	input cpuBusControl,
 	input [15:0] memoryDataIn,
+	// ★ Floppy fetch data on its OWN wire (2026-08-19). It used to arrive
+	// through memoryDataIn, which the top level muxed to the floppy byte for
+	// the duration of every fetch window — but memoryDataIn is ALSO the memory
+	// leg of cpuDataOut. Under the old slot machine that was safe: the CPU
+	// could only sample data at its own slot's memoryLatch, never during the
+	// floppy slot. Phase C's demand-start broke that guarantee — a CPU access
+	// is no longer slot-aligned, so a window landing inside one hands the CPU
+	// floppy bytes instead of its own read data. Rare (and merely latent) while
+	// windows were pending-gated; with windows firing every rotation it hangs
+	// the boot outright. Same defect class as the download riding the CPU's
+	// request nets: under demand-start, ANY mux shared between the CPU and a
+	// non-CPU agent is a bug.
+	input [7:0] dskReadDataIn,
 	output [15:0] memoryDataOut,
 	input memoryLatch,
 	
@@ -1013,7 +1026,7 @@ module dataController_top(
 		.dskReadAckInt(dskReadAckInt),
 		.dskReadAddrExt(dskReadAddrExt),
 		.dskReadAckExt(dskReadAckExt),
-		.dskReadData(memoryDataIn[7:0]),
+		.dskReadData(dskReadDataIn),
 
 		.dbg_ism_flpe(dbg_ism_flpe),
 		.dbg_flp_byte_cnt(dbg_flp_byte_cnt),

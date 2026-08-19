@@ -2086,6 +2086,9 @@ module emu
 		memoryOverlayOn_prev <= memoryOverlayOn;
 	end
 
+	// Forward declaration: the floppy fetch byte is assigned further down,
+	// after the SDRAM instantiation that produces sdram_out.
+	wire [15:0] extra_rom_data_demux;
 	dataController_top dataController (
 		.clk32(clk_sys),
 		.clk8_en_p(clk8_en_p),
@@ -2136,6 +2139,7 @@ module emu
 		.cpuBusControl(cpuBusControl),
 		.memoryDataOut(memoryDataOut),
 		.memoryDataIn(sdram_do),
+		.dskReadDataIn(extra_rom_data_demux[7:0]),
 		.memoryLatch(memoryLatch),
 		.selectAriel(selectAriel),
 		.ariel_data_in(ariel_reg_dout),
@@ -2491,8 +2495,12 @@ module emu
 	// SDRAM at all (BRAM framebuffer), and forcing $FFFF here corrupted any
 	// CPU read that happened to be sampled inside a download slot, which is
 	// the same defect class as the request mux itself.)
-	wire [15:0] sdram_do   = (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
-	                                                            cpu_dout_patched;
+	// ★ The floppy leg is GONE from this mux (2026-08-19) — it now reaches
+	// dataController on its own dskReadDataIn wire. This net is the memory leg
+	// of cpuDataOut, so swapping it to the floppy byte for the duration of
+	// every fetch window handed the CPU floppy data whenever a window landed
+	// inside a (no-longer-slot-aligned) demand access.
+	wire [15:0] sdram_do   = cpu_dout_patched;
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
@@ -2514,7 +2522,7 @@ module emu
 	// (the live signal is one tick ahead of the registered window now).
 	reg  sdram_dskodd_q;
 	always @(posedge clk_sys) sdram_dskodd_q <= dsk_byte_odd;
-	wire [15:0] extra_rom_data_demux = sdram_dskodd_q?
+	assign extra_rom_data_demux = sdram_dskodd_q?
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
 
