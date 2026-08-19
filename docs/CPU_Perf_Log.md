@@ -206,10 +206,24 @@ stick" decomposed into THREE stacked facts, established in this order:
    `fc45705` (eager NVRAM persistence): every firmware PRAM write
    restarts a ~2 s settle timer; expiry flushes the sector if dirty.**
    OS write bursts coalesce; OSD-open flush retained; R6 unchanged.
-   The all-zero .nvr files remain attributable to R6/P_CLR (the only
-   all-zero writer; its row sat adjacent to R0 with coin-flip cursor —
-   both renamed/separated in `5185086`), with the hang forcing users
-   into that corner of the OSD in the first place.
+   The all-zero .nvr files were R6/P_CLR — but NOT via mis-navigation:
+   **the bench Main has a FIRE/RENDER OFF-BY-ONE for every row below the
+   `P1,MT32-pi;` page header** (the cursor lands on the header as a
+   selectable row; the action lookup skips it, so each row below fires
+   the entry ABOVE its label). The user VISUALLY selecting "Reset &
+   Apply" fired the wipe above it — twice; after a reorder put R5 there,
+   the same selection fired the Interrupt (user report, the decisive
+   clue). Long-standing and invisible until the R rows became
+   load-bearing today; every row above the header always fired true.
+   FIX `585334b`: the whole R block moved ABOVE the P1 header (labels
+   fire true under the skew model, and it is the exact historical order
+   if that model is wrong). VERIFIED by count-probe on the final build
+   `5db08dda` (seed 4; seed 7 drew displaced+chroma-corrupt video —
+   rejected by the video-first gate): firing "Reset & Apply" captured
+   "Welcome to Macintosh" at t+12 s and the desktop at t+97 s with the
+   .nvr intact. ★LAW for this core: never place actionable CONF_STR rows
+   below a P-page header, and verify layout changes by firing a row and
+   observing the guest, never by reading the rendered menu.
 Bench-verification contract for the eager flush: deploy → cold boot →
 touch NOTHING → the .nvr md5 must change within ~30 s (the ROM/OS boot
 writes alone must trigger a flush), then a guest settings change must
