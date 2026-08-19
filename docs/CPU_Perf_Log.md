@@ -150,11 +150,24 @@ read/write protocol + data all clean). Negative control = FAIL with exactly
 the 3 violations. tb_dl_cpu_seam PASS / legacy-mux FAIL; tb_fetch_cache
 PASS / hostile-RDW PASS / no-rdw-fix FAIL; quartus_map A&S 0 errors.
 
-**Status: offline-proven; hardware validation pending** via a test fit with
+**Status: ★★★ HARDWARE-VALIDATED 2026-08-19.** Test fit **md5
+`fb8819d6064194c2861b5f16560874d9`** (STA met +0.246 ns) with
 `.enable(1'b1)` hardwired (no OSD navigation — the 08-19 row-11/row-12
-toggle ambiguity is what the hardwire exists to avoid). Revert to
-`status[11]` before any release fit. Note the RDW fix (entry 6) remains
-necessary — this is a SECOND, independent defect; do not fold them.
+toggle ambiguity is what the hardwire exists to avoid):
+- **Boots to the full Finder desktop with the cache enabled** — the exact
+  configuration that froze instantly on 08-18.
+- Cursor-move liveness PASS (two frames differ).
+- **Floppy-mount stress PASS**: OSD-mounted `Fetch GCR800K.dsk` into the
+  running cached guest (screenshot-filename oracle confirms the download);
+  the Finder auto-opened the disk window listing `Fetch 2.1.2 / 482K /
+  application` — an HFS catalog B-tree read off the floppy, i.e. download
+  occupancy + gen flush + windows-vs-hits interleaving all exercised, the
+  precise trigger geometry of the original hang.
+The RDW fix (entry 6) remains necessary — this was a SECOND, independent
+defect; do not fold them. Remaining before release: revert the enable
+hardwire to `status[11]`, refit, per-seed boot/icon/soak gates, and the
+Speedometer re-run (expect Sieve 53.7% / Queens 72.3% / Bubble Sort 74.4%
+to move most).
 
 ### ★★ RESOLVED (2026-08-19): floppy mount AND read both work again
 
