@@ -1122,7 +1122,7 @@ module emu
 		// as MacLC.sv (a word that misses its slot must wait for the next one,
 		// not be dropped), but written as a SEPARATE, LATER assignment rather
 		// than an `else if`, and that difference is load-bearing:
-		// verilator/sim/sim_bus.cpp holds ioctl_wr HIGH for as long as
+		// the SimBus driver (sim/sim_bus.cpp) holds ioctl_wr HIGH as long as
 		// ioctl_wait is set (it is a LEVEL here, not the one-cycle pulse hps_io
 		// produces on hardware), so an `else if` can never be reached and the
 		// download deadlocks. Letting the ack win gives ioctl_wait one clock at
