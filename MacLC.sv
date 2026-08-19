@@ -1203,7 +1203,11 @@ module emu
 		.clk        ( clk_sys ),
 		.reset      ( ~_cpuReset ),
 		.flush_bits ( {memoryOverlayOn, dio_download} ),
-		.enable     ( status[11] ),
+		// ★★ TEST FIT ONLY (2026-08-19): enable HARDWIRED ON so booting IS the
+	// I-cache test — no OSD navigation (the row-11 Memory / row-12 I-Cache
+	// mis-toggle burned a hardware cycle). REVERT to status[11] before any
+	// release fit.
+	.enable     ( 1'b1 /* status[11] */ ),
 		.cpuAddr    ( tg68_a_early[23:0] ),
 		.as_n       ( _cpuAS ),
 		.rw         ( _cpuRW ),
