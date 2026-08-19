@@ -1095,6 +1095,8 @@ module emu
 	// Download request into the RAM model's dedicated port — keep in sync
 	// with MacLC.sv. Declared here because the handshake below consumes it.
 	wire        ram_dl_ack;
+	reg         ram_dl_ack_d = 1'b0;
+	always @(posedge clk_sys) ram_dl_ack_d <= ram_dl_ack;
 
 	// DC42 write offset: active from the word after the magic (word 41)
 	wire [19:0] dio_flp_a = dc42_skip ? (dio_addr[19:0] - 20'd42) : dio_addr[19:0];
@@ -1133,7 +1135,13 @@ module emu
 		// 0, which is exactly what SimBus polls for before presenting the next
 		// word. No word can be lost: SimBus does not advance until it sees that
 		// 0, and on hardware hps_io cannot pulse while ioctl_wait is high.
-		if (ram_dl_ack) ioctl_wait <= 0;
+		// ...and only on its RISING EDGE. dl_ack is a level that outlives
+		// dl_req by a cycle, so keying on the level holds ioctl_wait at 0 for
+		// TWO consecutive clocks — and SimBus presents a new word every clock
+		// it sees 0, so every other word was skipped and the ROM landed half
+		// empty (CPU fetched garbage from frame 9 onward). Hardware is immune:
+		// hps_io pulses ioctl_wr for one cycle and waits for ioctl_wait.
+		if (ram_dl_ack && !ram_dl_ack_d) ioctl_wait <= 0;
 	end
 
 	////////////////////////// RAM /////////////////////////////////
