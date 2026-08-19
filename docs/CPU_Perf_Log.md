@@ -122,13 +122,31 @@ Plus the functional one: Phase C's `flp_pend_*` gate delivers **one** ack per
 address change where `floppy.v`'s MFM loop needs **two per byte**
 (`mfm_ack_skip` absorbs the in-flight one). Gate reverted.
 
-**Perf debt.** With windows ungated, `flp_guard` asserts on 2 of every 4
-rotations (busCycle 01+10), costing the CPU roughly a quarter of its start
-opportunities. The GCR encoder free-runs even with no disk, so every SCSI-only
-boot pays for windows nobody reads. The clean recovery is to gate the window on
-the drive being active — `|diskMotor` already exists at the `MacLC.sv` top
-level but is not yet an `addrController` input. Speedometer should be re-run
-against this build before it is stamped as a release.
+**Perf debt — identified, and paid back.** With windows ungated, `flp_guard`
+asserts on 2 of every 4 rotations (busCycle 01+10), costing the CPU roughly a
+quarter of its start opportunities. The GCR encoder free-runs even with no disk
+inserted, so every SCSI-only boot — and every benchmark run — was paying that
+for fetches nobody reads.
+
+Fix: `addrController` gains an `flp_present` input (`dsk_int_ins | dsk_ext_ins`)
+folded into `flp_ok`, so windows and their guard exist only while a floppy is
+actually mounted. Deliberately keyed on *a disk is present* rather than *the
+motor is spinning*: with a floppy mounted the behaviour stays byte-for-byte
+identical to the configuration validated above, and the bandwidth is reclaimed
+only where the floppy path is provably idle. (A motor gate would be tighter but
+would change timing under an active drive — the exact path that has now bitten
+four times.)
+
+**Measured, same sim harness, 100 frames with a mid-run mount at frame 60:**
+
+| build | instructions retired in 100 frames |
+|---|---|
+| windows always on | 4,370,487 |
+| windows gated on `flp_present` | **5,130,293** (+17.4%) |
+
+Both runs `check_boot` PASS (ROM init / main startup / hardware init / RAM test,
+ADVANCING). Speedometer should still be re-run on hardware before this is
+stamped as a release.
 
 **Two sim-only bugs introduced and fixed en route** (both cost real time):
 - `sim_ram.v` holds `reset` **high for the whole ROM download** (its
