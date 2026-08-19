@@ -88,6 +88,105 @@ are calibrated against current pacing).
 
 ## Entries
 
+### 9 — 2026-08-19: two more floppy defects the download fix uncovered
+
+Entry 8 fixed the cause of the *bomb*. Deploying it revealed two further
+defects on the same path — both of which the bomb had been hiding.
+
+**9a — the floppy window and the download slot are the same slot.**
+First hardware test of the download-port fix: the mount no longer bombed, but
+the guest froze with a sprayed framebuffer. Removing the `download_cycle` mux
+had exposed a second collision the mux was masking.
+
+`extraBusControl == dioBusControl` — a floppy window and a download word want
+the *same* bus slot. And a window does more than request a fetch: it switches
+`memoryAddr` to the floppy image address and forces both data strobes. That is
+safe only because a window *also* blocks CPU starts (`flp_win`/`flp_guard` in
+the controller). But `flp_win` is deliberately suppressed during a download —
+so nothing blocked the CPU, and with the address mux gone the CPU's own
+request reached the controller **carrying the floppy address**. Reads returned
+image bytes instead of guest memory; writes landed in the image. The GCR
+encoder free-runs with no disk, so those windows fire continuously.
+
+Fix: gate `dskReadAckInt`/`dskReadAckExt` **and** `flp_guard` on
+`!dio_download` inside `addrController`, instead of only masking `flp_win` at
+the top. One gate then keeps `memoryAddr`, the data strobes, `flp_win_any` and
+the `sdram_do` source mux all consistent — during a download there is simply
+no floppy window.
+
+**9b — the pending gate halves the ack count the encoders need.**
+With 9a in, the guest survives a mount cleanly (desktop intact, OS healthy)
+and the symptom reduces to an ordinary "This disk is unreadable" dialog.
+
+Two free measurements localised it before any further build:
+- A **1.44 MB MFM** image fails *identically* — with the correct HD
+  "Initialize" dialog, so media-type detection is fine. Failing across two
+  completely different track encoders rules the encoders out and puts the
+  defect in the shared fetch seam.
+- The **download path is exonerated by construction**: the boot ROM streams
+  through the very same new `dl_*` port, and the machine boots — which
+  requires a byte-perfect 512 KB ROM in SDRAM.
+
+That leaves the pending gate (entry 3), the only Phase C change to the floppy
+path that is *functional* rather than timing-only. Its stated premise — "one
+ack per address is precisely what the freshness protocol needs" — is wrong,
+and `rtl/floppy.v` says so directly:
+
+```verilog
+// on every delivered byte:
+mfm_fresh    <= 1'b0;
+mfm_ack_skip <= 1'b1;     // the in-flight ack belongs to the address we just left
+// ...and later:
+if (dskReadAckD) begin
+    if (mfm_ack_skip) mfm_ack_skip <= 1'b0;
+    else              mfm_fresh    <= 1'b1;
+end
+```
+
+That is **two acks per delivered byte** — one absorbed by the skip, one to arm
+the next. The pending gate delivers exactly *one* ack per address change; the
+skip eats it, `mfm_fresh` never sets, and delivery stalls at the loop's own
+`// else: payload byte not fetched yet` branch. The GCR path leans on repeated
+acks the same way: `if (dskReadAck) diskImageData <= dskReadDataEnc` re-samples
+every rotation and picks up the value `dskReadDataLatch` settled on a previous
+one. **Both encoders were written against the continuous every-rotation acks
+this design provided before Phase C.**
+
+Fix: windows fire every rotation again. The bandwidth argument for the gate is
+void under demand-start — the CPU is served from any idle `clk_64` edge and
+does not need that slot.
+
+**Method note.** The two failed fixes of 2026-08-18 were reasoned from code
+with no reproduction. What actually moved this forward was cheap measurement:
+one hardware A/B against the pre-mission release (never previously run), one
+fault-injected TB, and one free "does MFM fail too?" mount. Each cost minutes
+and each eliminated a whole class of cause. The remaining suspects, if
+anything still misbehaves, are `sdram_dskodd_q` (byte parity registered one
+`clk_sys`, on a premise that is void because `flp_win` is passed
+**unregistered** in both tops — `sdram_flpwin_q`/`ram_flpwin_q` are dead code)
+and `cf9a98b` (`flp_addr` bypassing the request pipeline). The repo's own
+hardware instrument for this, `USE_DBG_HUD` rows 7/8, is still unused.
+
+**Timing arithmetic, recorded because it was expensive to derive.** `floppy.v`
+samples `dskReadAckD` at `cen` (busPhase 1) and latches `dskReadDataLatch` at
+`cep` — the edge *ending* busPhase 3 — of the same window slot. With `flp_win`
+unregistered, ACTIVE fires around busPhase 0 and the controller assigns `dout`
+at `seq == 6`, three `clk_sys` later, i.e. the start of busPhase 3: stable
+across the whole phase, so the latch is correct. Registering `flp_win` would
+push that capture to busPhase 0 of the *next* slot and deliver the previous
+byte.
+
+**Sim note.** Making `verilator/sim.v`'s download slot-gated (to match
+`MacLC.sv`) makes the sim's ROM download **16× slower** — one word per bus
+round instead of one per `ioctl_wr` tick, ~8 sim-frames instead of ~0.5. Not a
+hang; budget for it. Also: `sim_ram.v` holds `reset` high for the entire ROM
+download (its write-commit path says so), so never clear a download ack in its
+reset branch.
+
+**Pocket port:** 9a is core RTL (`addrController_top.v`) and applies to any
+platform that shares the extra-slot scheme. 9b is core RTL too, and applies to
+anyone who adopted Phase C's pending gate.
+
 ### 8 — 2026-08-18: ★ THE FLOPPY-MOUNT BOMB — root cause was the DOWNLOAD, not the floppy
 
 **Symptom.** Mounting any floppy image bombed the running guest with
