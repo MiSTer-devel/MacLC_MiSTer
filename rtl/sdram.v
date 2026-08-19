@@ -23,7 +23,18 @@ module sdram
 (
 	// interface to the MT48LC16M16 chip
 	output              sd_clk,
+`ifdef TB_NO_TRISTATE
+	// TB-ONLY pin split (never synthesised — no build defines this). Verilator
+	// cannot model the procedural tristate below, which is why every offline
+	// gate ran against sim_ram.v instead of this file — and why the 2026-08
+	// stale-done defect (see cpu_done below) was invisible offline. The split
+	// lets verilator/tb_icache_seam.v compile THIS file: the chip model drives
+	// sd_data_in, the controller's writes appear on sd_data as a plain output.
+	output reg [15:0]   sd_data,    // controller -> chip (write data)
+	input      [15:0]   sd_data_in, // chip -> controller (read data)
+`else
 	inout  reg [15:0]   sd_data,    // 16 bit bidirectional data bus
+`endif
 	output reg [12:0]   sd_addr,    // 13 bit multiplexed address bus
 	output     [1:0]    sd_dqm,     // two byte masks
 	output reg [1:0]    sd_ba,      // two banks
@@ -240,6 +251,14 @@ reg [9:0]  ref_due;      // clk_64 ticks since last refresh (saturating)
 localparam REF_OPP   = 10'd300;  // idle refresh threshold
 localparam REF_FORCE = 10'd480;  // block new CPU starts, refresh first
 
+// Read view of the data pins (alias only; the TB pin split substitutes the
+// chip model's input here — see the TB_NO_TRISTATE note at the port list).
+`ifdef TB_NO_TRISTATE
+wire [15:0] sd_data_rd = sd_data_in;
+`else
+wire [15:0] sd_data_rd = sd_data;
+`endif
+
 wire req_flp   = flp_win && !flp_served;
 // Download: served in its own bus slot, at most one word per window, ranked
 // between the floppy window and the CPU. If a CPU access happens to straddle
@@ -258,7 +277,9 @@ wire req_cpu   = (oe || we) && !flp_win && !flp_guard && t[0]
 
 always @(posedge clk_64) begin
 	sd_cmd <= CMD_INHIBIT;  // default: idle
+`ifndef TB_NO_TRISTATE
 	sd_data <= 16'bZZZZZZZZZZZZZZZZ;
+`endif
 
 	if(reset != 0) begin
 		seq_busy   <= 0;
@@ -312,13 +333,37 @@ always @(posedge clk_64) begin
 			// later (S_WAIT exit -> S_TAIL2), so cpu_dout is stable a full
 			// clk_sys tick before the consumer's latch edge. Do not move done
 			// earlier than STATE_CMD_CONT+1 without redoing that arithmetic.
+			//
+			// ★★ `&& oe` (2026-08-19): done may only be BORN while its request
+			// level is still up. A fetch-cache HIT answers the CPU early, so
+			// the FSM releases AS ~4 ticks in and ABANDONS this transaction;
+			// if its ACTIVE was delayed (floppy window / download / refresh
+			// occupancy) the unqualified set fired AFTER the level dropped —
+			// and, being written after the `!(oe||we)` clear above, it WON the
+			// same-edge conflict. The orphan done then landed inside the NEXT
+			// cycle's S_WAIT sampling window: a false DTACK, the CPU latching
+			// the PREVIOUS access's cpu_dout — the I-cache-enable hang (same
+			// stale-done family as the oe-bridge magenta bug and the
+			// download-ack floppy-mount bomb). Cache-off never abandons (the
+			// FSM waits in S_WAIT for its own done), so this qualifier is
+			// inert there. `oe` alone, not (oe||we): a newly-risen WRITE level
+			// must not legitimise a stale READ's done. Proven both ways by
+			// tb_icache_seam.v (in the verilator dir) — run it (normal AND
+			// the negative control below) after ANY edit to this handshake.
+`ifdef SDRAM_NO_DONE_LEVEL_FIX
+			// NEGATIVE CONTROL (TB only, never synthesised): the pre-fix set,
+			// so tb_icache_seam.v can demonstrate it catches the defect
+			// rather than passing vacuously.
 			if (seq == STATE_CMD_CONT + 3'd1 && src_cpu && oe_latch) cpu_done <= 1;
+`else
+			if (seq == STATE_CMD_CONT + 3'd1 && src_cpu && oe_latch && oe) cpu_done <= 1;
+`endif
 			// Data ready
 			if (seq == STATE_READ) begin
 				if (src_cpu) begin
-					if (oe_latch) cpu_dout <= sd_data;
+					if (oe_latch) cpu_dout <= sd_data_rd;
 				end else begin
-					dout <= sd_data;   // floppy-window data (legacy consumer path)
+					dout <= sd_data_rd;   // floppy-window data (legacy consumer path)
 				end
 			end
 			if (seq == 3'd7) seq_busy <= 0;

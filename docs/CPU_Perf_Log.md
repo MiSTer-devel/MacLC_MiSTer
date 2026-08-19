@@ -88,6 +88,74 @@ are calibrated against current pacing).
 
 ## Entries
 
+### 7 — 2026-08-19: I-cache HW hang ROOT-CAUSED offline — abandoned-transaction stale-done in rtl/sdram.v
+
+**The defect (proven, not theorised).** A fetch-cache hit answers the CPU
+early: `icache_hit` drives `_cpuDTACK` directly, the FSM exits S_WAIT at
+~tick 2 and releases AS at tick 4 — **abandoning the demand-start SDRAM
+transaction the fetch triggered**. That breaks the Phase C handshake's
+implicit invariant, which cache-off preserves by protocol: *the requester
+always sits in S_WAIT until its own done, so a done can never outlive the
+request that started it.* Two pre-existing properties then combine:
+
+1. `cpu_done`'s early-done set (`seq == STATE_CMD_CONT+1`) is written AFTER
+   the `!(oe||we)` clear in the same always block — **the set wins the
+   same-edge conflict**, so a done can be born after its request level died.
+2. The abandoned transaction's ACTIVE can be **delayed** — a floppy fetch
+   window occupies the sequencer for 8 clk_64, a download word for the same,
+   refresh for 5 — pushing it right up to the request level's drop edge.
+   ACTIVE at the drop edge ⇒ early-done 3 clk_64 later, which lands **inside
+   the NEXT bus cycle's S_WAIT sampling window**: a false DTACK, and the CPU
+   latches the PREVIOUS access's `cpu_dout`. Executed garbage ⇒ the hang.
+   (A write falsely completed the same way can be LOST outright if another
+   window delays its re-arm past the level drop.)
+
+Same stale-done family as the 2026-08-17 oe-bridge magenta bug and the
+2026-08-18 download-ack floppy-mount bomb; this is the shared-mux law's
+**fifth instance** — the cache is a fourth bus agent, and the hit bypass
+removed the only thing that made `cpu_done` single-consumer.
+
+**Why every offline gate passed.** The whole sim stack runs `sim_ram.v`,
+never `rtl/sdram.v` — and sim_ram's handshake is structurally immune three
+ways: its `!(oe||we)` clear is FIRST in an else-if chain (clear wins), its
+set only fires while the level is high, and it has no delayed-start
+mechanism at all (fixed 2-edge reads, floppy serves in parallel). The
+controller whose handshake hangs the machine had never executed one cycle
+in simulation. On the 08-18 HW test the GCR encoder still free-ran with no
+disk (`flp_present` landed 08-19), so window occupancy was cycling
+constantly — the delay source was live on every slot rotation, which is why
+the hang was instant.
+
+**The proof: `verilator/tb_icache_seam.v` (NEW)** — the REAL `rtl/sdram.v`
+under Verilator (via a TB-only `TB_NO_TRISTATE` pin split; the procedural
+tristate is why sim_ram exists), driven with the exact Phase-B bus shapes:
+clk_sys-aligned level requests on the DUT's own t[0] parity lattice, a
+behavioural SDRAM chip, and a hit cycle = a 4-tick oe level abandoned
+unconsumed. Sweeps floppy-window (± its 4-tick guard) and download
+occupancy phases past the abandoned fetch. Pre-fix: **3 stale-done
+violations** (window, window+guard, download — all at the occupancy phase
+that parks ACTIVE on the drop edge), each showing the next read would latch
+the previous access's data. No-occupancy control clean, matching the
+tick arithmetic (undelayed abandonment self-drains).
+
+**The fix (`rtl/sdram.v`): done may only be born while its request level is
+still up** — `&& oe` on the early-done set. `oe` alone, not `(oe||we)`: a
+newly-risen WRITE level must not legitimise a stale READ's done. Cache-off
+behaviour is untouched (the FSM's own wait guarantees the level at set
+time). Ships with a `SDRAM_NO_DONE_LEVEL_FIX` negative control ifdef, per
+the house differential pattern.
+
+**Differential results:** fixed = PASS (107 checks, 0 violations, legit
+read/write protocol + data all clean). Negative control = FAIL with exactly
+the 3 violations. tb_dl_cpu_seam PASS / legacy-mux FAIL; tb_fetch_cache
+PASS / hostile-RDW PASS / no-rdw-fix FAIL; quartus_map A&S 0 errors.
+
+**Status: offline-proven; hardware validation pending** via a test fit with
+`.enable(1'b1)` hardwired (no OSD navigation — the 08-19 row-11/row-12
+toggle ambiguity is what the hardwire exists to avoid). Revert to
+`status[11]` before any release fit. Note the RDW fix (entry 6) remains
+necessary — this is a SECOND, independent defect; do not fold them.
+
 ### ★★ RESOLVED (2026-08-19): floppy mount AND read both work again
 
 Shipping candidate **md5 `e06be0ce9de18dc17866d519d7c73695`**, STA met

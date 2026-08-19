@@ -119,6 +119,18 @@ These must stay identical; they were checked and match today.
   in Verilator can still fail on hardware for SDRAM timing/latency reasons.**
   Historically real here (stale-read / DTACK-before-cpu-slot issues). "Boots in
   sim" ≠ "boots on FPGA" for anything timing-sensitive on the memory bus.
+- **Handshake semantics differ too, not just latency** (learned 2026-08-19, the
+  I-cache stale-done hang): `sim_ram`'s `cpu_done` is structurally immune to
+  abandoned-request hazards — its `!(oe||we)` clear is FIRST in an else-if
+  chain, its set only fires while the level is high, and it has no
+  delayed-start (refresh/floppy-window/download occupancy) at all. The real
+  `rtl/sdram.v` had the opposite ordering and CAN delay a start; its stale-done
+  defect never executed in sim. **Any change to the demand handshake or any new
+  agent that can abandon a request (cache hit, BERR abort) must be gated by
+  `verilator/tb_icache_seam.v`**, which compiles the REAL `rtl/sdram.v` under
+  Verilator via its `TB_NO_TRISTATE` pin split — the one place the real
+  controller's handshake runs offline. Run its negative control too
+  (`+define+SDRAM_NO_DONE_LEVEL_FIX` must FAIL).
 
 ## Host-input harness (sim only)
 
