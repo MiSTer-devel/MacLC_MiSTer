@@ -1118,10 +1118,18 @@ module emu
 			endcase
 			ioctl_wait <= 1;
 		end
-		// Release the HPS on the RAM model's own acknowledgement — keep in
-		// sync with MacLC.sv (a word that misses its slot must wait for the
-		// next one, not be dropped).
-		else if (ram_dl_ack) ioctl_wait <= 0;
+		// Release the HPS on the RAM model's own acknowledgement — same intent
+		// as MacLC.sv (a word that misses its slot must wait for the next one,
+		// not be dropped), but written as a SEPARATE, LATER assignment rather
+		// than an `else if`, and that difference is load-bearing:
+		// verilator/sim/sim_bus.cpp holds ioctl_wr HIGH for as long as
+		// ioctl_wait is set (it is a LEVEL here, not the one-cycle pulse hps_io
+		// produces on hardware), so an `else if` can never be reached and the
+		// download deadlocks. Letting the ack win gives ioctl_wait one clock at
+		// 0, which is exactly what SimBus polls for before presenting the next
+		// word. No word can be lost: SimBus does not advance until it sees that
+		// 0, and on hardware hps_io cannot pulse while ioctl_wait is high.
+		if (ram_dl_ack) ioctl_wait <= 0;
 	end
 
 	////////////////////////// RAM /////////////////////////////////
