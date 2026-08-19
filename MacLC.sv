@@ -123,9 +123,8 @@ module emu
 		"MT32-pi: Unknown mode;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
-		"R0,Reset & Apply CPU+Memory;",
-		"-;",
 		"R6,WIPE PRAM (erases settings!);",
+		"R0,Reset & Apply CPU+Memory;",
 		"V,v",`BUILD_DATE
 	};
 
