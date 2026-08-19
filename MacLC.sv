@@ -100,7 +100,6 @@ module emu
 		"OA,Monitor @Reset,640x480 VGA,512x384 12in;",
 		"-;",
 		"O4,Memory,2MB,10MB;",
-		"OB,CPU I-Cache,Disabled,Enabled;",
 		"-;",
 		"P1,MT32-pi;",
 		"P1-;",
@@ -1184,26 +1183,32 @@ module emu
 	// instead of phantom-card garbage, and nothing depends on TG68 berr.
 	wire cpu_berr = (fc7_berr && !_cpuAS) || sdma_berr;
 
-	// ── Fetch cache (ported 2026-08-18, branch cpu-icache) ──────────────────
-	// OSD-gated (status[11], default DISABLED) exactly as the 2026-07-07 build
-	// shipped: it FILLS AND SNOOPS ALWAYS and `enable` gates only the answer
-	// path, so the switch can be flipped mid-session for a same-build live A/B
-	// against an already-warm, already-coherent cache.
+	// ── Fetch cache (ported 2026-08-18, HW-validated 2026-08-19) ────────────
 	// ★ Fed the EARLY address (tg68_a_early = the kernel's combinational
 	// output): the Phase-B FSM registers cpuAddr on the same edge AS falls, so
 	// the module's correspondence guard rejects every fetch on the registered
 	// address — 100% miss, silently. See rtl/fetch_cache.sv.
-	// ★ DEFAULT OFF IS DELIBERATE: with the cache enabled the 2026-07-07
-	// session corrupted a file on the boot image, and that root cause is still
-	// UNFOUND (docs/resume_icache_corruption_2026-07-07.md). Do not enable it
-	// on a disk image you care about without a backup.
+	// ★ The July "cache corrupts / hangs" history is CLOSED — it was TWO
+	// independent silicon-only defects, both fixed and both still required:
+	//   1. M10K read-during-write (rdw_collide in fetch_cache.sv, proven by
+	//      FETCH_CACHE_HOSTILE_RDW fault injection);
+	//   2. abandoned-transaction stale-done in rtl/sdram.v (a hit lets the
+	//      CPU abandon its demand transaction; the orphan early-done could
+	//      falsely complete the NEXT cycle — proven and regression-gated by
+	//      verilator/tb_icache_seam.v, which runs the REAL controller).
+	// Any new agent that can abandon a bus request re-opens class 2 — run
+	// that TB (normal + negative control) before trusting it.
 	wire        icache_hit;
 	wire [15:0] icache_data;
 	fetch_cache #(.LOG2_WORDS(9)) icache (
 		.clk        ( clk_sys ),
 		.reset      ( ~_cpuReset ),
 		.flush_bits ( {memoryOverlayOn, dio_download} ),
-		.enable     ( status[11] ),
+		// ★ ALWAYS ON (user ruling 2026-08-19, after HW validation on fb8819d6):
+	// no OSD toggle — the CONF_STR entry is removed and status[11] is FREE.
+	// The sim side keeps its +icache plusarg so icache_trace_diff.py can
+	// still run ON/OFF differential traces.
+	.enable     ( 1'b1 ),
 		.cpuAddr    ( tg68_a_early[23:0] ),
 		.as_n       ( _cpuAS ),
 		.rw         ( _cpuRW ),
