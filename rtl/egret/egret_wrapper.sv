@@ -828,6 +828,26 @@ end
 assign pram_save_data = pram[pram_save_addr];
 assign pram_wr_stb    = pram_region_wr;
 
+`ifdef SIMULATION
+// PRAM write-path witness (2026-08-19, the "colors reset every boot" report):
+// counts firmware writes that reach the canonical pram[] and checksums the
+// array, so a sim boot can prove whether guest/ROM PRAM writes actually land.
+integer pw_cnt = 0;
+integer pw_i;
+reg [15:0] pw_sum;
+always @(posedge clk) begin
+    if (pram_region_wr) begin
+        pw_cnt = pw_cnt + 1;
+        if (pw_cnt <= 8 || pw_cnt % 64 == 0) begin
+            pw_sum = 0;
+            for (pw_i = 0; pw_i < 256; pw_i = pw_i + 1) pw_sum = pw_sum + pram[pw_i];
+            $display("PRAM_WITNESS: write #%0d addr=%02x data=%02x pram_sum=%04x @%0t",
+                     pw_cnt, pram_wr_idx, cpu_dout, pw_sum, $time);
+        end
+    end
+end
+`endif
+
 `ifdef VERBOSE_TRACE
 // Debug stack reads around RTS execution
 always @(posedge clk) begin
