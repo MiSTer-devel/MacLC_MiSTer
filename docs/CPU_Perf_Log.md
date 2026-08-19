@@ -88,6 +88,64 @@ are calibrated against current pacing).
 
 ## Entries
 
+### ★★ RESOLVED (2026-08-19): floppy mount AND read both work again
+
+Shipping candidate **md5 `e06be0ce9de18dc17866d519d7c73695`**, STA met
+**+0.185 ns**, branch `cpu-icache`.
+
+Hardware evidence:
+- `Fetch GCR800K.dsk` mounts and the Finder auto-opens its window listing
+  `Fetch 2.1.2 / 482K / application` — byte-identical to what the pre-mission
+  `releases/MacLC_20260815.rbf` shows. That listing is an HFS catalog B-tree
+  **read off the disk**, so reads genuinely work, not just the mount.
+- `OS608-1440k.dsk` (1.44 MB MFM) no longer raises the "This disk is
+  unreadable" dialog it reliably produced on the previous build.
+- Boots to the Finder clean; the guest stays healthy through mounts.
+
+Offline gate restored: `check_boot.sh` on a run with `--mount-floppy0-at 60`
+now reports **PASS** (ROM early init, main startup, hardware init and RAM test
+all reached, ADVANCING). Before the sim fixes below it reported "never reached
+ROM init", with the CPU looping at PC `$1-$F` fetching `$FFFF`.
+
+**Four defects, one root pattern.** Phase C's demand-start removed the slot
+alignment that made every CPU-vs-non-CPU mux safe *by construction*. Each
+shared resource then had to be separated, and each only became visible once the
+previous was fixed:
+
+| # | Shared resource | Symptom | Fix |
+|---|---|---|---|
+| 1 | request nets + `cpu_done` | mount **bombs** the guest | dedicated `dl_*` download port |
+| 2 | `memoryAddr` + data strobes | mount **freezes** guest, sprayed framebuffer | suppress floppy windows at source during a download |
+| 3 | `sdram_do` → `cpuDataOut` | **boot hangs** once windows fire every rotation | floppy byte gets its own `dskReadDataIn` wire |
+
+Plus the functional one: Phase C's `flp_pend_*` gate delivers **one** ack per
+address change where `floppy.v`'s MFM loop needs **two per byte**
+(`mfm_ack_skip` absorbs the in-flight one). Gate reverted.
+
+**Perf debt.** With windows ungated, `flp_guard` asserts on 2 of every 4
+rotations (busCycle 01+10), costing the CPU roughly a quarter of its start
+opportunities. The GCR encoder free-runs even with no disk, so every SCSI-only
+boot pays for windows nobody reads. The clean recovery is to gate the window on
+the drive being active — `|diskMotor` already exists at the `MacLC.sv` top
+level but is not yet an `addrController` input. Speedometer should be re-run
+against this build before it is stamped as a release.
+
+**Two sim-only bugs introduced and fixed en route** (both cost real time):
+- `sim_ram.v` holds `reset` **high for the whole ROM download** (its
+  write-commit path says so), so clearing the download ack in the reset branch
+  deadlocks the load. `rtl/sdram.v` is immune — its `reset` is the init ladder.
+- `sim/sim_bus.cpp` holds `ioctl_wr` **high as a level** while `ioctl_wait` is
+  set — not the one-cycle pulse `hps_io` gives. So an `else if (ack)` clear is
+  unreachable (deadlock), and keying the clear on the ack *level* leaves
+  `ioctl_wait` at 0 for two clocks — SimBus presents a new word on every clock
+  it sees 0, so every other word was skipped and the ROM landed half empty.
+  Clear on the ack's **rising edge**.
+
+Also worth knowing: a comment line beginning `// verilator/...` is parsed by
+Verilator as a metacomment and fails the build; and verify RBF freshness by
+**content**, not `ls` — md5 polls returned the previous build's hash for ~20
+minutes after the artifact was written (drvfs caching).
+
 ### 9 — 2026-08-19: two more floppy defects the download fix uncovered
 
 Entry 8 fixed the cause of the *bomb*. Deploying it revealed two further
