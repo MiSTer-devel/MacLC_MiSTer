@@ -64,7 +64,22 @@ module fetch_cache #(
 	input  wire [15:0] mem_din,     // dataControllerDataOut (fill source)
 
 	output reg         hit,         // registered; ~2 clk after AS-fall on a hit
-	output reg  [15:0] hit_data
+	output reg  [15:0] hit_data,
+	// COMBINATIONAL hit indication, valid from the cycle AS falls (the same
+	// cycle the tops would launch the SDRAM demand request). The tops gate
+	// the fetch's SDRAM request with this so a HIT NEVER STARTS A
+	// TRANSACTION. Why (2026-08-19, Speedometer per-test evidence): a hit
+	// answers the CPU early and ABANDONS its in-flight demand transaction;
+	// the controller stays busy finishing the phantom and the NEXT access
+	// stalls behind it. Fetch-dominated loops still won (Sieve +21%), but
+	// data-heavy code (the software-FP tests) paid more stall than it
+	// gained: KWhet/FFT/FP-Matrix regressed 4-6% vs cache-off. Gating the
+	// request at the source removes the abandonment class entirely;
+	// sdram.v's done-birth guard (`&& oe`) remains as the safety net.
+	// Stable for the whole access: cpuAddr cannot change until the next
+	// clkena, and lookup_match's inputs (tag_q/data_q/rd_idx_d/gen) only
+	// move on clk edges that also move `hit`.
+	output wire        hit_now
 );
 
 	localparam WORDS = 1 << LOG2_WORDS;
@@ -145,6 +160,24 @@ module fetch_cache #(
 `else
 	wire lookup_match = (tag_q == {gen, tag}) && (rd_idx_d == idx) && !rdw_collide_d;
 `endif
+
+	// Request-suppression hit (see the port comment). Uses the same terms as
+	// fetch_start/hit so it can never suppress a request the answer path will
+	// not serve. ★ PER-ACCESS SNAPSHOT, not the live verdict: lookup_match
+	// can RISE mid-access (an RDW-forced miss refills and matches one cycle
+	// later) — a live gate would then drop the request level mid-transaction
+	// and, with sdram.v's done-birth guard, the CPU would wait on a done
+	// that can never be born. So: combinational on the AS-fall cycle (the
+	// same edge `hit` registers, so gate and answer always agree), latched
+	// for the remainder of the access, cleared when AS rises.
+	wire hit_now_comb = enable_r && rw && (fc == 3'b010 || fc == 3'b110)
+	                    && cacheable && lookup_match;
+	reg  hit_now_held;
+	always @(posedge clk) begin
+		if (reset || as_n) hit_now_held <= 1'b0;
+		else if (as_n_d)   hit_now_held <= hit_now_comb;  // first AS-low cycle
+	end
+	assign hit_now = !as_n && (as_n_d ? hit_now_comb : hit_now_held);
 
 	// SINGLE write port for tag_ram (M10K is 1R+1W): the snoop kill (AS-fall
 	// of a write cycle) and the miss fill (AS-rise of a fetch cycle) are on

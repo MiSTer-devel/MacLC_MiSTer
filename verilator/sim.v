@@ -516,6 +516,7 @@ module emu
 	initial if ($test$plusargs("icache")) icache_en = 1'b1;
 	wire        icache_hit;
 	wire [15:0] icache_data;
+	wire        icache_hit_now;   // per-access request-suppression verdict
 	fetch_cache #(.LOG2_WORDS(9)) icache (
 		.clk        ( clk_sys ),
 		.reset      ( ~_cpuReset ),
@@ -529,7 +530,8 @@ module emu
 		.snoopable  ( selectRAM ),
 		.mem_din    ( dataControllerDataOut ),
 		.hit        ( icache_hit ),
-		.hit_data   ( icache_data )
+		.hit_data   ( icache_data ),
+		.hit_now    ( icache_hit_now )
 	);
 
 	// CPU debug - capture PC and opcode during instruction fetch
@@ -1166,7 +1168,10 @@ module emu
 	// Phase C: oe is PURE CPU read intent — floppy windows request via
 	// flp_win (see the stale-read/lost-strobe note in MacLC.sv; keep both
 	// tops identical).
-	wire        ram_oe   = (!_ramOE || !_romOE);
+	// ★ A cache hit never starts a memory transaction — same gate as
+	// MacLC.sv (per-access snapshot from fetch_cache; keep both tops
+	// identical — see the stall-tax note at MacLC.sv's sdram_oe).
+	wire        ram_oe   = (!_ramOE || !_romOE) && !icache_hit_now;
 	wire [15:0] ram_do_raw;
 	wire        ram_cpu_done;
 	wire [15:0] ram_cpu_dout;

@@ -1219,6 +1219,7 @@ module emu
 	// that TB (normal + negative control) before trusting it.
 	wire        icache_hit;
 	wire [15:0] icache_data;
+	wire        icache_hit_now;   // per-access request-suppression verdict
 	fetch_cache #(.LOG2_WORDS(9)) icache (
 		.clk        ( clk_sys ),
 		.reset      ( ~_cpuReset ),
@@ -1236,7 +1237,8 @@ module emu
 		.snoopable  ( selectRAM ),
 		.mem_din    ( dataControllerDataOut ),
 		.hit        ( icache_hit ),
-		.hit_data   ( icache_data )
+		.hit_data   ( icache_data ),
+		.hit_now    ( icache_hit_now )
 	);
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -2513,7 +2515,15 @@ module emu
 	// PREVIOUS access's cpu_dout without ever touching SDRAM (stale-read
 	// class), and writes lost their done-RISE (vram_we strobes silently
 	// dropped -> the magenta-screen hunt of 2026-08-17).
-	wire        sdram_oe   = (!_ramOE || !_romOE);
+	// ★ A cache hit never starts an SDRAM transaction (2026-08-19): the
+	// suppression verdict is a per-access snapshot from fetch_cache (same
+	// edge the hit registers, held for the access), so oe_q sees a stable
+	// gate — never a mid-transaction drop. Without this every hit ABANDONED
+	// its demand transaction and the next access stalled behind the phantom:
+	// Speedometer showed the software-FP tests 4-6% BELOW cache-off while
+	// tight loops gained (+21% Sieve) — the stall tax. sdram.v's done-birth
+	// guard (`&& oe`) remains as the abandonment safety net.
+	wire        sdram_oe   = (!_ramOE || !_romOE) && !icache_hit_now;
 	// Phase C: CPU reads come from the SDRAM controller's held cpu_dout
 	// register (captured once per demand access), not the shared slot-domain
 	// dout — floppy windows can no longer clobber CPU read data, and the
