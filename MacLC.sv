@@ -101,6 +101,10 @@ module emu
 		"-;",
 		"O4,Memory,2MB,10MB;",
 		"-;",
+		"R5,Interrupt (NMI / MacsBug);",
+		"R6,WIPE PRAM (erases settings!);",
+		"R0,Reset & Apply CPU+Memory;",
+		"-;",
 		"P1,MT32-pi;",
 		"P1-;",
 		"P1OO,Use MT32-pi,Yes,No;",
@@ -121,10 +125,6 @@ module emu
 		"MT32-pi: MT-32 v2,",
 		"MT32-pi: CM-32L,",
 		"MT32-pi: Unknown mode;",
-		"-;",
-		"R5,Interrupt (NMI / MacsBug);",
-		"R6,WIPE PRAM (erases settings!);",
-		"R0,Reset & Apply CPU+Memory;",
 		"V,v",`BUILD_DATE
 	};
 
