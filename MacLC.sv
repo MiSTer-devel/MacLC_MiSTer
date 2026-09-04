@@ -27,7 +27,20 @@ module emu
 	// USER_OUT is driven by the mt32pi instance (user-port MIDI + I2C);
 	// unused user-port pins are held at '1 inside sys/mt32pi.sv.
 
-	assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
+	// DDR3 port: wholly owned by the PDS Ethernet card's shared-memory mailbox
+	// (rtl/pds/pds_enet.sv — Main's mac_eth service serves the other side).
+	// Single clock domain: the mailbox runs in clk_sys.
+	assign DDRAM_CLK      = clk_sys;
+	assign DDRAM_BURSTCNT = pds_mem_burst;
+	assign DDRAM_ADDR     = pds_mem_addr;
+	assign DDRAM_DIN      = pds_mem_wdata;
+	assign DDRAM_BE       = pds_mem_be;
+	assign DDRAM_RD       = pds_mem_rd;
+	assign DDRAM_WE       = pds_mem_we;
+	wire [28:0] pds_mem_addr;
+	wire  [7:0] pds_mem_burst, pds_mem_be;
+	wire        pds_mem_rd, pds_mem_we;
+	wire [63:0] pds_mem_wdata;
 	assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 	assign LED_USER  = dio_download || (disk_act ^ |diskMotor);
@@ -80,12 +93,24 @@ module emu
 		// on a stock Main a 2048-byte-sector .bin also works mounted directly.
 		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
 		"OI,CD-ROM Drive,Enabled,Disabled;",
+		// Default OFF for distribution (2026-08-24): the ethernet card needs
+		// the paired Main (releases/MiSTer) — with an older ethernet Main a
+		// card-ON boot hangs, so users opt in via the OSD after installing
+		// the Main. Bit clear (0) = first entry = Off; ena_osd below is the
+		// matching un-inverted status[19].
+		"OJ,Ethernet,Off,On;",
+		"o45,Net interface,eth0,tap0,macvlan,eth1;",
+		"o03,MAC suffix,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F;",
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor @Reset,640x480 VGA,512x384 12in;",
 		"-;",
 		"O4,Memory,2MB,10MB;",
+		"-;",
+		"R5,Interrupt (NMI / MacsBug);",
+		"R6,WIPE PRAM (erases settings!);",
+		"R0,Reset & Apply CPU+Memory;",
 		"-;",
 		"P1,MT32-pi;",
 		"P1-;",
@@ -107,10 +132,6 @@ module emu
 		"MT32-pi: MT-32 v2,",
 		"MT32-pi: CM-32L,",
 		"MT32-pi: Unknown mode;",
-		"-;",
-		"R5,Interrupt (NMI / MacsBug);",
-		"R6,Reset PRAM & Core;",
-		"R0,Reset & Apply CPU+Memory;",
 		"V,v",`BUILD_DATE
 	};
 
@@ -305,6 +326,7 @@ module emu
 	reg        pram_dirty;                      // PRAM changed since last save
 	reg        pram_rst_after;                  // pulse reset after the current save
 	reg        pram_load_pending, pram_flush_pending, pram_clr_pending;
+	reg [26:0] pram_settle;          // eager-flush settle timer (restarts on each PRAM write)
 	reg        old_pack, old_osd, old_mnt2, old_rstpram;
 	reg        pram_ready;        // -> Egret: pram[] loaded (or no image / timed out)
 	reg [31:0] pram_rdy_cnt;      // ready backstop so a missing image never hangs boot
@@ -328,6 +350,7 @@ module emu
 			pst <= P_IDLE; pram_rd <= 0; pram_wr_req <= 0; pram_load_wr <= 0;
 			pram_ena <= 0; pram_dirty <= 0; pram_force_reset <= 0; pram_rst_after <= 0;
 			pram_load_pending <= 0; pram_flush_pending <= 0; pram_clr_pending <= 0;
+			pram_settle <= 0;
 			old_pack <= 0; old_osd <= 0; old_mnt2 <= 0; old_rstpram <= 0; rst_hold <= 0;
 			pram_ready <= 0; pram_rdy_cnt <= 0;
 			pram_restart_after_load <= 0; pram_ld_wd <= 0; pram_ld_try <= 0;
@@ -354,6 +377,23 @@ module emu
 				else               pram_ready        <= 1'b1;  // no image: release the boot-copy now
 			end
 			if (OSD_STATUS && !old_osd && pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
+			// ── EAGER NVRAM PERSISTENCE (2026-08-19 user directive) ─────────
+			// Flush PRAM to SD whenever it has changed and the writes have
+			// settled (~2-4 s), instead of only on OSD-open. Rationale: the
+			// guest's soft-restart path hangs (long-standing, reproduced on
+			// 0815/0817/dea3649e alike), so hard recovery is routine — and
+			// hard recovery discards anything not yet flushed. With this,
+			// a settings change reaches the .nvr within seconds, no OSD
+			// open or clean shutdown required. The settle timer restarts on
+			// every firmware PRAM write, so the OS's burst writes coalesce
+			// into one sector save; the OSD-open flush above remains as a
+			// second trigger, and R6/P_CLR semantics are unchanged.
+			if (pram_wr_stb)                pram_settle <= 27'd65_000_000;  // ~2 s at 32.5 MHz clk_sys
+			else if (pram_settle > 27'd1)   pram_settle <= pram_settle - 1'b1;
+			else if (pram_settle == 27'd1) begin
+				pram_settle <= 27'd0;
+				if (pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
+			end
 			if (status[6] && !old_rstpram) pram_clr_pending <= 1'b1;
 
 			// PRAM-ready gate. The Egret's boot-copy seeds the 68k's working PRAM from
@@ -512,7 +552,12 @@ module emu
 		.ps2_kbd_led_use(3'b001),
 		.ps2_kbd_led_status({2'b00, capslock}),
 
-		.ps2_mouse(ps2_mouse)
+		.ps2_mouse(ps2_mouse),
+
+		// OSD "UART mode" as Main reports it to the core: 0=None, 1=PPP
+		// (Main maps its modem modes to 1 before sending), 2=Console, 3=MIDI.
+		// Gates the user-port MIDI-in merge at the serialIn assign below.
+		.uart_mode(uart_mode)
 	);
 
 	assign CLK_VIDEO = clk_vid;
@@ -720,6 +765,7 @@ module emu
 	wire serialIn;
 	wire serialCTS = 1'b1; // Idle/deasserted when no serial device connected
 	wire serialRTS;
+	wire [7:0] uart_mode;  // OSD "UART mode" from hps_io (3 = MIDI)
 
 	// V8 Video system wires
 	wire v8_hsync, v8_vsync, v8_hblank, v8_vblank, v8_de;
@@ -739,9 +785,18 @@ module emu
 	// (Previously forced to 1'b1 to dodge a suspected ROM "Break detection loop";
 	// that was a symptom of earlier boot issues, since resolved, not the RX path.)
 	// The line idles high; rxuart double-syncs UART_RXD internally.
-	// RX source: ALWAYS the HPS UART (UART_RXD) — MidiLink / console / PPP.
-	// The MT32-pi is an OUTPUT synth: the guest sends MIDI out to it and gets
-	// AUDIO back over I2S — it never drives the guest's serial receive line.
+	// RX sources:
+	//  - ALWAYS the HPS UART (UART_RXD) — MidiLink / console / PPP.
+	//  - MIDI IN (2026-08-14): in OSD UART mode = MIDI ONLY, the user-port
+	//    MIDI-in line (mt32_midi_rx from sys/mt32pi.sv: the Pi's TX pin when
+	//    an MT32-pi is detected, USER_IN[0] otherwise) is AND-merged in.
+	//    Both lines idle high (USER_IO has weak pull-ups, MacLC.qsf), so the
+	//    merge is inert until a source actually transmits; a start bit from
+	//    either reaches the SCC. A USB MIDI keyboard on the MiSTer arrives
+	//    via MidiLink on UART_RXD; a controller on the MT32-pi (or a user-port
+	//    MIDI receiver with no Pi) arrives on mt32_midi_rx. The SCC side needs
+	//    nothing: rx/tx share one baud divider, the WR11/TRxC clause covers
+	//    the RX clock-source bits, and tb_scc_midi section 3 gates RX @31250.
 	// (2026-08-13) The old `mt32_available ? mt32_midi_rx : UART_RXD` mux was a
 	// bug: whenever a Pi was detected on the user port it repointed the guest's
 	// RX at the Pi's MIDI-return line, so EVERY guest-receive path died with a
@@ -749,9 +804,11 @@ module emu
 	// looked one-directional. PPP was the first feature to need guest RX and
 	// exposed it (LCP: pppd rcvd the guest's ConfReq but the guest never saw
 	// pppd's ConfAck -> LCP never completed). cozyMIDI is TX-only and missed it.
-	// If a USB-MIDI-controller-on-the-Pi -> guest path is ever wanted, gate
-	// mt32_midi_rx on a wired uart_mode==MIDI, never unconditionally.
-	assign serialIn = UART_RXD;
+	// The uart_mode==MIDI gate below is exactly what that post-mortem
+	// prescribed: outside MIDI mode serialIn is UART_RXD alone and the user
+	// port can never hijack guest receive (PPP/console unaffected).
+	wire userport_midi_in = (uart_mode == 8'd3) ? mt32_midi_rx : 1'b1;
+	assign serialIn = UART_RXD & userport_midi_in;
 	assign UART_TXD = serialOut;
 	assign UART_RTS = serialRTS ;
 	assign UART_DTR = UART_DSR;
@@ -876,11 +933,12 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
+	wire flp_guard;
 	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
-	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
+	wire pds_slot_irq = pds_irq;  // PDS Ethernet card → pseudo-VIA slot-IFR bit $20 (slot $E)
 	wire vid_alt;
 	wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectASC, selectUnmapped;
 	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
@@ -903,28 +961,30 @@ module emu
 	wire [21:0] dskReadAddrExt;
 
 	// dtack generation for 16 MHz mode
-	reg  dtack_en, mem_latch_d;
+	// Phase C (branch cpu-enhancements): RAM/ROM/VRAM DTACK comes straight
+	// from the SDRAM controller's demand handshake (sdram_cpu_done) — the
+	// old slot-aligned grant (cpuBusControl & mem_latch_d strobe at each
+	// cpu-slot start) is gone, and with it the mod-4 quantization that
+	// pinned every memory access to >=8 clk_sys. dtack_en now serves ONLY
+	// the immediate paths the demand engine never serves:
+	//   - peripheral/unmapped space (as before), and
+	//   - ROM-region WRITES (ack-and-discard, 68000/V8 style). A ROM write
+	//     asserts neither oe nor we, so the engine never answers it — but
+	//     the boot ROM's device-probe code WRITES into ROM space behind a
+	//     temporary vector-$8 handler and requires the cycle to complete
+	//     (ack or bus-error; the old slot glue acked every mem-region
+	//     access regardless of oe/we). Without this the diskless ?-icon
+	//     phase deadlocks at a byte write to $A6C3xx — the 2026-08-17
+	//     magenta-screen boot stall.
+	reg  dtack_en;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
 		end
 		else begin
-			// mem_latch_d = registered memoryLatch: high at busPhase 0, i.e. the
-			// START of each busCycle. (cpuBusControl & mem_latch_d) therefore
-			// strobes once at the start of EVERY cpu slot.
-			mem_latch_d <= memoryLatch;
 			if (_cpuAS) dtack_en <= 0;
-			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
-			// so it must take the slot-aligned DTACK path (a cpu-slot start),
-			// NOT the immediate !ROM&!RAM peripheral path. Excluding selectVRAM
-			// here stops DTACK asserting before the SDRAM cpu-slot commits the
-			// read/write (was truncating longword writes / sampling stale data).
-			// H1: this was `!cpuBusControl_d & cpuBusControl` (rising edge), which
-			// gave each ISOLATED cpu slot one DTACK opportunity. With slot 00 now
-			// also a cpu slot the three slots are contiguous (one rising edge per
-			// round), so we strobe at each cpu-slot start instead — same busPhase-0
-			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
-			if (!_cpuAS & ((cpuBusControl & mem_latch_d) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			if (!_cpuAS & ( (!selectROM & !selectRAM & !selectVRAM)
+			              | (selectROM & !_cpuRW) )) dtack_en <= 1;
 		end
 	end
 
@@ -1022,11 +1082,73 @@ module emu
 		end
 	end
 
-	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
+	// ── PDS Ethernet card (Apple Ethernet LC Twisted Pair, pseudo-slot $E) ─────
+	// Claims $FE0Dxxxx/$FE0Exxxx/$FEFFxxxx (and the 24-bit $EDxxxx/$EExxxx
+	// windows) ONLY when Main's mac_eth service has published MAGIC — otherwise
+	// slot space keeps the hardware-validated open-bus $FFFF ack below. Card
+	// cycles complete via stretched async DTACK (never VPA), like SCSI DMA.
+	wire        pds_card_sel, pds_card_ack, pds_irq;
+	wire        pds_dbg_present, pds_dbg_cmdq, pds_dbg_wd;
+	wire  [3:0] pds_dbg_kind;
+	wire [15:0] pds_dbg_rdata;
+	wire [15:0] pds_dout;
+	// guest-RAM DMA legs into the SDRAM controller's eth port (Phase 3)
+	wire        pds_eth_req, pds_eth_we, pds_eth_ack;
+	wire [23:0] pds_eth_addr;
+	wire [15:0] pds_eth_din, pds_eth_dout;
+	pds_enet pds_enet (
+		.clk_sys   (clk_sys),
+		.rst_core  (~pll_locked_s | RESET),
+		.rst_guest (~_cpuReset | ~_cpuReset_o),
+		.ram_config_phys(configRAMSize),
+		.eth_req   (pds_eth_req),
+		.eth_we    (pds_eth_we),
+		.eth_addr  (pds_eth_addr),
+		.eth_din   (pds_eth_din),
+		.eth_ack   (pds_eth_ack),
+		.eth_dout  (pds_eth_dout),
+		.ena_osd   (status[19]),   // OJ list is Off,On -> bit SET = On (default Off)
+		.cpuAddr   (cpuAddr),
+		.cpuDataIn (cpuDataOut),
+		._cpuAS    (_cpuAS),
+		._cpuUDS   (_cpuUDS),
+		._cpuLDS   (_cpuLDS),
+		._cpuRW    (_cpuRW),
+		.card_sel  (pds_card_sel),
+		.card_ack  (pds_card_ack),
+		.card_dout (pds_dout),
+		.irq       (pds_irq),
+		.dbg_present    (pds_dbg_present),
+		.dbg_cmd_queued (pds_dbg_cmdq),
+		.dbg_wd_fired   (pds_dbg_wd),
+		.dbg_last_kind  (pds_dbg_kind),
+		.dbg_rdata      (pds_dbg_rdata),
+		.mem_addr  (pds_mem_addr),
+		.mem_burst (pds_mem_burst),
+		.mem_rd    (pds_mem_rd),
+		.mem_we    (pds_mem_we),
+		.mem_wdata (pds_mem_wdata),
+		.mem_be    (pds_mem_be),
+		.mem_rdata (DDRAM_DOUT),
+		.mem_rvalid(DDRAM_DOUT_READY),
+		.mem_busy  (DDRAM_BUSY)
+	);
+
+	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space || pds_card_sel) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        icache_hit ? 1'b0 :        // fetch-cache hit answers now
+	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
-	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+	                        // Phase C: SDRAM-backed targets ack via the demand
+	                        // handshake (early-done: data is in cpu_dout before
+	                        // the FSM's exit+2 din_r latch; writes post at ACTIVE).
+	                        // ROM WRITES are excluded: the engine never serves
+	                        // them (no oe/we) — they ack-and-discard via dtack_en.
+	                        (!_cpuAS && (selectRAM || selectVRAM || (selectROM && _cpuRW))) ? ~sdram_cpu_done :
+	                        // $Fxxxxx VPA peripherals stay un-acked here (E/VMA
+	                        // paced); everything else non-mem = immediate ack
+	                        (~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en);
 
 	// ── Programmer's switch / Level-7 NMI (debug aid) ───────────────────────────
 	// An OSD button (status[5], the "R5" momentary trigger) fires a non-maskable
@@ -1055,6 +1177,24 @@ module emu
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
+
+	// RESET-instruction soft peripheral reset (2026-08-08 warm-restart fix).
+	// Both guest restart flavors (Special ▸ Restart AND the shutdown screen's
+	// Restart button) execute RESET + jump — NO Egret reset, HUD row-12
+	// witnessed on HW: rsti_edges 1→2, rst_edges 0. On a real LC that
+	// instruction resets the VIA and the V8 interrupt state; here it reset
+	// NOTHING, so the warm ROM inherited the OS's live pseudovia slot_ier —
+	// vblank re-asserted the slot summary every frame and the boot wedged
+	// forever probing $F1xxxx with video blanked (cfg $40): the black screen.
+	// Stretch tg68_reset_n (asserted only while the RESET micro-op runs)
+	// into a clean 16-clk pulse for via6522 + pseudovia interrupt state.
+	// Keep in sync with verilator/sim.v.
+	reg [3:0] softrst_cnt = 4'd0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset_o)           softrst_cnt <= 4'hF;
+		else if (softrst_cnt != 0)  softrst_cnt <= softrst_cnt - 1'd1;
+	end
+	wire soft_periph_rst = (softrst_cnt != 0);
 	// The 68k RESET instruction resets chip-level peripherals (NCR5380+SCSI
 	// targets, SCC — see dataController._resetInstr_n) and the pseudo-VIA,
 	// but NOT the CPU/system (reset-source NOTE above: feeding it into
@@ -1084,6 +1224,7 @@ module emu
 	wire        tg68_fc2;
 	wire [15:0] tg68_dout;
 	wire [31:0] tg68_a;
+	wire [31:0] tg68_a_early;   // pre-AS address for the fetch cache
 	wire        tg68_reset_n;
 	wire        tg68_longword;   // 32-bit access flag — drives SCSI pseudo-DMA byte packing
 
@@ -1105,6 +1246,48 @@ module emu
 	// instead of phantom-card garbage, and nothing depends on TG68 berr.
 	wire cpu_berr = (fc7_berr && !_cpuAS) || sdma_berr;
 
+	// ── Fetch cache (ported 2026-08-18, HW-validated 2026-08-19) ────────────
+	// ★ Fed the EARLY address (tg68_a_early = the kernel's combinational
+	// output): the Phase-B FSM registers cpuAddr on the same edge AS falls, so
+	// the module's correspondence guard rejects every fetch on the registered
+	// address — 100% miss, silently. See rtl/fetch_cache.sv.
+	// ★ The July "cache corrupts / hangs" history is CLOSED — it was TWO
+	// independent silicon-only defects, both fixed and both still required:
+	//   1. M10K read-during-write (rdw_collide in fetch_cache.sv, proven by
+	//      FETCH_CACHE_HOSTILE_RDW fault injection);
+	//   2. abandoned-transaction stale-done in rtl/sdram.v (a hit lets the
+	//      CPU abandon its demand transaction; the orphan early-done could
+	//      falsely complete the NEXT cycle — proven and regression-gated by
+	//      verilator/tb_icache_seam.v, which runs the REAL controller).
+	// Any new agent that can abandon a bus request re-opens class 2 — run
+	// that TB (normal + negative control) before trusting it.
+	wire        icache_hit;
+	wire [15:0] icache_data;
+	wire        icache_hit_now;   // per-access request-suppression verdict
+	fetch_cache #(.LOG2_WORDS(9)) icache (
+		.clk        ( clk_sys ),
+		.reset      ( ~_cpuReset ),
+		.flush_bits ( {memoryOverlayOn, dio_download} ),
+		// ★ ALWAYS ON (user ruling 2026-08-19, after HW validation on fb8819d6):
+	// no OSD toggle — the CONF_STR entry is removed and status[11] is FREE.
+	// The sim side keeps its +icache plusarg so icache_trace_diff.py can
+	// still run ON/OFF differential traces.
+	.enable     ( ~status[11] ),   // FIX 2026-08-22: non-constant '1' (status[11] free/=0)
+	                                 // keeps fetch_cache enable_r un-folded -> hit/DTACK path
+	                                 // no longer races. Zero-cost (immediate hit answer kept).
+	                                 // See docs/pocket_icache_fix_handoff.md.
+		.cpuAddr    ( tg68_a_early[23:0] ),
+		.as_n       ( _cpuAS ),
+		.rw         ( _cpuRW ),
+		.fc         ( cpuFC ),
+		.cacheable  ( selectRAM || selectROM ),
+		.snoopable  ( selectRAM ),
+		.mem_din    ( dataControllerDataOut ),
+		.hit        ( icache_hit ),
+		.hit_data   ( icache_data ),
+		.hit_now    ( icache_hit_now )
+	);
+
 	// ─────────────────────────────────────────────────────────────────────────
 	// SCSI / peripheral read-path fit-stabilization (Layer 1 — the structural fix).
 	//
@@ -1112,10 +1295,10 @@ module emu
 	// 6800-style VPA cycle — NOT the async-DTACK path RAM/ROM/VRAM use. (Verified:
 	// for this region _cpuDTACK is held DEASSERTED above and _cpuVPA asserted, so the
 	// CPU is paced by VMA/E, never by dtack_en.) The VPA cycle is E-paced (E≈812kHz
-	// ⇒ ~40 clk_sys per E period) and the kernel latches read data LATE: at s_state 6,
-	// only after stalling at s_state 4 for xVma (= eCntr==8, one tick before E-fall —
-	// rtl/tg68k/tg68k.v:107,115,135). So from address/select settle (AS at s_state 1)
-	// to the data sample is ALWAYS ≥5 clk_sys.
+	// ⇒ ~40 clk_sys per E period) and the kernel latches read data LATE: at S_TAIL2,
+	// only after stalling at S_WAIT for the E-paced (phi2 && xVma) exit (= eCntr==8,
+	// one tick before E-fall — rtl/tg68k/tg68k.v). So from address/select settle
+	// (AS at S_WAIT entry) to the data sample is ALWAYS ≥5 clk_sys.
 	//
 	// The bit that makes this read fit-sensitive is CSR bit6 / scsi_bsy — the deepest
 	// cone in the whole read mux: scsi.v phase reg → bsy=(phase!=IDLE) → |target_bsy
@@ -1136,7 +1319,9 @@ module emu
 	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
 	reg [15:0] periph_din_reg;
 	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
-	wire [15:0] cpu_din_muxed = slot_space     ? 16'hFFFF :
+	wire [15:0] cpu_din_muxed = pds_card_sel   ? pds_dout :
+	                            slot_space     ? 16'hFFFF :
+	                            icache_hit     ? icache_data :
 	                            vpa_periph_read ? periph_din_reg :
 	                                              dataControllerDataOut;
 `ifdef SIMULATION
@@ -1182,7 +1367,8 @@ module emu
 				.din        ( cpu_din_muxed ),
 				.dout       ( tg68_dout ),
 				.longword   ( tg68_longword ),
-				.addr       ( tg68_a )
+				.addr       ( tg68_a ),
+				.addr_early ( tg68_a_early )
 			);
 	
 	// On-chip framebuffer (BRAM): packed CPU VRAM write mirror (port A) +
@@ -1193,8 +1379,12 @@ module emu
 	wire [17:0] v8_vram_raddr;
 	wire [15:0] v8_vram_rdata;
 
+	// Forward declarations: assigned with the rest of the disk-mount state
+	// further down; needed here for addrController's flp_present gate.
+	wire dsk_int_ins, dsk_ext_ins;
 	addrController_top ac0
 	(
+		.flp_present(dsk_int_ins | dsk_ext_ins),
 		.clk(clk_sys),
 		.clk8(clk8),
 		.clk8_en_p(clk8_en_p),
@@ -1208,6 +1398,7 @@ module emu
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
 		.cpuFC(cpuFC),
+		.pds_claim(pds_card_sel),
 		.ram_config(pvia_ram_config_out),
 		.ram_config_phys(configRAMSize),   // PHYSICAL SIMM size — was unconnected (=0),
 		                                   // so the 10MB SIMM was invisible and the Mac
@@ -1222,6 +1413,9 @@ module emu
 		._ramWE(_ramWE),
 		.dioBusControl(dioBusControl),
 		.cpuBusControl(cpuBusControl),
+		.flp_guard(flp_guard),
+		.cpu_wr_ack(sdram_cpu_done),
+		.dio_download(dio_download),
 		.selectSCSI(selectSCSI),
 		.selectSCSIDMA(selectSCSIDMA),
 		.selectSCC(selectSCC),
@@ -1315,6 +1509,7 @@ module emu
 	pseudovia pvia(
 		.clk_sys(clk_sys),
 		.reset(~n_reset),
+		.soft_rst(soft_periph_rst),
 		.addr({cpuAddr[12:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(pseudovia_dout),
@@ -1568,7 +1763,21 @@ module emu
 	reg hud_de_d = 1'b0, hud_vbl_d = 1'b0;
 	reg [31:0] hud_w1 = 32'd0, hud_w2 = 32'd0, hud_w3 = 32'd0, hud_w4 = 32'd0,
 	           hud_w5 = 32'd0, hud_w6 = 32'd0, hud_w7 = 32'd0, hud_w8 = 32'd0,
-	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0;
+	           hud_w9 = 32'd0, hud_w10 = 32'd0, hud_w11 = 32'd0,
+	           hud_w12 = 32'd0, hud_w13 = 32'd0, hud_w14 = 32'd0;
+	// ── Rows 12/13: last two DISTINCT bus addresses + live IPL (2026-08-25
+	// card-ON "?"-wedge hunt; same instrument as release-branch f4f0de4).
+	// Three grabs of a wedged screen = six 24-bit samples = the loop's exact
+	// footprint (PCs in $A0xxxx, data addresses name the device/table).
+	reg        hud_as_d2 = 1'b1;
+	reg [23:0] hud_lastaddr = 24'd0, hud_prevaddr = 24'd0;
+	always @(posedge clk_sys) begin
+		hud_as_d2 <= _cpuAS;
+		if (hud_as_d2 && !_cpuAS && (cpuAddr[23:0] != hud_lastaddr)) begin
+			hud_prevaddr <= hud_lastaddr;
+			hud_lastaddr <= cpuAddr[23:0];
+		end
+	end
 	// ── Geometry (2026-08-05 pm): 4x4 cells at the BOTTOM-LEFT ─────────────
 	// Was 8x8 cells at the top-left, which covered the Mac MENU BAR — that
 	// cost real bench time (the Special-menu shutdown choreography walked
@@ -1580,13 +1789,16 @@ module emu
 	// any other v8 mode all place the deck against the true last line
 	// without a hard-coded height.
 	localparam [9:0] HUD_W  = 10'd128;   // 32 cells x 4 px
-	localparam [9:0] HUD_HT = 10'd48;    // 12 rows  x 4 lines
+	localparam [9:0] HUD_HT = 10'd60;    // 15 rows  x 4 lines
 	reg  [9:0] hud_h = 10'd480;          // measured active lines (prev frame)
 	wire [9:0] hud_ytop  = (hud_h > HUD_HT) ? (hud_h - HUD_HT) : 10'd0;
 	wire       hud_vband = (hud_y >= hud_ytop) && (hud_y < hud_h);
 	wire [9:0] hud_yrel  = hud_y - hud_ytop;
 	wire [3:0] hud_rowsel = hud_yrel[5:2];
 	wire [31:0] hud_wmux =
+		(hud_rowsel == 4'd14) ? hud_w14 :
+		(hud_rowsel == 4'd13) ? hud_w13 :
+		(hud_rowsel == 4'd12) ? hud_w12 :
 		(hud_rowsel == 4'd11) ? hud_w11 :
 		(hud_rowsel == 4'd10) ? hud_w10 :
 		(hud_rowsel == 4'd9) ? hud_w9 :
@@ -1625,6 +1837,13 @@ module emu
 			hud_w10 <= hud_e142_pos;
 			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
 			             dbg_flp_disk_data, dbg_flp_raw};
+			hud_w12 <= {5'b0, _cpuIPL_dc, hud_lastaddr};
+			hud_w13 <= {8'h00, hud_prevaddr};
+			// Row 14 (2026-08-26): card write-vanish witnesses.
+			// [31:16]=last completed card-cycle data, [7:4]=sticky
+			// {saw_stub,saw_regwr,0,0}, [2]=wd_fired [1]=cmd_queued [0]=present
+			hud_w14 <= {pds_dbg_rdata, 8'b0, pds_dbg_kind,
+			            1'b0, pds_dbg_wd, pds_dbg_cmdq, pds_dbg_present};
 		end
 		hud_on_q    <= hud_vband && (hud_x < HUD_W) && v8_de;
 		hud_white_q <= hud_wmux[5'd31 - hud_x[6:2]];
@@ -1855,7 +2074,15 @@ module emu
 	// V8 schematic SND[0:2]/DFAC_CLK/CULTDAC0: see rtl/asc.sv / rtl/ariel_ramdac.sv
 	asc asc_inst(
 		.clk(clk_sys),
-		.reset(~n_reset),
+		// soft_periph_rst: the RESET instruction resets the ASC on a real LC
+		// (it sits on the system reset line). Row-13 witness 2026-08-08: the
+		// warm boot's Egret handshake COMPLETES (treq/tip/pvia_wr counters
+		// freeze at 7/14/41, lines idle) and the ROM then spins quietly in
+		// $A0xxxx before the march/video-config — the chime-phase wait on a
+		// STALE OS-era ASC (FIFO/mode/IRQ state) is the prime suspect; a
+		// freshly-reset ASC behaves exactly as the ROM's chime code expects
+		// on every cold boot.
+		.reset(~n_reset || soft_periph_rst),
 		.cs(selectASC),
 		// cpuAddr[0] is forced 0 in this core, so the ASC register A0 (which
 		// selects MODE/FIFOMODE/CLOCK — the odd-numbered regs) gets dropped and
@@ -1969,6 +2196,9 @@ module emu
 		memoryOverlayOn_prev <= memoryOverlayOn;
 	end
 
+	// Forward declaration: the floppy fetch byte is assigned further down,
+	// after the SDRAM instantiation that produces sdram_out.
+	wire [15:0] extra_rom_data_demux;
 	dataController_top dataController (
 		.clk32(clk_sys),
 		.clk8_en_p(clk8_en_p),
@@ -1977,6 +2207,7 @@ module emu
 		.E_rising(E_rising),
 		.E_falling(E_falling),
 		._systemReset(n_reset),
+		.softRst(soft_periph_rst),
 		.pseudovia_irq(pseudovia_irq),
 		._cpuReset(_cpuReset),
 		._cpuIPL(_cpuIPL_dc),
@@ -2019,6 +2250,7 @@ module emu
 		.cpuBusControl(cpuBusControl),
 		.memoryDataOut(memoryDataOut),
 		.memoryDataIn(sdram_do),
+		.dskReadDataIn(extra_rom_data_demux[7:0]),
 		.memoryLatch(memoryLatch),
 		.selectAriel(selectAriel),
 		.ariel_data_in(ariel_reg_dout),
@@ -2205,8 +2437,8 @@ module emu
 	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
 
 	// any known type of disk image inserted?
-	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
+	assign dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
+	assign dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
@@ -2287,13 +2519,17 @@ module emu
 	//   Floppy 2: $700000 + offset
 	reg [22:0] dio_a;
 	reg [15:0] dio_data;
-	reg        dio_write;
+
+	// Download request into the SDRAM controller's dedicated port. One word
+	// per dioBusControl slot (the pre-Phase-C rate); dl_ack, not the slot
+	// edge, releases the HPS. Declared here because the handshake below
+	// consumes sdram_dl_ack.
+	wire        sdram_dl_ack;
 
 	// DC42 write offset: active from the word after the magic (word 41)
 	wire [19:0] dio_flp_a = dc42_skip ? (dio_addr[19:0] - 20'd42) : dio_addr[19:0];
 
 	always @(posedge clk_sys) begin
-		reg old_cyc = 0;
 		if(ioctl_write) begin
 			if (dio_index[1:0] != 2'b00) begin
 				// DC42 header detection (floppy downloads only)
@@ -2313,18 +2549,29 @@ module emu
 			endcase
 			ioctl_wait <= 1;
 		end
-
-		old_cyc <= dioBusControl;
-		if(~dioBusControl) dio_write <= ioctl_wait;
-		if(old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
+		// ★ Release the HPS on the SDRAM controller's OWN acknowledgement, not
+		// on the bus-slot edge. The old edge protocol assumed the write had
+		// certainly been issued by the time the slot ended; under demand-start
+		// the sequencer can still be busy with a CPU access, and a word that
+		// missed its slot was silently dropped from the image. dl_ack is a
+		// level (clk_64 is 2x clk_sys — a one-tick pulse is not sampleable),
+		// so this is a clean two-phase handshake: ioctl_wait 0->1 requests,
+		// dl_ack 0->1 acknowledges, and the word simply waits for the next
+		// window if this one was taken.
+		else if (sdram_dl_ack) ioctl_wait <= 0;
 	end
 
 	// (Floppy-download acceptance counters removed 2026-07-16 with their PFL1
 	// sel-3 readout — recover from git history with the floppy probes.)
 
 
-	// sdram used for ram/rom maps directly into 68k address space
-	wire download_cycle = dio_download && dioBusControl;
+	// ★★★ 2026-08-18 — the `download_cycle` MUX IS GONE. It used to steal the
+	// CPU's addr/din/ds/we/oe nets for the dioBusControl slot; see the long
+	// root-cause note on the dl_* port in rtl/sdram.v. Downloads now reach the
+	// controller through their own request, so a mount can no longer hijack a
+	// CPU access (or its DTACK) mid-flight. The window is still exactly one
+	// word per dioBusControl slot, so the download rate and the CPU/download
+	// bandwidth split are unchanged from the pre-Phase-C slot machine.
 
 	// ============================================================
 	// VRAM is left uninitialized — the Mac's video driver clears and
@@ -2337,19 +2584,42 @@ module emu
 	// SDRAM Address mapping for Mac LC (V8-style):
 	// memoryAddr[22:0] is already the SDRAM word address from addrController
 	// Download path uses dio_a[22:0] directly
-	wire [24:0] sdram_addr = download_cycle ? {2'b00, dio_a[22:0]} :
-	                                          {2'b00, memoryAddr[22:0]};
-	wire [15:0] sdram_din  = download_cycle ? dio_data :
-	                                          memoryDataOut;
-	wire  [1:0] sdram_ds   = download_cycle ? 2'b11 :
-	                                          { !_memoryUDS, !_memoryLDS };
-	wire        sdram_we   = download_cycle ? dio_write :
-	                                          !_ramWE;
-	wire        sdram_oe   = download_cycle ? 1'b0 :
-	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
-	wire [15:0] sdram_do   = download_cycle ? 16'hffff :
-	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
-	                                                            sdram_out_patched;
+	wire [24:0] sdram_addr = {2'b00, memoryAddr[22:0]};
+	wire [15:0] sdram_din  = memoryDataOut;
+	wire  [1:0] sdram_ds   = { !_memoryUDS, !_memoryLDS };
+	wire        sdram_we   = !_ramWE;
+	// Phase C: oe is PURE CPU read intent — floppy windows request via
+	// flp_win, NOT via oe. Including dskReadAck here (as the slot machine
+	// needed) let a pending floppy window bridge the 2-3 tick AS-high gap
+	// between CPU cycles, holding oe high so cpu_done never cleared: the
+	// next read then instant-acked on the HELD done and latched the
+	// PREVIOUS access's cpu_dout without ever touching SDRAM (stale-read
+	// class), and writes lost their done-RISE (vram_we strobes silently
+	// dropped -> the magenta-screen hunt of 2026-08-17).
+	// ★ A cache hit never starts an SDRAM transaction (2026-08-19): the
+	// suppression verdict is a per-access snapshot from fetch_cache (same
+	// edge the hit registers, held for the access), so oe_q sees a stable
+	// gate — never a mid-transaction drop. Without this every hit ABANDONED
+	// its demand transaction and the next access stalled behind the phantom:
+	// Speedometer showed the software-FP tests 4-6% BELOW cache-off while
+	// tight loops gained (+21% Sieve) — the stall tax. sdram.v's done-birth
+	// guard (`&& oe`) remains as the abandonment safety net.
+	wire        sdram_oe   = (!_ramOE || !_romOE) && !icache_hit_now;
+	// Phase C: CPU reads come from the SDRAM controller's held cpu_dout
+	// register (captured once per demand access), not the shared slot-domain
+	// dout — floppy windows can no longer clobber CPU read data, and the
+	// value stays valid through the CPU FSM's late din_r latch.
+	// (The old `download_cycle ? 16'hffff` term — "so the screen is black
+	// during download" — was removed with the mux: video no longer reads
+	// SDRAM at all (BRAM framebuffer), and forcing $FFFF here corrupted any
+	// CPU read that happened to be sampled inside a download slot, which is
+	// the same defect class as the request mux itself.)
+	// ★ The floppy leg is GONE from this mux (2026-08-19) — it now reaches
+	// dataController on its own dskReadDataIn wire. This net is the memory leg
+	// of cpuDataOut, so swapping it to the floppy byte for the duration of
+	// every fetch window handed the CPU floppy data whenever a window landed
+	// inside a (no-longer-slot-aligned) demand access.
+	wire [15:0] sdram_do   = cpu_dout_patched;
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
@@ -2366,23 +2636,77 @@ module emu
 	// fetch window, so the live bit is coherent with the returning word. Keep in
 	// sync with verilator/sim.v.
 	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
-	wire [15:0] extra_rom_data_demux = dsk_byte_odd?
+	// Phase C fix: select with the parity REGISTERED alongside the request
+	// bundle, so it matches the address the access was actually issued with
+	// (the live signal is one tick ahead of the registered window now).
+	reg  sdram_dskodd_q;
+	always @(posedge clk_sys) sdram_dskodd_q <= dsk_byte_odd;
+	assign extra_rom_data_demux = sdram_dskodd_q?
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
 
-	// --- Force cold-boot path (warm-reset hang workaround) -----------------------
-	// The boot ROM chooses warm-vs-cold start with a `bne.w` at ROM byte $4655E
-	// (SDRAM word $52322F): d3 != 'WLSC' takes the FULL RAM march (cold path). On a
-	// warm reset RAM stays refreshed, so d3 == 'WLSC' and the core hangs on the warm
-	// path (only a full reconfig, which decays RAM, recovers). Force that one branch
-	// UNCONDITIONAL as it is fetched (`bne.w` 0x6600 -> `bra.w` 0x6000) so EVERY boot
-	// runs the cold march. No-op on a cold boot (the branch is taken anyway, d3 !=
-	// 'WLSC'). Guarded on the address AND the live opcode, so a different ROM is left
-	// untouched; catches both overlay and direct-ROM fetches (both selectROM->$52322F).
-	// Replaces the reverted sdram.init warm-reset hacks (d88c098 / 50d0c32), which
-	// broke cold boot. Keep in sync with verilator/sim.v.
-	wire [15:0] sdram_out_patched =
-		(!_romOE && memoryAddr == 23'h52322F && sdram_out == 16'h6600) ? 16'h6000 : sdram_out;
+	// --- Warm-boot path RESTORED (force-cold ROM patch removed 2026-08-24) ------
+	// History: the ROM chooses warm-vs-cold start with a `bne.w` at ROM byte
+	// $4655E (SDRAM word $52322F): d3 == 'WLSC' takes the warm shortcut, which
+	// used to hang because the RESET+jump restart inherited stale peripheral
+	// state (no Egret reset). A live ROM patch here forced that branch
+	// unconditional (0x6600 -> 0x6000) so EVERY boot ran the cold RAM march.
+	// With the RESET-instruction peripheral soft reset ported (fc73a58: VIA +
+	// TIP + pseudovia IRQ state + ASC + SWIM), the warm path's wedge cause is
+	// gone, so the patch is removed to get real-Mac fast warm restarts. If a
+	// warm-path hang ever returns, the one-line patch to reinstate is:
+	//   (!_romOE && memoryAddr == 23'h52322F && sdram_cpu_dout == 16'h6600)
+	//     ? 16'h6000 : sdram_cpu_dout
+	// (see git history of this block; keep in sync with verilator/sim.v).
+	wire [15:0] sdram_cpu_dout;
+	wire        sdram_cpu_done;
+	wire [15:0] cpu_dout_patched = sdram_cpu_dout;
+
+	// ── Phase C fix (2026-08-18): pipeline the SDRAM request in clk_sys ──────
+	// STA on the post-fit netlist (scratch/sta_sdram_summary.txt) measured the
+	// clk_sys->clk_mem request paths at **-6.710 ns** with a 15.381 ns window:
+	// the V8 address-translation cone (tg68k|addr -> SIMM compare / mirror
+	// subtract / mux -> sdram|sd_addr) needs ~22 ns, but a clk_64 capture edge
+	// gives it only ONE clk_64 period. The demand sequencer was therefore
+	// latching a HALF-SETTLED ROW/COLUMN ADDRESS — reads and writes landing at
+	// the wrong location, i.e. the RAM corruption behind the "System Update"
+	// F-line bomb of 2026-08-17. (The earlier b48b60c multicycle "fixed" this
+	// on paper by granting 2 destination periods; the silicon never got them.
+	// It is deleted with this change — the fix must be structural.)
+	//
+	// The old slot machine never had this problem: it sampled at a fixed slot
+	// phase with the CPU holding address and data stable across the WHOLE
+	// 4-clk_sys slot (~123 ns of settling). This restores that guarantee the
+	// cheap way — one clk_sys register stage on the whole request bundle:
+	//   * the deep translation cone now terminates at a clk_sys flop and gets
+	//     a full 30.76 ns period (22 ns needed -> genuine positive slack);
+	//   * the sequencer captures from an adjacent register, a short route that
+	//     closes inside one clk_64 period with room to spare.
+	// Cost is one clk_sys tick of request latency per access.
+	// The WHOLE bundle registers together (including flp_win/flp_guard) so the
+	// floppy window stays coherent with the address it is muxing — floppy.v
+	// latches its fetch a full clk8 period later, which absorbs the shift.
+	reg [24:0] sdram_addr_q;
+	reg [15:0] sdram_din_q;
+	reg  [1:0] sdram_ds_q;
+	reg        sdram_we_q, sdram_oe_q;
+	reg        sdram_flpwin_q, sdram_flpguard_q;
+	reg        sdram_dlreq_q, sdram_dlslot_q;
+	reg [23:0] sdram_dladdr_q;
+	reg [15:0] sdram_dldin_q;
+	always @(posedge clk_sys) begin
+		sdram_addr_q     <= sdram_addr;
+		sdram_din_q      <= sdram_din;
+		sdram_ds_q       <= sdram_ds;
+		sdram_we_q       <= sdram_we;
+		sdram_oe_q       <= sdram_oe;
+		sdram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download;
+		sdram_flpguard_q <= flp_guard && !dio_download;
+		sdram_dlreq_q    <= ioctl_wait;
+		sdram_dlslot_q   <= dioBusControl;
+		sdram_dladdr_q   <= {1'b0, dio_a[22:0]};
+		sdram_dldin_q    <= dio_data;
+	end
 
 	assign SDRAM_CKE = 1;
 
@@ -2431,14 +2755,48 @@ module emu
 		.sd_cas         ( SDRAM_nCAS               ),
 
 
-		// cpu/chipset interface
+		// cpu/chipset interface — the clk_sys-REGISTERED request bundle (see
+		// the pipeline note above; feeding the combinational nets here is what
+		// broke the 2026-08-17 build).
 		// map rom to sdram word address $200000 - $20ffff
-		.din            ( sdram_din                ),
-		.addr           ( sdram_addr               ),
-		.ds             ( sdram_ds                 ),
-		.we             ( sdram_we                 ),
-		.oe             ( sdram_oe                 ),
-		.dout           ( sdram_out                )
+		.din            ( sdram_din_q              ),
+		.addr           ( sdram_addr_q             ),
+		.ds             ( sdram_ds_q               ),
+		.we             ( sdram_we_q               ),
+		.oe             ( sdram_oe_q               ),
+		.dout           ( sdram_out                ),
+
+		// Phase C demand-start service (branch cpu-enhancements).
+		// !dio_download on both (applied at the register above): during a
+		// download, dio writes are only PRESENTED during dioBusControl ticks —
+		// the very ticks floppy windows claim — and the guard zone covers
+		// them, so a pending floppy fetch would deadlock the HPS download
+		// (ioctl_wait never clears). The old slot machine equivalently served
+		// dio in slot 2 during downloads (oe forced 0). Floppy pending state
+		// persists and is served after the download.
+		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
+		.flp_addr       ( sdram_addr[23:0] ),
+		.flp_guard      ( sdram_flpguard_q         ),
+
+		// download port (see the root-cause note in rtl/sdram.v)
+		.dl_req         ( sdram_dlreq_q            ),
+		.dl_slot        ( sdram_dlslot_q           ),
+		.dl_addr        ( sdram_dladdr_q           ),
+		.dl_din         ( sdram_dldin_q            ),
+		.dl_ack         ( sdram_dl_ack             ),
+
+		// PDS Ethernet guest-RAM DMA port (rtl/pds/pds_enet.sv, Phase 3).
+		// pds_enet's outputs are already clk_sys registers set before the
+		// request rises — the same settled-value shape as the _q bundle.
+		.eth_req        ( pds_eth_req              ),
+		.eth_we         ( pds_eth_we               ),
+		.eth_addr       ( pds_eth_addr             ),
+		.eth_din        ( pds_eth_din              ),
+		.eth_ack        ( pds_eth_ack              ),
+		.eth_dout       ( pds_eth_dout             ),
+
+		.cpu_done       ( sdram_cpu_done           ),
+		.cpu_dout       ( sdram_cpu_dout           )
 	);
 
 endmodule

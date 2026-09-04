@@ -323,3 +323,137 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   (or a third-party CD driver) to mount discs. Serving law for any new
   DataIn command: transfer EXACTLY what the initiator arms (see
   docs/SCSI_CMD_GAPS.md).
+- **Ethernet (Apple Ethernet LC Twisted Pair card, 820-0532, LC PDS slot $E):
+  HW-VALIDATED + RELEASED 2026-08-22 — `releases/MacLC_20260822.rbf`
+  (md5 4f31e0dd) + `releases/MiSTer` (md5 932ed605, the REQUIRED ethernet
+  host).** The guest boots to the Finder desktop with the card On and FTP
+  works (connect, login, transfer). Three defects fixed on the way (all the
+  same class — the guest-RAM DMA engine moves 16-bit WORDS at EVEN addresses
+  but the SONIC uses ODD ones): (1) odd end-of-list descriptor addr aborted
+  transmit_chain leaving CR.TXP set → fixed host-side (mac_sonic.cpp DA()
+  word-align + TX_ABORT); (2) odd RX-buffer pointer failed the packet store →
+  PKTRX never set → fixed host-side (mac_eth.cpp rpc_read/write word-align +
+  RMW); (3) a ~120x interrupt-ack livelock → fixed in RTL with an irq
+  SUPPRESSION TIMER (pds_enet.sv: after a guest ISR write, hold irq low for
+  IRQ_SUPP ~1.85ms then follow Main's INT word — only DELAYS irq, never masks
+  a bit, so it can't deadlock; the earlier per-bit mask overlay DID deadlock/
+  wedge and was replaced). For latency-sensitive gaming, IRQ_SUPP is the lever
+  to tune DOWN (untested). The card is a RAM-less bus-master SONIC (DP83934).
+  **2026-08-26 — TX-dead-on-24-bit + the 2 KB/s FTP class FIXED; the old
+  "Fetch saturates the CPU" slowness theory is REFUTED.** Three fixes, all
+  Main-side (RTL untouched), fork branch `mac-ethernet`
+  `4f7717f`+`492a48b`+`fc87d1b`:
+  (1) **24-bit-mode DMA pointers**: a fresh System 7 runs 24-bit addressing
+  and stores Memory-Manager flags in pointer top bytes (bit31=locked — and
+  DMA buffers ARE locked); the LC PDS has only 24 address lines so the real
+  card never sees that byte. The model now masks EA() to [23:0] (registers /
+  published pointers keep full width like real silicon) and dma_rpc()
+  enforces the mailbox's 24-bit addr field (a dirty top byte overlapped the
+  COUNT field, bits 47:40 — a 64-byte read became a ~33KB grind → 50ms RPC
+  timeout → silent TX_ABORT: the "arp tx 33, ip tx 0" fingerprint, ARP
+  passing because driver NewPtr buffers have clean top bytes). `ea_strip` in
+  /tmp/mac_eth_stats witnesses it live. (2) **RX elasticity queue**: frames
+  the model refuses BEFORE touching guest state (RDE/RBE latched, no free
+  descriptor — sonic_rx_frame now returns -1 busy/0 dropped/1 delivered) are
+  held in order (64-deep, 2s age cap, guest-unicast only) and redelivered
+  when the ring frees: a burst tail costs ms, not a TCP RTO. `rx_held`/
+  `max_depth` witness. (3) **THE throughput killer: kernel GRO** coalesced
+  back-to-back TCP segments into >1518-byte super-frames before the
+  AF_PACKET tap; the model refuses jumbos, so every data burst toward the
+  guest silently vanished while solitary retransmits/ACKs/ARP/ping passed —
+  ping RTT was 3.7ms DURING the 796 B/s crawl, the measurement that finally
+  separated the layers. Linux TCP answered the burst loss with RTO backoff
+  (measured rto 111s, backoff 9, cwnd 2, 55% bytes retransmitted).
+  iface_gro_off() now runs at raw-socket open (named iface + /sys
+  `lower_*` parents — macvlan children ride the parent's RX path where GRO
+  actually runs); `rx_jumbo` + a one-time log line witness any recurrence.
+  HW result: the same Fetch download went 796 B/s → **58 KB/s end-to-end
+  average (3MB complete), 70-80 KB/s sustained mid-transfer** —
+  era-appropriate for a real LC. Diagnosis tool kept for the next TCP
+  mystery: `Main_MiSTer/support/mac/test/tcpsnoop.c` (static AF_PACKET TCP
+  tracer, build cmd in header) — run on BOTH endpoints and compare.
+  mac_sonic_test now 70 checks (24-bit dirty pointers, rx return contract).
+  FPGA side = `rtl/pds/pds_enet.sv`: register doorbell + read shadows, MAC
+  PROM (word-wide reads return the $0028 probe magic), flat 32K declROM at
+  $FEFF'8000 served from DDR3, and a guest-RAM DMA engine that enters
+  `rtl/sdram.v` as a 4th requester (idle-edges-only, level handshake, NEVER
+  touches cpu_done — the download-port pattern). Host side lives in the
+  Main_MiSTer fork (branch `mac-ethernet`, `support/mac/mac_eth*` +
+  `mac_sonic*` — SONIC model ported from MAME dp83932c flows); **the
+  modified Main is REQUIRED** (the old standalone `hps/maclc_eth` daemon is
+  retired). declROM source of truth = `releases/341-0740_AppleLCTwistedPair
+  .BIN` (sha1 447ce683…); `scripts/gen_enet_declrom.py` generates both the
+  sim hex and Main's embedded header — never hand-edit those. Guest needs
+  Apple's Network Software (no driver in ROM).
+  **Settings are OSD options, NOT MiSTer.ini** (MiSTer.ini is parsed by Main
+  for itself and cannot even choose which binary launches — `/etc/inittab`
+  hardcodes `/media/fat/MiSTer`): `OJ` Ethernet On/Off is a real core bit,
+  while `o45` Net interface and `o03` MAC suffix live in the EXTENDED status
+  range (32+) that this core's `wire [31:0] status` cannot read — the right
+  home for host-only settings, and it keeps the low bits free (note 15:17 =
+  video mode and bit 11 = the I-cache enable trick are USED but declare no
+  CONF_STR entry, so grep `status[` before claiming a bit is free).
+  Guest MAC = `08:00:07:4D:4C:0N` — fixed base + the OSD nibble, byte 4
+  identifying the core. Do NOT "improve" this by deriving it from the box:
+  the DE10-Nano has no MAC EEPROM, so u-boot gives every MiSTer
+  `02:03:04:05:06:07` unless the owner wrote `linux/u-boot.txt`, and every
+  hostname is `MiSTer` — both "unique" sources are identical across stock
+  boxes. `/media/fat/games/MacLC/eth.cfg` (`iface=`, `mac=`) still overrides
+  both, read at card start only.
+  **2026-08-27 — BULK GUEST UPLOADS FIXED (the last open eth item): 3 MB
+  Fetch PUT completes in ~34 s (~90-106 KB/s) on BOTH boxes; downloads
+  re-gated 58-71 KB/s.** Four stacked defects, found by DISASSEMBLING THE
+  ACTUAL GUEST DRIVER (the declROM has NO driver — content ends at 0x138;
+  the live one is 'enet' 43 "Sonic 32 Ethernet Driver v1.1.1" in the guest
+  System file, extracted with scratchpad hfs_extract.py + capstone) and by
+  per-exit TX witnesses in /tmp/mac_eth_stats (`sonic_tx` line):
+  (1) Main `fb3a191` — the CRDA reload never released the parked RX
+  descriptor (in_use=0); the driver defers frees with in_use!=0 to a list
+  drained only on PKTRX, so upload cadence starved the ring permanently.
+  Rev>3 silicon releases it itself — the driver's TC chip-reset workaround
+  is gated `SR<=3` and we report SR 6 (same gate in both driver versions).
+  (2) Main `6bfd50d` — drain_ring was unbounded and shadows pushed only at
+  poll end: a stale-shadow ISR dispatch loop flooded the doorbell at 80 kHz
+  (watched via devmem), starving ALL of Main — both earlier "video capture
+  died" wedges were this. Now DRAIN_BUDGET 256 + push_state per applied
+  entry (+ drain_full witness). (3) RTL `7e7ff1a` — timed per-bit ISR
+  clear-mask in pds_enet.sv: an ack reads back clear IMMEDIATELY (dispatch
+  loops assume real-silicon write visibility); expires one IRQ_SUPP after
+  the last ack — time-based, unlike the removed 08-22 value-reconcile
+  overlay that wedged RX. tb_pds_enet 50 checks. (4) Main `b308dbf` — TX
+  ring-walk discipline: ack clamp (only PUSHED ISR bits clearable — a
+  TXDN set between the guest's read and its ack's apply must survive),
+  ring-lap guard (one kick never revisits a descriptor), and the status
+  gate + TX_PARK (descriptor status==0 <=> queued-and-unsent is the
+  driver's own convention; nonzero parks like EOL, and EVERY abnormal
+  exit now parks on the descriptor start instead of leaving CTDA
+  mid-descriptor — the old abort-advance was the permanent post-stall
+  death). `busy=` parks fire ~1,300/transfer and all recover.
+  mac_sonic_test = 104 checks. Release: `releases/MacLC_20260827.rbf`
+  (= e4e22e7b, SEED 4, STA +0.151 — the ISR-mask netlist re-rolled seeds;
+  seed 8 was a corrupted-fetch fit: clean boot, video garbage under load)
+  + `releases/MiSTer` (= 508786f0). ★ WT deadman lore: the driver arms
+  0x02FAF080 = 50M counts = 5.0 s at 10 counts/us (20 MHz crystal); its
+  TC handler is stats-only on SR 6.
+  ★ **A card-ON boot hang means an OLD MAIN, not an old core.** Two of the
+  three fixes were host-side (`f2679bf`), so the first published ethernet
+  Main (`34b8994`) pairs happily and then hangs; the RBF alone cannot fix it.
+  `md5sum /media/fat/MiSTer` must match `releases/MiSTer`. A MISSING or stock
+  Main cannot hang anything — presence latches at guest reset, so no MAGIC
+  means slot $E stays open-bus and the machine boots as with no card. Regression gates for ANY
+  ethernet/SDRAM edit: `verilator/tb_pds_enet.v` (43 checks, build cmd in
+  header), the Main fork's `support/mac/test/mac_sonic_test.cpp` (36),
+  `verilator/tb_icache_seam.v` normal AND negative control after any
+  sdram.v handshake edit, and the boot gate card-absent AND card-present
+  (`+pds_magic +pds_rom=pds_declrom.hex`; card-present shifts the ?-icon
+  past frame ~500 — the 32K ROM scan delays it, that is normal).
+- **Serial (SCC, modem port): MIDI OUT + MIDI IN + PPP all work, HW-validated**
+  (OUT 2026-08-12 cozyMIDI → MidiLink/MT32-pi; PPP 2026-08-13 LCP+IPCP on
+  7.5.5 incl. guest FTP; IN 2026-08-14). MIDI IN sources: HPS UART (MidiLink
+  USB, always wired) and the user-port MIDI-in line (MT32-pi TX pin) — the
+  latter joins guest RX ONLY in OSD UART mode = MIDI (`uart_mode==3` AND-merge
+  in MacLC.sv), so PPP/console guest-receive can never be hijacked by the user
+  port (the 2026-08-13 serialIn-mux lesson). v1 is channel A only; printer-port
+  TX (`txd_b_out`) still dangles at dataController. Regression gate for ANY SCC
+  serial/baud/FIFO edit: `verilator/tb_scc_midi.v` (build cmd in its header;
+  §3 = MIDI-in RX at 31250; keep the ROM-style loopback prelude).

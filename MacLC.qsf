@@ -48,7 +48,7 @@ set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
-set_global_assignment -name SEED 7
+set_global_assignment -name SEED 4
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -384,3 +384,6 @@ set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *vga_scale
 set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *HDMI_shadowmask|vid*
 set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *yc_out|phase*
 set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *dv_de1*
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/pds/pds_enet.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fetch_cache.sv

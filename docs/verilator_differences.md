@@ -12,7 +12,36 @@ CPU-glue or top-level wiring fix must be made in **both** files or sim and FPGA
 silently diverge. (This has bitten us before — e.g. sim once hardwired
 `.berr(1'b0)`, masking the MOVES bus-error fix.)
 
-Last audited: 2026-08-02 (sim MFM floppy detection wired — see below).
+Last audited: 2026-08-21 (PDS Ethernet v2 Phase 3: pds_enet grew the
+guest-RAM DMA engine — new cross-top signal bundle `pds_eth_req/we/addr/
+din/ack/dout` plus `.ram_config_phys(configRAMSize)`, wired IDENTICALLY in
+both tops into the memory controller's new `eth_*` port: rtl/sdram.v in
+MacLC.sv, verilator/sim_ram.v in sim.v. sim_ram's eth service is
+latency-matched loosely (2-edge reads) and, like the FPGA port, never
+touches cpu_done. The V8 RAM translation is DUPLICATED inside pds_enet.sv
+— keep it in sync with addrController_top.v; tb_pds_enet.v carries
+known-answer cases for all three regions.)
+
+2026-08-20 (PDS Ethernet v2: the card front-end became the Apple
+Ethernet LC TP / SONIC — decode is now $FE00'0000 regs, $FE04/$FE40'0000 MAC
+PROM, $FEFF'8000 declROM — all INTERNAL to rtl/pds/pds_enet.sv; the module's
+CPU-glue port list and both tops' glue are unchanged from 08-15, so the audit
+below still describes that wiring exactly. The selectRAM aliases pds_claim
+masks are now $FE00xxxx→$00'0000 (page zero!) and $FE40xxxx→$40'0000.)
+
+**2026-08-15 — PDS Ethernet (rtl/pds/pds_enet.sv) wired into BOTH tops,
+backing store differs by design:** MacLC.sv backs the card's DDR3 mailbox with
+the real DDRAM port (`DDRAM_CLK = clk_sys`, port was previously tied off and
+is wholly owned by the card); sim.v backs it with the behavioral
+`verilator/sim_ddr3.v` model (`+pds_magic` / `+pds_rom=<hex>` stage the
+window; without them the card is absent and slot space behaves exactly as
+before, so the boot gate is unaffected). The CPU-glue edits are IDENTICAL in
+both tops and must stay so: `pds_card_sel` branch in `_cpuVPA` (forced 1),
+`_cpuDTACK` (`~pds_card_ack`, ahead of the slot_space $FFFF ack) and the din
+mux (`pds_dout`, ahead of slot_space), plus `.pds_claim(pds_card_sel)` into
+addrController_top (masks the selectRAM alias of $FE0Dxxxx/$FE0Exxxx onto
+guest SDRAM). Sim-only difference: `ena_osd` is hardwired 1 (no OSD) and
+rst_core is `~pll_locked | reset` vs MacLC.sv's `~pll_locked_s | RESET`.
 
 **2026-08-02 — sim floppy MFM/HD detection un-hardwired (both tops now
 equivalent):** `sim.v` used to pass `.diskMFM(2'b00)/.diskHD(2'b00)` ("MFM path
@@ -96,7 +125,7 @@ These must stay identical; they were checked and match today.
 | Framework | bespoke C++ harness (`sim_main.cpp`) | `sys/` (HPS I/O, HDMI/scaler, OSD, audio out) | sim has no HPS/HDMI/scaler |
 | PRAM NVRAM persistence | `dataController_top` `pram_*` ports tied off (`pram_load_wr=0`, `pram_save_addr=0`, outputs open) | FSM in `MacLC.sv` (SD slot 2 save image, load-on-mount / flush-on-OSD / Reset PRAM&Core) drives them | **PRAM save/restore is FPGA-only**; sim still boots with `egret.pram` (zeros). The Egret `pram[]` mirror + `pram_load_*/save_*` ports in `egret_wrapper.sv` are shared and identical. |
 | CD-ROM (SCSI ID 3) block-device slot | sim block-device **slot 2** (`--cdrom <iso>`; `sd_*[2]`, `img_mounted[2]`), `cd_enable` hardwired 1 | hps_io **slot `VD_CDROM`=4** (`SC4` OSD entry), `cd_enable = ~status[18]` (OSD "CD-ROM Drive") | Same `dataController_top` `cd_*` ports both sides; only the slot index and the enable source differ. Sim boots with the disc-less CD target answering the ROM SCSI scan (regression for the 2026-06-10 empty-CD wedge class). |
-| Serial / MIDI sinks (2026-08-12) | `serialIn = serial_rxd`, `serial_txd = serialOut` (harness wires only; no UART/user-port consumers) | SCC ch A TX fans out to **both** `UART_TXD` (HPS ttyS1 → MidiLink) and `mt32pi.midi_tx` (user port → MT32-pi); `serialIn = mt32_available ? mt32_midi_rx : UART_RXD`. `sys/mt32pi.sv` instance is **MacLC.sv-only** (CLK_AUDIO domain; LCD-overlay video inputs tied 0) | The WR11/TRxC 31,250-baud path itself is **shared** (`rtl/scc.v`) and unit-gated by `verilator/tb_scc_midi.v` — run it after any SCC serial/baud/FIFO edit. MT32-pi detection/I2S mixing is FPGA-only. |
+| Serial / MIDI sinks (2026-08-12, MIDI-in 2026-08-14) | `serialIn = serial_rxd`, `serial_txd = serialOut` (harness wires only; no UART/user-port consumers) | SCC ch A TX fans out to **both** `UART_TXD` (HPS ttyS1 → MidiLink) and `mt32pi.midi_tx` (user port → MT32-pi); `serialIn = UART_RXD & (uart_mode==3 ? mt32_midi_rx : 1)` — the user-port MIDI-in line joins guest RX **only** in OSD UART mode = MIDI (the 08-13 unconditional mux hijacked all guest receive with a Pi attached — the PPP bug). `sys/mt32pi.sv` instance is **MacLC.sv-only** (CLK_AUDIO domain; LCD-overlay video inputs tied 0) | The WR11/TRxC 31,250-baud path itself is **shared** (`rtl/scc.v`), covers RX and TX (one baud divider), and is unit-gated by `verilator/tb_scc_midi.v` incl. RX@31250 — run it after any SCC serial/baud/FIFO edit. MT32-pi detection/I2S mixing and the `uart_mode` gate are FPGA-only. |
 
 ## 🔴 Inherent gap — keep in mind
 
@@ -105,6 +134,18 @@ These must stay identical; they were checked and match today.
   in Verilator can still fail on hardware for SDRAM timing/latency reasons.**
   Historically real here (stale-read / DTACK-before-cpu-slot issues). "Boots in
   sim" ≠ "boots on FPGA" for anything timing-sensitive on the memory bus.
+- **Handshake semantics differ too, not just latency** (learned 2026-08-19, the
+  I-cache stale-done hang): `sim_ram`'s `cpu_done` is structurally immune to
+  abandoned-request hazards — its `!(oe||we)` clear is FIRST in an else-if
+  chain, its set only fires while the level is high, and it has no
+  delayed-start (refresh/floppy-window/download occupancy) at all. The real
+  `rtl/sdram.v` had the opposite ordering and CAN delay a start; its stale-done
+  defect never executed in sim. **Any change to the demand handshake or any new
+  agent that can abandon a request (cache hit, BERR abort) must be gated by
+  `verilator/tb_icache_seam.v`**, which compiles the REAL `rtl/sdram.v` under
+  Verilator via its `TB_NO_TRISTATE` pin split — the one place the real
+  controller's handshake runs offline. Run its negative control too
+  (`+define+SDRAM_NO_DONE_LEVEL_FIX` must FAIL).
 
 ## Host-input harness (sim only)
 

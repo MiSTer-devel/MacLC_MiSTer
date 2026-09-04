@@ -151,6 +151,23 @@ always @(posedge clk_sys)
 // disarm on an early strobe-less mem_latch and drop the access entirely.
 reg ariel_armed;
 wire req_stb = ariel_armed && req && mem_latch && (~uds_n | ~lds_n);
+
+`ifdef ARIEL_TRACE
+// Magenta-hunt telemetry (2026-08-17, resolved — see docs/CPU_Perf_Log.md):
+// per-access register trace incl. READS (REG_PALETTE reads auto-advance the
+// shared RGB phase, so unlogged reads look like phantom phase jumps; RMW
+// instructions like BSET/NOT on the data port legitimately produce
+// read+write pairs). Re-enable with +define+ARIEL_TRACE.
+integer dbg_ariel_n = 0;
+always @(posedge clk_sys) begin
+	if (req_stb) begin
+		dbg_ariel_n = dbg_ariel_n + 1;
+		$display("ARIEL %s[%0d]: breg=%0d a=%03x uds=%b lds=%b data=%02x paddr=%02x comp=%0d @%0t",
+		         we ? "WR" : "RD", dbg_ariel_n, byte_reg, reg_addr,
+		         ~uds_n, ~lds_n, data_in, palette_addr, color_comp, $time);
+	end
+end
+`endif
 always @(posedge clk_sys) begin
     if (reset)         ariel_armed <= 1'b1;
     else if (cpu_as_n) ariel_armed <= 1'b1; // access ended -> re-arm

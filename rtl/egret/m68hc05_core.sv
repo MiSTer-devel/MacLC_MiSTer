@@ -76,6 +76,7 @@ module m68hc05_core (
     logic irq_d;
     logic timer_irq_d;
     logic onesec_irq_d;
+    logic ext_irq_pending;   // latched falling edge of the external IRQ pin
     logic irqRequest;
     logic [1:0] irq_source;  // 0=ext IRQ, 1=timer, 2=one-second
     
@@ -169,6 +170,7 @@ module m68hc05_core (
             irq_d   <= 1'b1;
             timer_irq_d <= 1'b1;
             onesec_irq_d <= 1'b1;
+            ext_irq_pending <= 1'b0;
             irqRequest <= 1'b0;
             irq_source <= 2'd0;
             mainFSM <= 4'h0;
@@ -178,27 +180,43 @@ module m68hc05_core (
 
         end else if (cen) begin
             // Clock enabled - normal operation
-            // IRQ edge detection for all three sources
-            // Priority: one-second (highest) > timer > external IRQ (lowest)
+            // Maskable interrupt sensing.  Priority: one-second > timer > ext IRQ.
+            //
+            // onesec/timer are LEVEL-sensitive (real 68HC05 / MAME semantics):
+            // each source's flag register holds its line asserted until the ISR
+            // acks it ($12 bit 6 / $08 bit 7), so a tick that lands while I is
+            // masked (the firmware's SEI shift windows, other ISRs) fires as soon
+            // as I clears.  The old edge detection DROPPED such edges — and the
+            // ack lives in the never-run ISR, so the line stayed low forever and
+            // the one-second interrupt deadlocked permanently (frozen guest
+            // clock/RTC, while everything polled kept working).
+            //
+            // Requests latch only at opcode fetch (mainFSM 4'h2) so a pending
+            // level cannot hijack the vector selection of an SWI sequence already
+            // in flight (states 3-7 check !irqRequest), and a pending interrupt
+            // is taken on instruction boundaries exactly like the real core.
             irq_d <= irq;
             timer_irq_d <= timer_irq;
             onesec_irq_d <= onesec_irq;
-            if (flagI == 1'b0 && !irqRequest) begin
-                if ((onesec_irq == 1'b0) && (onesec_irq_d == 1'b1)) begin
+            if ((irq == 1'b0) && (irq_d == 1'b1))
+                ext_irq_pending <= 1'b1;   // edge-latched; pin is tied high today
+            if (flagI == 1'b0 && !irqRequest && mainFSM == 4'h2) begin
+                if (onesec_irq == 1'b0) begin
                     irqRequest <= 1'b1;
                     irq_source <= 2'd2;
                     `ifdef VERBOSE_TRACE
                     $display("HC05: ONE-SEC IRQ request! PC=%04x", regPC);
                     `endif
-                end else if ((timer_irq == 1'b0) && (timer_irq_d == 1'b1)) begin
+                end else if (timer_irq == 1'b0) begin
                     irqRequest <= 1'b1;
                     irq_source <= 2'd1;
                     `ifdef VERBOSE_TRACE
                     $display("HC05: TIMER IRQ request! PC=%04x", regPC);
                     `endif
-                end else if ((irq == 1'b0) && (irq_d == 1'b1)) begin
+                end else if (ext_irq_pending) begin
                     irqRequest <= 1'b1;
                     irq_source <= 2'd0;
+                    ext_irq_pending <= 1'b0;
                     `ifdef VERBOSE_TRACE
                     $display("HC05: EXT IRQ request! PC=%04x", regPC);
                     `endif

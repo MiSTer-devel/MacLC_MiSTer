@@ -17,6 +17,20 @@
 module pseudovia(
     input clk_sys,
     input reset,
+    // RESET-instruction soft reset (2026-08-08 warm-restart fix): on a real
+    // LC the 68020 RESET instruction drives the external reset line, which
+    // resets the V8's interrupt state. Our soft restart path (Special ▸
+    // Restart / shutdown-screen Restart both execute RESET + jump, NO Egret
+    // reset — HUD row-12 witnessed) left the OS's slot_ier/ier live, and
+    // any_slot_irq re-asserts from vblank EVERY FRAME — so the warm boot,
+    // on first lowering IPL, lived forever in the slot-interrupt handler
+    // probing $F1xxxx (the phantom-PDS space) for a source it could never
+    // silence: the user-visible "black screen after restart" (video still
+    // blanked at cfg $40). Clears INTERRUPT state only — ram_cfg/
+    // ram_configured/video_config survive, exactly as on a real LC (the
+    // ROM's own T+4s cold-boot RESET would otherwise unmap RAM under the
+    // running boot).
+    input soft_rst,
 
     // CPU interface - full offset within $F26000-$F27FFF range
     input [12:0] addr,  // Offset 0x0000-0x1FFF
@@ -72,7 +86,20 @@ reg [7:0] ier;          // IER (shared between native $13 and compat reg 14, per
 // Folding asc into slot_status[4] here made it fire a spurious level-2 IRQ
 // (gated only by slot_ier=$7f) that preempted the level-1 VIA1 timer the
 // boot POST's interrupt-timing self-test relies on.
-wire [7:0] slot_status = {1'b0, ~vblank_irq, ~slot_irq, 1'b1, 3'b111, 1'b1};
+// ★ MAME-exact VBL flag (2026-08-08 warm-restart hunt): bit 6 is a REGISTER
+// (active low, 0 = VBL pending) driven by vblank EDGES — asserted at vblank
+// start, deasserted at vblank end (pseudovia.cpp slot_irq_w<0x40> called on
+// both screen_vblank edges) — AND guest-ACKable mid-period: a reg-$02 write
+// with bit 6 set deasserts it until the next vblank-start edge (MAME write():
+// regs[2] |= data & 0x40). The old model returned the RAW ~vblank level and
+// implemented the documented ack as a NO-OP, so the IRQ pinned high for the
+// whole vblank period (~350 µs-1 ms = thousands of CPU cycles) re-entering
+// the handler no matter how it acked — survivable for the running OS,
+// poison for a warm boot inheriting a live slot_ier.
+reg  vbl_flag_n = 1'b1;   // slot-status bit 6 (active low)
+reg  vbl_lvl_d  = 1'b0;
+reg  asc_irq_d  = 1'b0;   // for the MAME edge-latch of IFR bit 4
+wire [7:0] slot_status = {1'b0, vbl_flag_n, ~slot_irq, 1'b1, 3'b111, 1'b1};
 
 // Slot/VBL summary, gated by the slot IER ($12) -> IFR bit 1 (any slot).
 wire [7:0] slot_irqs = (~slot_status) & 8'h78;  // Check bits 3-6 (slots + vblank)
@@ -85,7 +112,11 @@ wire any_slot_irq = |slot_irqs_masked;
 //   contradicted MAME pseudovia.cpp, where scsi_irq_w owns bit 3 and slot
 //   sources live in slot_status + the bit-1 summary; the slot input is tied
 //   0 in both tops, so nothing depended on the old mapping.)
-wire [7:0] ifr_live = { ifr[7], ifr[6], ifr[5], asc_irq, scsi_irq, ifr[2], any_slot_irq, scsi_drq };
+// bit 4 (ASC) is the LATCHED ifr[4] — MAME asc_irq_w edge-latches it and only
+// a guest W1C clears it (see the edge logic in the clocked block below); the
+// SCSI bits and the slot summary stay LEVEL (MAME scsi_irq_w/scsi_drq_w and
+// recalc — and the LBMacTwo edge-model deadlock lesson).
+wire [7:0] ifr_live = { ifr[7], ifr[6], ifr[5], ifr[4], scsi_irq, ifr[2], any_slot_irq, scsi_drq };
 
 // MAME: IRQ asserts when (IFR & IER[$13] & 0x1B) != 0. The main IER ($13)
 // gates the final interrupt; the slot IER ($12) only gates the slot summary.
@@ -115,7 +146,26 @@ always @(posedge clk_sys) begin
         ier <= 8'h00;
         irq_out <= 1'b0;
         video_config <= 8'h03;  // Default to 8bpp mode
+        vbl_flag_n <= 1'b1;
+        vbl_lvl_d  <= 1'b0;
+        asc_irq_d  <= 1'b0;
+    end else if (soft_rst) begin
+        // RESET instruction: interrupt state only (see the port comment).
+        ifr        <= 8'h00;
+        slot_ier   <= 8'h00;
+        ier        <= 8'h00;
+        irq_out    <= 1'b0;
+        vbl_flag_n <= 1'b1;
     end else begin
+        // VBL flag: assert at vblank start, deassert at vblank end (MAME
+        // slot_irq_w<0x40> on both edges); the guest ack in the reg-$02
+        // write case below can also deassert it mid-period.
+        vbl_lvl_d <= vblank_irq;
+        if (!vbl_lvl_d && vblank_irq)
+            vbl_flag_n <= 1'b0;
+        else if (vbl_lvl_d && !vblank_irq)
+            vbl_flag_n <= 1'b1;
+
         // Update slot IRQ summary in IFR (bit 1 = any slot)
         if (any_slot_irq)
             ifr[1] <= 1'b1;
@@ -132,10 +182,17 @@ always @(posedge clk_sys) begin
         // IRQ fired" but couldn't tell WHICH source, and any handler that
         // dispatched off IFR[4] / IFR[3] saw 0 and fell through to a wrong
         // path.
-        if (asc_irq)
+        // ★ ASC = EDGE-LATCHED per MAME asc_irq_w (2026-08-08): set on the
+        // RISING edge of asc_irq, cleared ONLY by the guest's reg-$03 W1C
+        // (below) — never auto-cleared when the line drops. The old level
+        // model made a clear-then-wait-for-edge protocol MISS short pulses
+        // entirely (the flag vanished with the line), which is the shape of
+        // the warm boot's quiet chime-phase spin: polling IFR bit 4 forever
+        // in ROM with zero pseudovia writes. Level bits (SCSI, slot summary)
+        // stay level — see the LBMacTwo note below.
+        asc_irq_d <= asc_irq;
+        if (!asc_irq_d && asc_irq)
             ifr[4] <= 1'b1;
-        else
-            ifr[4] <= 1'b0;
 
         // SCSI flags are LEVEL-driven — NEVER edge-latch these here. The
         // LBMacTwo round-3 HW test proved an edge model deadlocks: the
@@ -186,7 +243,12 @@ always @(posedge clk_sys) begin
                         end
 
                         3'b010: begin  // $02: Slot Status
-                            // Write 1 to bit 6 to clear VBlank flag
+                            // Guest VBL ack (MAME write(): regs[2] |= data
+                            // & 0x40) — deasserts the flag until the next
+                            // vblank-start edge. Was a NO-OP before
+                            // 2026-08-08 (the flag was a raw level).
+                            if (data_in[6])
+                                vbl_flag_n <= 1'b1;
                             `ifdef VERBOSE_TRACE
                             $display("PVIA: WRITE Slot Status = %02x @%0t", data_in, $time);
                             `endif
@@ -210,6 +272,10 @@ always @(posedge clk_sys) begin
                             `ifdef VERBOSE_TRACE
                             $display("PVIA: WRITE Video Config = %02x (bpp mode = %d) addr=%h @%0t",
                                      data_in, data_in[2:0], addr, $time);
+                            `endif
+                            `ifdef ARIEL_TRACE
+                            // mode-write trace (level-repeats per commit tick)
+                            $display("PVIA VIDMODE=%02x @%0t", data_in, $time);
                             `endif
                         end
 

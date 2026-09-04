@@ -235,11 +235,12 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
+	wire flp_guard;
 	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
-	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
+	wire pds_slot_irq = pds_irq;  // PDS Ethernet card → pseudo-VIA slot-IFR bit $20 (slot $E)
 	wire vid_alt;
 	wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectUnmapped;
 	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
@@ -254,28 +255,23 @@ module emu
 	wire [21:0] dskReadAddrExt;
 
 	// dtack generation for 16 MHz mode
-	reg  dtack_en, mem_latch_d;
+	// Phase C (branch cpu-enhancements): RAM/ROM/VRAM DTACK comes straight
+	// from the RAM model's demand handshake (ram_cpu_done) — the old
+	// slot-aligned grant is gone. dtack_en serves the immediate
+	// peripheral/unmapped path AND ROM-region WRITES (ack-and-discard: the
+	// engine never serves them since they assert neither oe nor we, but the
+	// boot ROM's device probe writes into ROM space behind a temp vector-$8
+	// handler and needs the cycle to complete — see MacLC.sv, keep both
+	// tops identical; this was the 2026-08-17 magenta boot stall).
+	reg  dtack_en;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
 		end
 		else begin
-			// mem_latch_d = registered memoryLatch: high at busPhase 0, i.e. the
-			// START of each busCycle. (cpuBusControl & mem_latch_d) therefore
-			// strobes once at the start of EVERY cpu slot.
-			mem_latch_d <= memoryLatch;
 			if (_cpuAS) dtack_en <= 0;
-			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
-			// so it must take the slot-aligned DTACK path (a cpu-slot start),
-			// NOT the immediate !ROM&!RAM peripheral path. Excluding selectVRAM
-			// here stops DTACK asserting before the SDRAM cpu-slot commits the
-			// read/write (was truncating longword writes / sampling stale data).
-			// H1: this was `!cpuBusControl_d & cpuBusControl` (rising edge), which
-			// gave each ISOLATED cpu slot one DTACK opportunity. With slot 00 now
-			// also a cpu slot the three slots are contiguous (one rising edge per
-			// round), so we strobe at each cpu-slot start instead — same busPhase-0
-			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
-			if (!_cpuAS & ((cpuBusControl & mem_latch_d) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			if (!_cpuAS & ( (!selectROM & !selectRAM & !selectVRAM)
+			              | (selectROM & !_cpuRW) )) dtack_en <= 1;
 		end
 	end
 
@@ -303,11 +299,77 @@ module emu
 	wire        slot_space = (cpuAddrFullHi >= 8'hF1) && (cpuAddrFullHi <= 8'hFE);
 	// SCSI pseudo-DMA ($F06000/$F12000) uses async DTACK gated by the NCR5380 DREQ
 	// instead of the 6800-style VPA path the rest of $F0xxxx uses — see MacLC.sv.
-	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
+	// ── PDS Ethernet card (mirror of MacLC.sv — keep both tops identical) ──────
+	// Backing store is the behavioral sim_ddr3 model instead of the DDRAM port;
+	// with no "daemon" (MAGIC absent) the card is invisible and slot space
+	// behaves exactly as before. +pds_magic / +pds_rom=<hex> stage the window.
+	wire        pds_card_sel, pds_card_ack, pds_irq;
+	wire [15:0] pds_dout;
+	wire [28:0] pds_mem_addr;
+	wire  [7:0] pds_mem_burst, pds_mem_be;
+	wire        pds_mem_rd, pds_mem_we;
+	wire [63:0] pds_mem_wdata, pds_mem_rdata;
+	wire        pds_mem_rvalid, pds_mem_busy;
+	// guest-RAM DMA legs into sim_ram's eth port (mirror of MacLC.sv)
+	wire        pds_eth_req, pds_eth_we, pds_eth_ack;
+	wire [23:0] pds_eth_addr;
+	wire [15:0] pds_eth_din, pds_eth_dout;
+	pds_enet pds_enet (
+		.clk_sys   (clk_sys),
+		.rst_core  (~pll_locked | reset),
+		.rst_guest (~_cpuReset | ~_cpuReset_o),
+		.ena_osd   (1'b1),
+		.ram_config_phys(configRAMSize),
+		.eth_req   (pds_eth_req),
+		.eth_we    (pds_eth_we),
+		.eth_addr  (pds_eth_addr),
+		.eth_din   (pds_eth_din),
+		.eth_ack   (pds_eth_ack),
+		.eth_dout  (pds_eth_dout),
+		.cpuAddr   (cpuAddr),
+		.cpuDataIn (cpuDataOut),
+		._cpuAS    (_cpuAS),
+		._cpuUDS   (_cpuUDS),
+		._cpuLDS   (_cpuLDS),
+		._cpuRW    (_cpuRW),
+		.card_sel  (pds_card_sel),
+		.card_ack  (pds_card_ack),
+		.card_dout (pds_dout),
+		.irq       (pds_irq),
+		.mem_addr  (pds_mem_addr),
+		.mem_burst (pds_mem_burst),
+		.mem_rd    (pds_mem_rd),
+		.mem_we    (pds_mem_we),
+		.mem_wdata (pds_mem_wdata),
+		.mem_be    (pds_mem_be),
+		.mem_rdata (pds_mem_rdata),
+		.mem_rvalid(pds_mem_rvalid),
+		.mem_busy  (pds_mem_busy)
+	);
+	sim_ddr3 sim_ddr3 (
+		.clk   (clk_sys),
+		.addr  (pds_mem_addr),
+		.burst (pds_mem_burst),
+		.rd    (pds_mem_rd),
+		.we    (pds_mem_we),
+		.wdata (pds_mem_wdata),
+		.be    (pds_mem_be),
+		.rdata (pds_mem_rdata),
+		.rvalid(pds_mem_rvalid),
+		.busy  (pds_mem_busy)
+	);
+
+	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space || pds_card_sel) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        icache_hit ? 1'b0 :        // fetch-cache hit answers now
+	                        pds_card_sel ? ~pds_card_ack :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
-	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+	                        // Phase C: SDRAM-backed targets ack via the demand
+	                        // handshake — mirror of MacLC.sv, keep identical.
+	                        // ROM WRITES excluded: ack-and-discard via dtack_en.
+	                        (!_cpuAS && (selectRAM || selectVRAM || (selectROM && _cpuRW))) ? ~ram_cpu_done :
+	                        (~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en);
 
 	// Programmer's switch / Level-7 NMI — mirror of MacLC.sv (there the trigger is
 	// the "R5" OSD button status[5]; in sim it is the nmi_pulse input driven by
@@ -335,6 +397,17 @@ module emu
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
+
+	// RESET-instruction soft peripheral reset — keep in sync with MacLC.sv
+	// (2026-08-08 warm-restart fix; full rationale there): stretch
+	// tg68_reset_n into a 16-clk pulse for via6522 + pseudovia interrupt
+	// state. The cold-boot T+4s RESET exercises this in every sim boot.
+	reg [3:0] softrst_cnt = 4'd0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset_o)           softrst_cnt <= 4'hF;
+		else if (softrst_cnt != 0)  softrst_cnt <= softrst_cnt - 1'd1;
+	end
+	wire soft_periph_rst = (softrst_cnt != 0);
 	assign      _cpuRW        = tg68_rw;
 	assign      _cpuAS        = tg68_as_n;
 	assign      _cpuUDS       = tg68_uds_n;
@@ -360,6 +433,7 @@ module emu
 	wire        tg68_fc2;
 	wire [15:0] tg68_dout;
 	wire [31:0] tg68_a;
+	wire [31:0] tg68_a_early;   // pre-AS address for the fetch cache
 	wire        tg68_reset_n;
 	wire        tg68_longword;   // 32-bit access flag — drives SCSI pseudo-DMA byte packing
 	wire [1:0]  tg68_busstate;
@@ -438,11 +512,48 @@ module emu
 
 		.ipl        ( _cpuIPL ),
 		.berr       ( cpu_berr ),
-		.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
+		.din        ( pds_card_sel ? pds_dout : slot_space ? 16'hFFFF :
+		              icache_hit ? icache_data : dataControllerDataOut ),
 		.dout       ( tg68_dout ),
 		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
+		.addr_early ( tg68_a_early ),
 		.busstate   ( tg68_busstate )
+	);
+
+	// ── Fetch cache (ported 2026-08-18 from branch i-cache @b393eaf) ─────────
+	// Answers instruction fetches from on-chip BRAM. It is fed the EARLY
+	// address (see the port note in rtl/fetch_cache.sv): the Phase-B FSM
+	// registers cpuAddr on the same edge AS falls, so the module's
+	// continuous-lookup correspondence guard would reject every fetch if it
+	// were given the registered address.
+	// The cache FILLS AND SNOOPS ALWAYS; `enable` gates only the answer path,
+	// so +icache selects between a cache-ON and cache-OFF run of the SAME
+	// binary with an identically warm/coherent cache — that is the A/B the
+	// 2026-07-07 session could not run (sim runs were banned then) and which
+	// is the deterministic catch for the disk-corruption blocker: diff
+	// cpu_trace.log between the two, and the first divergent instruction names
+	// the coherency hole.
+	reg icache_en = 1'b0;
+	initial if ($test$plusargs("icache")) icache_en = 1'b1;
+	wire        icache_hit;
+	wire [15:0] icache_data;
+	wire        icache_hit_now;   // per-access request-suppression verdict
+	fetch_cache #(.LOG2_WORDS(9)) icache (
+		.clk        ( clk_sys ),
+		.reset      ( ~_cpuReset ),
+		.flush_bits ( {memoryOverlayOn, dio_download} ),
+		.enable     ( icache_en ),
+		.cpuAddr    ( tg68_a_early[23:0] ),
+		.as_n       ( _cpuAS ),
+		.rw         ( _cpuRW ),
+		.fc         ( cpuFC ),
+		.cacheable  ( selectRAM || selectROM ),
+		.snoopable  ( selectRAM ),
+		.mem_din    ( dataControllerDataOut ),
+		.hit        ( icache_hit ),
+		.hit_data   ( icache_data ),
+		.hit_now    ( icache_hit_now )
 	);
 
 	// CPU debug - capture PC and opcode during instruction fetch
@@ -508,8 +619,12 @@ module emu
 	assign debug_fetch_valid = fetch_valid;
 	assign debug_data_addr = last_data_addr;
 
+	// Forward declarations: assigned with the rest of the disk-mount state
+	// further down; needed here for addrController's flp_present gate.
+	wire dsk_int_ins, dsk_ext_ins;
 	addrController_top ac0
 	(
+		.flp_present(dsk_int_ins | dsk_ext_ins),
 		.clk(clk_sys),
 		.clk8(clk8),
 		.clk8_en_p(clk8_en_p),
@@ -522,6 +637,7 @@ module emu
 		._cpuLDS(_cpuLDS),
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
+		.pds_claim(pds_card_sel),
 		.ram_config(pvia_ram_config_out),
 		.ram_config_phys(configRAMSize),
 		.ram_configured(pvia_ram_configured),
@@ -534,6 +650,9 @@ module emu
 		._ramWE(_ramWE),
 		.dioBusControl(dioBusControl),
 		.cpuBusControl(cpuBusControl),
+		.flp_guard(flp_guard),
+		.cpu_wr_ack(ram_cpu_done),
+		.dio_download(dio_download),
 		.selectSCSI(selectSCSI),
 		.selectSCSIDMA(selectSCSIDMA),
 		.selectSCC(selectSCC),
@@ -605,6 +724,7 @@ module emu
 	pseudovia pvia(
 		.clk_sys(clk_sys),
 		.reset(~n_reset),
+		.soft_rst(soft_periph_rst),
 		.addr({cpuAddr[12:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(pseudovia_dout),
@@ -635,7 +755,9 @@ module emu
 
 	asc asc_inst(
 		.clk(clk_sys),
-		.reset(~n_reset),
+		// soft_periph_rst: RESET instruction resets the ASC (real reset
+		// line) — keep in sync with MacLC.sv (2026-08-08 warm-restart fix).
+		.reset(~n_reset || soft_periph_rst),
 		.cs(selectASC),
 		// cpuAddr[0] is forced 0; reconstruct the real A0 (tg68_a[0]) so the
 		// odd ASC registers (MODE/FIFOMODE/CLOCK) don't alias onto the even reg
@@ -764,6 +886,9 @@ module emu
 	assign sd_buff_din[1] = scsi_buff_din[1];
 	assign sd_buff_din[2] = cd_buff_din;
 
+	// Forward declaration: the floppy fetch byte is assigned further down,
+	// after the RAM instantiation that produces ram_do_raw.
+	wire [15:0] extra_rom_data_demux;
 	dataController_top #(SCSI_DEVS) dc0
 	(
 		.clk32(clk_sys),
@@ -773,6 +898,7 @@ module emu
 		.E_rising(E_rising),
 		.E_falling(E_falling),
 		._systemReset(n_reset),
+		.softRst(soft_periph_rst),
 		._cpuReset(_cpuReset),
 		._cpuIPL(_cpuIPL_dc),
 		.pseudovia_irq(pseudovia_irq),
@@ -810,6 +936,7 @@ module emu
 		.cpuBusControl(cpuBusControl),
 		.memoryDataOut(memoryDataOut),
 		.memoryDataIn(ram_do),
+		.dskReadDataIn(extra_rom_data_demux[7:0]),
 		.memoryLatch(memoryLatch),
 		.selectAriel(selectAriel),
 		.ariel_data_in(ariel_reg_dout),
@@ -915,8 +1042,8 @@ module emu
 	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
 	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
 	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
-	wire dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	wire dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
+	assign dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
+	assign dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 
 	always @(posedge clk_sys) begin
 		reg old_down;
@@ -996,8 +1123,12 @@ module emu
 	//   Floppy 2: $700000 + offset
 	reg [22:0] dio_a;
 	reg [15:0] dio_data;
-	reg        dio_write;
-	reg        dio_old_cyc = 0;
+
+	// Download request into the RAM model's dedicated port — keep in sync
+	// with MacLC.sv. Declared here because the handshake below consumes it.
+	wire        ram_dl_ack;
+	reg         ram_dl_ack_d = 1'b0;
+	always @(posedge clk_sys) ram_dl_ack_d <= ram_dl_ack;
 
 	// DC42 write offset: active from the word after the magic (word 41)
 	wire [19:0] dio_flp_a = dc42_skip ? (dio_addr[19:0] - 20'd42) : dio_addr[19:0];
@@ -1025,63 +1156,139 @@ module emu
 			endcase
 			ioctl_wait <= 1;
 		end
-
-		dio_old_cyc <= dioBusControl;
-		if(~dioBusControl) dio_write <= ioctl_wait;
-		if(dio_old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
+		// Release the HPS on the RAM model's own acknowledgement — same intent
+		// as MacLC.sv (a word that misses its slot must wait for the next one,
+		// not be dropped), but written as a SEPARATE, LATER assignment rather
+		// than an `else if`, and that difference is load-bearing:
+		// the SimBus driver (sim/sim_bus.cpp) holds ioctl_wr HIGH as long as
+		// ioctl_wait is set (it is a LEVEL here, not the one-cycle pulse hps_io
+		// produces on hardware), so an `else if` can never be reached and the
+		// download deadlocks. Letting the ack win gives ioctl_wait one clock at
+		// 0, which is exactly what SimBus polls for before presenting the next
+		// word. No word can be lost: SimBus does not advance until it sees that
+		// 0, and on hardware hps_io cannot pulse while ioctl_wait is high.
+		// ...and only on its RISING EDGE. dl_ack is a level that outlives
+		// dl_req by a cycle, so keying on the level holds ioctl_wait at 0 for
+		// TWO consecutive clocks — and SimBus presents a new word every clock
+		// it sees 0, so every other word was skipped and the ROM landed half
+		// empty (CPU fetched garbage from frame 9 onward). Hardware is immune:
+		// hps_io pulses ioctl_wr for one cycle and waits for ioctl_wait.
+		if (ram_dl_ack && !ram_dl_ack_d) ioctl_wait <= 0;
 	end
 
 	////////////////////////// RAM /////////////////////////////////
 
-	// For simulation with synchronous RAM, use simplified direct download path
-	wire download_cycle = dio_download && ioctl_wr;
-
-	// SDRAM word address mapping:
-	// memoryAddr[22:0] is already the SDRAM word address from addrController
-	// Download path uses dio_a_comb[22:0] directly
-	wire [22:0] dio_a_comb;
-	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 23'h600000 + {3'b0, ioctl_addr[20:1]} :  // Floppy 1
-	                    (ioctl_index[1:0] == 2'b10) ? 23'h700000 + {3'b0, ioctl_addr[20:1]} :  // Floppy 2
-	                    {5'b10100, ioctl_addr[18:1]};                                            // ROM at $500000 (must match addrController rom_sdram_word)
-
-	wire [24:0] ram_addr = download_cycle ? {2'b00, dio_a_comb[22:0]} :
-	                                        {2'b00, memoryAddr[22:0]};
-
-
-
-	// Use ioctl_dout directly for download (bypass registered dio_data)
-	wire [15:0] ram_din  = download_cycle ? ioctl_dout            : memoryDataOut;
-	wire  [1:0] ram_ds   = download_cycle ? 2'b11                 : { !_memoryUDS, !_memoryLDS };
-	// Use ioctl_wr directly as write enable during download (bypass registered dio_write)
-	wire        ram_we   = download_cycle ? 1'b1                  : !_ramWE;
-	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
+	// ★★★ 2026-08-18 — the `download_cycle` MUX IS GONE (keep in sync with
+	// MacLC.sv, which carries the full root-cause note). It stole the CPU's
+	// addr/din/ds/we/oe nets for the download; under Phase C's level request
+	// that both hid the CPU's request and let the download's posted-write ack
+	// land in cpu_done, which the CPU then consumed as its own DTACK —
+	// completing a read it never issued. Downloads now use their own port.
+	// This also removes a real sim-vs-FPGA divergence: the old sim path fired
+	// on `ioctl_wr` rather than the dioBusControl slot, and skipped the DC42
+	// header offset that MacLC.sv applies via dio_a.
+	wire [24:0] ram_addr = {2'b00, memoryAddr[22:0]};
+	wire [15:0] ram_din  = memoryDataOut;
+	wire  [1:0] ram_ds   = { !_memoryUDS, !_memoryLDS };
+	wire        ram_we   = !_ramWE;
+	// Phase C: oe is PURE CPU read intent — floppy windows request via
+	// flp_win (see the stale-read/lost-strobe note in MacLC.sv; keep both
+	// tops identical).
+	// ★ A cache hit never starts a memory transaction — same gate as
+	// MacLC.sv (per-access snapshot from fetch_cache; keep both tops
+	// identical — see the stall-tax note at MacLC.sv's sdram_oe).
+	wire        ram_oe   = (!_ramOE || !_romOE) && !icache_hit_now;
 	wire [15:0] ram_do_raw;
-	// --- Force cold-boot path (warm-reset hang workaround) — keep in sync with MacLC.sv.
-	// Patch the boot ROM's warm-vs-cold `bne.w` at ROM byte $4655E (SDRAM word
-	// $52322F) to UNCONDITIONAL (0x6600 -> 0x6000) as it is fetched, so every boot
-	// runs the full cold RAM march. No-op on a cold boot (branch already taken);
-	// guarded on the address AND opcode so other ROMs are untouched.
-	wire [15:0] ram_do_patched =
-		(!_romOE && memoryAddr == 23'h52322F && ram_do_raw == 16'h6600) ? 16'h6000 : ram_do_raw;
-	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_patched;
+	wire        ram_cpu_done;
+	wire [15:0] ram_cpu_dout;
+	// --- Warm-boot path RESTORED (force-cold ROM patch removed 2026-08-24) ---
+	// Keep in sync with MacLC.sv: with the RESET-instruction peripheral soft
+	// reset in (fc73a58), the warm path's stale-peripheral wedge is gone and
+	// the $52322F bne->bra live patch is removed (full rationale + the
+	// one-line reinstatement recipe at the matching block in MacLC.sv).
+	wire [15:0] cpu_dout_patched = ram_cpu_dout;
+	// ★ Floppy leg removed from this mux — keep in sync with MacLC.sv (it is
+	// the memory leg of cpuDataOut; a window landing inside a demand access
+	// used to hand the CPU floppy bytes).
+	wire [15:0] ram_do   = cpu_dout_patched;
 	// Disk byte-parity select: must be dskReadAddr[0], NOT memoryAddr[0] (which
 	// is dskReadAddr[1] after the >>1 word conversion drops bit 0). See the long
 	// note at the matching demux in MacLC.sv — the old bit selected the wrong
 	// byte on odd addresses and corrupted every floppy sector. Keep in sync.
 	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
-	wire [15:0] extra_rom_data_demux = dsk_byte_odd ?
+	// Phase C fix: parity registered with the request bundle — mirror of MacLC.sv
+	reg  ram_dskodd_q;
+	always @(posedge clk_sys) ram_dskodd_q <= dsk_byte_odd;
+	assign extra_rom_data_demux = ram_dskodd_q ?
 						   {ram_do_raw[7:0],ram_do_raw[7:0]}:{ram_do_raw[15:8],ram_do_raw[15:8]};
+
+	// ── Phase C fix (2026-08-18): pipeline the request bundle in clk_sys ─────
+	// Mirror of MacLC.sv — keep both tops identical. On the FPGA this stage is
+	// load-bearing: STA measured the unregistered clk_sys->clk_mem address path
+	// at -6.710 ns (15.381 ns window vs a ~22 ns V8-translation cone), so the
+	// controller was latching a half-settled row/column address and corrupting
+	// memory. Sim has no propagation delay and cannot see that, but the stage
+	// is mirrored here so the ONE-TICK REQUEST LATENCY it adds is modelled —
+	// otherwise the sim's cycle counts would flatter the FPGA.
+	reg [24:0] ram_addr_q;
+	reg [15:0] ram_din_q;
+	reg  [1:0] ram_ds_q;
+	reg        ram_we_q, ram_oe_q;
+	reg        ram_dlreq_q, ram_dlslot_q;
+	reg [23:0] ram_dladdr_q;
+	reg [15:0] ram_dldin_q;
+	reg        ram_flpwin_q, ram_flpguard_q;
+	always @(posedge clk_sys) begin
+		ram_addr_q     <= ram_addr;
+		ram_din_q      <= ram_din;
+		ram_ds_q       <= ram_ds;
+		ram_we_q       <= ram_we;
+		ram_oe_q       <= ram_oe;
+		ram_dlreq_q    <= ioctl_wait;
+		ram_dlslot_q   <= dioBusControl;
+		ram_dladdr_q   <= {1'b0, dio_a[22:0]};
+		ram_dldin_q    <= dio_data;
+		ram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download;
+		ram_flpguard_q <= flp_guard && !dio_download;
+	end
 
 	sim_ram ram
 	(
 		.clk            ( clk_sys     ),
 		.reset          ( reset       ),
-		.din            ( ram_din     ),
-		.addr           ( ram_addr    ),
-		.ds             ( ram_ds      ),
-		.we             ( ram_we      ),
-		.oe             ( ram_oe      ),
+		.din            ( ram_din_q   ),
+		.addr           ( ram_addr_q  ),
+		.ds             ( ram_ds_q    ),
+		.we             ( ram_we_q    ),
+		.oe             ( ram_oe_q    ),
 		.dout           ( ram_do_raw  ),
+
+		// Phase C demand-start handshake (latency-matched to rtl/sdram.v).
+		// !dio_download applied at the register above: during a download, dio
+		// writes are only presented during dioBusControl ticks — the very ticks
+		// floppy windows claim — so a pending floppy fetch would starve them.
+		.flp_win        ( (dskReadAckInt || dskReadAckExt) && !dio_download ),
+		.flp_addr       ( ram_addr[23:0] ),
+		.flp_guard      ( ram_flpguard_q ),
+
+		// download port (see the root-cause note above / in rtl/sdram.v)
+		.dl_req         ( ram_dlreq_q  ),
+		.dl_slot        ( ram_dlslot_q ),
+		.dl_addr        ( ram_dladdr_q ),
+		.dl_din         ( ram_dldin_q  ),
+		.dl_ack         ( ram_dl_ack   ),
+
+		.cpu_done       ( ram_cpu_done ),
+		.cpu_dout       ( ram_cpu_dout ),
+
+		// PDS Ethernet guest-RAM DMA port (mirror of MacLC.sv's sdram wiring)
+		.eth_req        ( pds_eth_req  ),
+		.eth_we         ( pds_eth_we   ),
+		.eth_addr       ( pds_eth_addr ),
+		.eth_din        ( pds_eth_din  ),
+		.eth_ack        ( pds_eth_ack  ),
+		.eth_dout       ( pds_eth_dout ),
+
 		.frame_count    ( sim_frame_count )
 	);
 

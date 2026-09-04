@@ -63,6 +63,8 @@ CC_OPT =
 V_SRC = \
 	sim.v \
 	sim_ram.v \
+	sim_ddr3.v \
+	$(RTL)/pds/pds_enet.sv \
 	$(RTL)/tg68k/TG68K_ALU.v \
 	$(RTL)/tg68k/TG68K_Pack.sv \
 	$(RTL)/tg68k/TG68KdotC_Kernel.v \
@@ -72,6 +74,7 @@ V_SRC = \
 	$(RTL)/dataController_top.sv \
 	$(RTL)/maclc_v8_video.sv \
 	$(RTL)/vram_bram.sv \
+	$(RTL)/fetch_cache.sv \
 	$(RTL)/ariel_ramdac.sv \
 	$(RTL)/pseudovia.sv \
 	$(RTL)/via6522.sv \

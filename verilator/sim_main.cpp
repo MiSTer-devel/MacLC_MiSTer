@@ -166,6 +166,13 @@ SimBlockDevice blockdevice(console);
 std::string scsi_disk_files[2];
 std::string cdrom_file;        // --cdrom <iso> -> block-device slot 2 (SCSI ID 3 CD)
 std::string floppy_disk_files[2];
+// Deferred (mid-run) floppy mount — the frame at which to START the ioctl
+// download, or -1 to download at startup like before. A real OSD mount happens
+// with the guest LIVE; queuing at startup runs the download while the CPU is
+// still held in reset, which is a fundamentally different (and much safer)
+// case. Every bug that lives in the CPU-vs-download bus seam is invisible
+// unless the download overlaps running guest code.
+int floppy_mount_frame[2] = { -1, -1 };
 
 // Input handling
 // --------------
@@ -827,6 +834,10 @@ int main(int argc, char** argv, char** env) {
 			floppy_disk_files[0] = argv[++i]; // primary floppy (.dsk) -> SDRAM download
 		} else if (strcmp(argv[i], "--floppy1") == 0 && i + 1 < argc) {
 			floppy_disk_files[1] = argv[++i]; // secondary floppy
+		} else if (strcmp(argv[i], "--mount-floppy0-at") == 0 && i + 1 < argc) {
+			floppy_mount_frame[0] = std::stoi(argv[++i]);  // defer --floppy0 to this frame
+		} else if (strcmp(argv[i], "--mount-floppy1-at") == 0 && i + 1 < argc) {
+			floppy_mount_frame[1] = std::stoi(argv[++i]);  // defer --floppy1 to this frame
 		}
 	}
 
@@ -953,6 +964,12 @@ int main(int argc, char** argv, char** env) {
 	for (int disk_index = 0; disk_index < 2; disk_index++) {
 		if (!floppy_disk_files[disk_index].empty()) {
 			int ioctl_index = disk_index == 0 ? 1 : 2;
+			if (floppy_mount_frame[disk_index] >= 0) {
+				fprintf(stderr, "Floppy%d mount DEFERRED to frame %d: %s\n",
+				        disk_index, floppy_mount_frame[disk_index],
+				        floppy_disk_files[disk_index].c_str());
+				continue;
+			}
 			bus.QueueDownload(floppy_disk_files[disk_index], ioctl_index, 1);
 			fprintf(stderr, "Loading floppy%d image (ioctl_index %d): %s\n",
 			        disk_index, ioctl_index, floppy_disk_files[disk_index].c_str());
@@ -1140,6 +1157,17 @@ int main(int argc, char** argv, char** env) {
 #endif
 
 		video.UpdateTexture();
+
+		// Deferred floppy mount — fire the ioctl download mid-run, exactly as an
+		// OSD mount does on hardware (guest live, CPU fetching from SDRAM).
+		for (int d = 0; d < 2; d++) {
+			if (floppy_mount_frame[d] >= 0 && video.count_frame >= floppy_mount_frame[d]) {
+				bus.QueueDownload(floppy_disk_files[d], d == 0 ? 1 : 2, 1);
+				fprintf(stderr, "[F%d] MOUNTING floppy%d mid-run: %s\n",
+				        video.count_frame, d, floppy_disk_files[d].c_str());
+				floppy_mount_frame[d] = -1;
+			}
+		}
 
 		// Handle screenshots at specified frames
 		bool took_screenshot_this_frame = false;

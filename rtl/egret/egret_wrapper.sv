@@ -228,16 +228,33 @@ wire [7:0] timer_counter = cycle_total[9:2];  // Divide by 4, take lower 8 bits
 // Register $12 bit 4 enables the timer, bit 6 is cleared by ISR
 //
 // Real hardware: 32.768 kHz crystal / 32768 = 1 Hz
-// Our approximation: count cen ticks (4 MHz). Use shorter period for simulation.
+// Our timebase: cen = clk32/8 = 32.5 MHz/8 = 4.0625 MHz exactly (pll outclk_1).
+// The counter spans 0..PERIOD inclusive, so a fire every PERIOD+1 cen ticks:
+// 4,062,499 + 1 = 4,062,500 cen = 1.000 s. (The old 4,000,000 at an assumed
+// 4 MHz ran the guest wall clock ~1.56% fast.)
 `ifdef SIMULATION
-localparam ONESEC_PERIOD = 22'd8192;    // ~2ms at 4 MHz (fast for simulation)
+localparam ONESEC_PERIOD = 22'd8192;    // ~2ms (fast for simulation)
 `else
-localparam ONESEC_PERIOD = 22'd4000000; // ~1 second at 4 MHz
+localparam ONESEC_PERIOD = 22'd4062499; // exactly 1 second at 4.0625 MHz
 `endif
 
 reg [21:0] onesec_counter;
-reg        onesec_irq_flag;  // Sticky flag, generates interrupt edge
+reg        onesec_irq_flag;  // Sticky flag; held until the ISR's $12 bit-6 ack
 wire       onesec_irq_n = ~onesec_irq_flag;
+
+`ifdef SIMULATION
+// One-second liveness witness: FIRE when the flag sets, ACK when the ISR's
+// BCLR 6,$12 clears it. A FIRE with no following ACK = the ISR is dead (the
+// pre-fix edge-drop deadlock signature). ~500 pairs/sim-second (2ms period).
+reg onesec_flag_d;
+always @(posedge clk) begin
+    onesec_flag_d <= onesec_irq_flag;
+    if (onesec_irq_flag && !onesec_flag_d)
+        $display("EGRET_ONESEC_FIRE @%0t", $time);
+    if (!onesec_irq_flag && onesec_flag_d)
+        $display("EGRET_ONESEC_ACK @%0t", $time);
+end
+`endif
 
 always @(posedge clk) begin
     if (reset) begin
@@ -749,6 +766,8 @@ end
 reg        pram_copy_busy = 1'b0;
 reg [8:0]  pram_copy_idx;             // 0-255 = PRAM bytes, 256-259 = RTC seed
 wire [7:0] pram_copy_rdata = pram[pram_copy_idx[7:0]];
+// Unix epoch (1970) -> Mac epoch (1904): see the seed comment below.
+wire [31:0] mac_seconds = timestamp[31:0] + 32'd2082844800;
 always @(posedge clk) begin
     if (reset) begin
         pram_loaded    <= 1'b0;
@@ -774,11 +793,18 @@ always @(posedge clk) begin
             // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
             // (offset 0x70 = 0x100 - 0x90), then seed RTC seconds
             // (CPU 0xAB-0xAE -> intram[0x1B-0x1E]) from the host timestamp.
+            // ★ mac_seconds: the host gives a UNIX epoch (1970); the Mac RTC
+            // counts seconds since 1904-01-01. Without the 2,082,844,800 s
+            // offset the guest ran with correct wall time but year 1960 (the
+            // 66-year offset is exactly 24,107 days, and 1904->1970 and
+            // 1960->2026 contain the same number of leap days, so the error
+            // hid in the menu-bar clock and only showed in dates). Wraps in
+            // 2040, when the 32-bit Mac epoch ends anyway.
             case (pram_copy_idx)
-                9'd256:  intram[16'hAB - 16'h90] <= timestamp[31:24];
-                9'd257:  intram[16'hAC - 16'h90] <= timestamp[23:16];
-                9'd258:  intram[16'hAD - 16'h90] <= timestamp[15:8];
-                9'd259:  intram[16'hAE - 16'h90] <= timestamp[7:0];
+                9'd256:  intram[16'hAB - 16'h90] <= mac_seconds[31:24];
+                9'd257:  intram[16'hAC - 16'h90] <= mac_seconds[23:16];
+                9'd258:  intram[16'hAD - 16'h90] <= mac_seconds[15:8];
+                9'd259:  intram[16'hAE - 16'h90] <= mac_seconds[7:0];
                 default: intram[pram_copy_idx + 9'h070] <= pram_copy_rdata;
             endcase
             if (pram_copy_idx == 9'd259) begin
@@ -827,6 +853,26 @@ always @(posedge clk) begin
 end
 assign pram_save_data = pram[pram_save_addr];
 assign pram_wr_stb    = pram_region_wr;
+
+`ifdef SIMULATION
+// PRAM write-path witness (2026-08-19, the "colors reset every boot" report):
+// counts firmware writes that reach the canonical pram[] and checksums the
+// array, so a sim boot can prove whether guest/ROM PRAM writes actually land.
+integer pw_cnt = 0;
+integer pw_i;
+reg [15:0] pw_sum;
+always @(posedge clk) begin
+    if (pram_region_wr) begin
+        pw_cnt = pw_cnt + 1;
+        if (pw_cnt <= 8 || pw_cnt % 64 == 0) begin
+            pw_sum = 0;
+            for (pw_i = 0; pw_i < 256; pw_i = pw_i + 1) pw_sum = pw_sum + pram[pw_i];
+            $display("PRAM_WITNESS: write #%0d addr=%02x data=%02x pram_sum=%04x @%0t",
+                     pw_cnt, pram_wr_idx, cpu_dout, pw_sum, $time);
+        end
+    end
+end
+`endif
 
 `ifdef VERBOSE_TRACE
 // Debug stack reads around RTS execution
@@ -898,7 +944,13 @@ always @(*) begin
             end
             5'h08: cpu_din_r = timer_ctrl;     // Timer control
             5'h09: cpu_din_r = timer_counter;  // Timer counter (8-bit, free-running)
-            5'h12: cpu_din_r = onesec_ctrl;    // One-second timer control
+            // One-second timer control. Reads must include the FIRED flag in
+            // bit 6 (MAME m68hc05e1: seconds_tick does m_onesec |= 0x40, visible
+            // on read until the firmware writes bit6=0). Without it, any RMW bit
+            // op on $12 (e.g. BSET 5,$12 in the set-time path) reads bit6=0 and
+            // writes bit6=0 back — spuriously acking a pending second. The ISR's
+            // BCLR 6,$12 still clears the flag through the same write path.
+            5'h12: cpu_din_r = onesec_ctrl | (onesec_irq_flag ? 8'h40 : 8'h00);
             default: cpu_din_r = 8'h00;  // Unmapped ports return 0 (makes bit tests fail safely)
         endcase
     end else if (ram_cs) begin
