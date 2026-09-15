@@ -49,7 +49,7 @@ module sdram
 	input               clk_8,      // 8MHz chipset clock to which sdram state machine is synchonized
 
 	input [15:0]        din,        // data input from chipset/cpu
-	output reg [15:0]   dout,       // data output to chipset/cpu (floppy-window reads)
+	output reg [15:0]   dout,       // floppy-window read data (loaded on a clk_64 FALLING edge, see read capture)
 	input [23:0]        addr,       // 24 bit word address
 	input [1:0]         ds,         // upper/lower data strobe
 	input               oe,         // cpu/chipset requests read
@@ -137,8 +137,8 @@ module sdram
 
 	output reg          cpu_done,   // request served: read data will be stable in cpu_dout
 	                                // before a consumer sampling done can latch it 2 ticks
-	                                // later (early-done: set at ACTIVE+3 clk_64, capture at
-	                                // ACTIVE+6); for writes set at ACTIVE (posted). Holds
+	                                // later (early-done: set at ACTIVE+3 clk_64, cpu_dout
+	                                // loaded at ACTIVE+7); for writes set at ACTIVE (posted). Holds
 	                                // until the request level drops (AS release), so the
 	                                // CPU glue can use it as an async DTACK directly.
 	output reg [15:0]   cpu_dout    // held CPU read data (private register: floppy-window
@@ -165,7 +165,16 @@ localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, B
 localparam STATE_FIRST     = 3'd0;   // first state in cycle
 localparam STATE_CMD_START = 3'd0;   // state in which a new command can be started
 localparam STATE_CMD_CONT  = STATE_CMD_START  + RASCAS_DELAY; // command can be continued
-localparam STATE_READ      = STATE_CMD_CONT + CAS_LATENCY + 4'd2;  // +2 for 65MHz margin (was +1)
+// STATE_READ = the posedge at which the consumers (cpu_dout / eth_dout) take
+// the read word. It is NOT the pin-sampling edge any more: the pins are
+// sampled by sd_data_q on the clk_64 FALLING edge STATE_CMD_CONT+CL+1.5 (see
+// the read-capture block below), re-timed once in the fabric on the next
+// falling edge, and consumed here one posedge after that. History: +1 was the
+// original, 3a6f00d made it +2 "for 65MHz margin" (setup only — the hold side
+// was left to the fitter's routing, which is the 2026-09 QuarkXPress
+// regression), 2026-09-12 made it +3 so that the pin-to-core route gets a
+// full clk_64 period instead of half of one.
+localparam STATE_READ      = STATE_CMD_CONT + CAS_LATENCY + 4'd3;
 localparam STATE_LAST      = 3'd7;  // last state in cycle
 
 reg [2:0] t;
@@ -200,6 +209,7 @@ always @(posedge clk_64) begin
 end
 
 initial reset = 10'h3FF;
+initial t     = 3'd0;    // Icarus starts regs at X; Verilator/Quartus power up at 0
 
 // ---------------------------------------------------------------------
 // ------------------ generate ram control signals ---------------------
@@ -229,8 +239,8 @@ reg oe_latch, we_latch;
 
 // ── Demand sequencer state (Phase C, branch cpu-enhancements) ────────────
 // One access = the same 8-clk_64 command schedule the old slot machine used
-// (ACTIVE at start, READ/WRITE+auto-precharge at STATE_CMD_CONT, capture at
-// STATE_READ with its empirically-margined +2) — only the START is now any
+// (ACTIVE at start, READ/WRITE+auto-precharge at STATE_CMD_CONT, pins sampled
+// on the falling edge at CL+1.5, consumed at STATE_READ) — only the START is now any
 // idle clk_64 edge instead of a bus-slot boundary. Floppy windows (flp_win)
 // take priority and still run slot-aligned by construction (the window IS
 // the old slot), so floppy.v and its fetch-freshness protocol see identical
@@ -278,6 +288,46 @@ wire [15:0] sd_data_rd = sd_data_in;
 wire [15:0] sd_data_rd = sd_data;
 `endif
 
+// ── Read capture (2026-09-12): two FALLING-edge stages, then the consumers.
+//
+// Timeline for one read, P = clk_64 period (15.38 ns), E_k = the k-th posedge
+// after ACTIVE (E0). SDRAM_CLK is the INVERTED clk_64 (altddio_out below), so
+// the chip's rising edges are clk_64 FALLING edges:
+//   E2      READ issued (seq == STATE_CMD_CONT); the chip latches it at E2.5
+//   E4.5    chip launches DQ (CL = 2); valid at the pin ~tAC later
+//   E5.5    sd_data_q  <= pins      I/O-cell register, clk_64 falling edge.
+//                                   Eye measured by STA (MacLC.sdc):
+//                                   +2.2 ns setup / +6.5 ns hold, identical
+//                                   to 0.04 ns across three fitter seeds.
+//   E6.5    sd_data_r  <= sd_data_q fabric register, clk_64 falling edge:
+//                                   the ~6 ns I/O-cell -> core route gets a
+//                                   FULL period (a posedge stage at E6 only
+//                                   had half of one and failed timing by
+//                                   -0.14..-0.64 ns on every seed).
+//   E7      cpu_dout / eth_dout <= sd_data_r   (seq == STATE_READ; a short
+//                                   fabric-to-fabric half-period path)
+//   The floppy word goes to `dout` at E6.5 directly from sd_data_q (gated by
+//   flp_cap): floppy.v latches its byte at busPhase 3 of the window slot,
+//   which is E7 of a window access (ACTIVE lands at slot+1), so a posedge
+//   E7 copy would arrive one clk_64 too late for it.
+//
+// Why: before this, three fabric registers (cpu_dout, eth_dout, dout) each
+// sampled the pins directly at STATE_READ. Only one register per pin packs
+// into the I/O cell, so two of them rode 3.8-12.3 ns of routing — the term a
+// fitter SEED reshuffles — and the SDRAM pins carried NO I/O constraints, so
+// STA never looked. That is how a pure reseed (SEED 8 -> 4) turned into the
+// QuarkXPress Line-1111 hang. See docs/plan_sdram_read_capture_2026-09-12.md.
+// The chip holds DQ only until its next edge + tOH (BL = 1), so the I/O-cell
+// stage is what makes the eye fit-invariant; the fabric stage is what makes
+// the hand-off close. sys/sys.tcl's FAST_INPUT_REGISTER on SDRAM_DQ[*] packs
+// sd_data_q (verify: 16 "Fast Input Register" rows in the fit report).
+reg [15:0] sd_data_q;   // I/O cell, E5.5
+reg [15:0] sd_data_r;   // fabric,   E6.5
+reg        flp_cap;     // posedge-domain enable: the E6.5 edge of a floppy read
+always @(negedge clk_64) sd_data_q <= sd_data_rd;
+always @(negedge clk_64) sd_data_r <= sd_data_q;
+always @(negedge clk_64) if (flp_cap) dout <= sd_data_q;   // floppy-window data
+
 wire req_flp   = flp_win && !flp_served;
 // Download: served in its own bus slot, at most one word per window, ranked
 // between the floppy window and the CPU. If a CPU access happens to straddle
@@ -287,9 +337,10 @@ wire req_dl    = dl_req && dl_slot && !dl_served;
 // t[0] parity gate: only start CPU accesses on clk_64 edges that coincide
 // with a clk_sys edge (the free-running ladder counter t wraps at the clk_8
 // boundary, so an edge evaluating an ODD t begins an even-t period = an
-// integer clk_sys tick). This pins the STATE_READ capture edge to a clk_sys
-// boundary, so cpu_dout -> clk_sys consumer paths are timed at a full
-// 30.8 ns period by STA — no cross-clock multicycle, no half-period races.
+// integer clk_sys tick). This pins every edge of the access to a known clk_sys
+// phase: cpu_done rises at E3 (odd) and cpu_dout lands at E7 (odd), one clk_64
+// before the clk_sys edges that consume them — exactly the single-period
+// clk_64 -> clk_sys relationship STA checks for these paths (no multicycle).
 // Costs at most one clk_64 of start latency.
 wire req_cpu   = (oe || we) && !flp_win && !flp_guard && t[0]
                  && !cpu_done && (ref_due < REF_FORCE);
@@ -305,6 +356,9 @@ always @(posedge clk_64) begin
 `ifndef TB_NO_TRISTATE
 	sd_data <= 16'bZZZZZZZZZZZZZZZZ;
 `endif
+	// Floppy-window read: arm the falling-edge `dout` load for E6.5 (set at
+	// E6, i.e. when seq == STATE_READ-1 is seen; cleared again at E7).
+	flp_cap <= seq_busy && (seq == STATE_READ - 3'd1) && !src_cpu && !src_eth && oe_latch;
 
 	if(reset != 0) begin
 		seq_busy   <= 0;
@@ -356,11 +410,13 @@ always @(posedge clk_64) begin
 				// need it, but the caches need to be able to store everything
 				sd_addr <= { we_latch ? ~ds_q : 2'b00, 2'b10, col_q };  // auto precharge
 			end
-			// early-done for CPU reads: 3 clk_64 (1.5 clk_sys) before capture.
-			// The CPU bus FSM samples done, then latches din TWO clk_sys ticks
-			// later (S_WAIT exit -> S_TAIL2), so cpu_dout is stable a full
-			// clk_sys tick before the consumer's latch edge. Do not move done
-			// earlier than STATE_CMD_CONT+1 without redoing that arithmetic.
+			// early-done for CPU reads: 4 clk_64 (2 clk_sys) before the E7
+			// cpu_dout load. The CPU bus FSM samples done at E4 (its first
+			// clk_sys edge after E3), then latches din TWO clk_sys ticks later
+			// (S_WAIT exit -> S_TAIL2 = E8), so cpu_dout (E7) reaches it over
+			// one clk_64 period — the relationship STA checks. Do not move
+			// done earlier than STATE_CMD_CONT+1, or the load later than
+			// STATE_READ, without redoing that arithmetic.
 			//
 			// ★★ `&& oe` (2026-08-19): done may only be BORN while its request
 			// level is still up. A fetch-cache HIT answers the CPU early, so
@@ -386,21 +442,21 @@ always @(posedge clk_64) begin
 `else
 			if (seq == STATE_CMD_CONT + 3'd1 && src_cpu && oe_latch && oe) cpu_done <= 1;
 `endif
-			// Data ready
+			// Data ready (from the fabric re-timing stage; see the read-capture
+			// block). The floppy word is NOT taken here — it is loaded into
+			// `dout` on the falling edge before this one (flp_cap below).
 			if (seq == STATE_READ) begin
 				if (src_cpu) begin
-					if (oe_latch) cpu_dout <= sd_data_rd;
+					if (oe_latch) cpu_dout <= sd_data_r;
 				end else if (src_eth) begin
 					// eth read completes here: data valid the same edge the
 					// ack rises. Born only while the request level is up (the
 					// done-birth law) — pds_enet never abandons, so this is
 					// belt-and-braces, not load-bearing like the CPU's.
 					if (oe_latch && eth_req) begin
-						eth_dout <= sd_data_rd;
+						eth_dout <= sd_data_r;
 						eth_ack  <= 1;
 					end
-				end else begin
-					dout <= sd_data_rd;   // floppy-window data (legacy consumer path)
 				end
 			end
 			if (seq == 3'd7) seq_busy <= 0;

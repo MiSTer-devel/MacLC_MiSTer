@@ -134,6 +134,16 @@ These must stay identical; they were checked and match today.
   in Verilator can still fail on hardware for SDRAM timing/latency reasons.**
   Historically real here (stale-read / DTACK-before-cpu-slot issues). "Boots in
   sim" ≠ "boots on FPGA" for anything timing-sensitive on the memory bus.
+  **Pin timing is not modelled at all** (2026-09-12): `rtl/sdram.v` now samples
+  the SDRAM data pins in the I/O cell on the clk_64 FALLING edge (`sd_data_q`),
+  re-times once in the fabric (`sd_data_r`, next falling edge) and loads
+  `cpu_dout`/`eth_dout` one clk_64 later than before (STATE_READ = CAS+CL+3,
+  was +2); the floppy `dout` loads on that falling edge. `sim_ram.v` is
+  untouched (its consumer latencies were never cycle-matched), and only the
+  constrained STA in `MacLC.sdc` + `scripts/sdram_io_report.tcl` can catch a
+  regression of this class — no offline gate can. Behaviour gates for the
+  FPGA controller itself: `tb_icache_seam.v` (+ negative control) and
+  `tb_dl_cpu_seam.v -DTB_REAL_SDRAM`, both under Icarus.
 - **Handshake semantics differ too, not just latency** (learned 2026-08-19, the
   I-cache stale-done hang): `sim_ram`'s `cpu_done` is structurally immune to
   abandoned-request hazards — its `!(oe||we)` clear is FIRST in an else-if
