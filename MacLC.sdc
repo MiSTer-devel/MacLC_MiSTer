@@ -1,7 +1,8 @@
 # MacLC project timing constraints (read after sys/sys_top.sdc).
 #
 # ----------------------------------------------------------------------------
-# TG68 kernel — HARD CAP on kernel-internal paths, NOT a two-period credit.
+# TG68 kernel — two-period credit (restored 2026-09-15 after the loop fix);
+# the HARD CAP era and its reasoning are kept below as history.
 # ----------------------------------------------------------------------------
 # History. From 2026-06-07 (29e1f69) to 2026-09-12 this block was
 #   set_multicycle_path -setup -end 2 -from kernel -to kernel  (+ -hold -end 1)
@@ -47,7 +48,53 @@
 # break the structural loop in the kernel so STA is exact; until then this cap
 # is the guard. Scope is kernel-INTERNAL only, as before: the tg68k wrapper FSM
 # and every CPU<->SDRAM/peripheral path are ordinary single-cycle paths.
-set_max_delay -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}] 32.0
+#
+# ★ 2026-09-15 — THE LOOP IS GONE (branch tg68-break-comb-loop). The mechanism
+# described above was wrong: the only real edge was setexecOPC -> datatype (the
+# MULU/MULS execute-phase "long" override, the sole setexecOPC-guarded datatype
+# write in the decode process) -> the EA-build test
+# `opcode(5 downto 3)="010" AND datatype="10"` (42ae7a6, the cmp.l (An) fix,
+# 2026-06-02 — so the loop was three months old and not TG68K's) -> setstate /
+# next_micro_state -> setexecOPC. Moving that one override to set_datatype
+# (identical value at every consumer; see the comment at the MUL site in
+# TG68KdotC_Kernel.vhd) removes the edge and adds none. Evidence, same SEED 4
+# that failed this cap at -1.024 ns with the loop: no 332081/332125 anywhere,
+# kernel-internal worst path 24.8 ns data delay (+6.86 ns against the cap), and
+# the warning-count diff against that parent fit is exactly the loop's 135
+# messages plus its "timing not met". Functional gates: verilator/tb_mul_modes.v
+# (old vs new kernel bus logs identical, every addressing mode) and the boot
+# CPU-trace diff. STA is now EXACT for the kernel, so the "loop-hidden
+# remainder" argument above no longer applies. THE CAP STAYS for now as a
+# policy choice (docs/tg68_comb_loop_plan.md, Phase A). Whether to give the
+# genuine two-period budget back is Phase B: decided on hardware across seeds
+# 4/5/7, never on STA alone (seed-8 precedent).
+#
+# ★ PHASE B PASSED 3/3 ON HARDWARE (2026-09-15 late evening, docs/
+# tg68_comb_loop_plan.md §7): seeds 4, 5 and 7 with this credit, each booted
+# twice, QuarkXPress typing, restart — all clean. Kernel-internal worst paths
+# 30.5 / 29.7 / 32.1 ns against 61.5 ns (+28 to +29.5 ns); seed 7 would have
+# FAILED the 32 ns cap by 0.1 ns, i.e. the 2.4 ns placement spread that was
+# pass-or-fail under the cap is noise under the real budget. The September
+# paragraphs above ("Do NOT restore the two-period credit") are kept as
+# history: they were right WHILE the loop existed and are superseded by its
+# removal. If the "STA met, hardware corrupt" class ever returns, the first
+# question is whether a NEW loop or untimed path has appeared (grep 332125),
+# not whether this credit is wrong.
+#
+# (Originally written as:) PHASE B UNDER TEST (2026-09-15, plan §4). With the
+# loop gone and STA exact, the two-period credit is restored: every kernel and
+# ALU register is clkena-gated and the kernel only advances on tg68_clkena
+# pulses >= 2 clk_sys apart (re-verified 2026-09-12), so kernel-internal
+# reg->reg paths genuinely have two periods. The hypothesis being tested is the
+# September one: that the credit was unsafe ONLY because the loop hid delay
+# from STA. Verdict comes from HARDWARE on seeds 4/5/7 (the 2026-09-12 trio:
+# one clean, two desktop hangs from one RTL), never from STA. Any failure ->
+# put the set_max_delay cap back (line kept below) and record the seed.
+# Hold stays the default single-cycle check (-hold -end 1), as in June.
+set_multicycle_path -setup -end 2 -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}]
+set_multicycle_path -hold  -end 1 -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}]
+# Phase A cap, retained for a one-line revert if Phase B fails on hardware:
+# set_max_delay -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}] 32.0
 
 # ----------------------------------------------------------------------------
 # Peripheral (VPA) read-data register — SCSI read-path fit-stabilization.
