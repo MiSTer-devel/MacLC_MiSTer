@@ -2970,9 +2970,33 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						IF (nextpass='1') OR (opcode(5 downto 4)="00" AND decodeOPC='1') THEN
 							dest_hbits <= '1';
 						END IF;
+						-- 2026-09-15 (danielb0 fork, branch tg68-break-comb-loop): the execute-phase
+						-- "long" override for MULU/MULS goes to set_datatype, NOT to datatype.
+						--
+						-- WHY. Writing it to datatype closed a 132-node STRUCTURAL combinational loop
+						-- (Quartus Critical Warning 332081 "estimating the delays through the loop"):
+						--   setexecOPC -> datatype (this site; the only setexecOPC-guarded datatype
+						--   write in the process) -> the EA-build test
+						--   opcode(5 downto 3)="010" AND datatype="10" (added in 42ae7a6 for the
+						--   cmp.l (An) flag-commit race) -> setstate / next_micro_state -> setexecOPC.
+						-- It never oscillated: with setexecOPC='1' that test forces setstate="01",
+						-- which forces setexecOPC='0', so the only stable state was always the ELSE
+						-- branch with datatype="01". But STA cannot time any path that crosses a loop,
+						-- which is why MacLC.sdc had to cap the whole kernel at one clk_sys period.
+						--
+						-- WHY THIS IS EXACT. set_datatype defaults to datatype at the top of this
+						-- process and a later assignment wins, so every consumer of set_datatype
+						-- (exe_datatype, the memmask select, the set(longaktion) test) sees exactly the
+						-- value it saw before. The EA-build block keeps reading the decode-phase
+						-- datatype ("01"), which is the value it already saw in every stable state.
+						-- The dependency graph is a strict subgraph of the old one: one edge removed,
+						-- none added.
+						--
+						-- LAW: never assign datatype under a setexecOPC guard anywhere in this process.
+						-- datatype feeds setstate through the EA-build block; setstate feeds setexecOPC.
 						datatype <= "01";
 						IF setexecOPC='1' THEN
-							datatype <= "10";
+							set_datatype <= "10";
 						END IF;
 					ELSE
 						trap_illegal <= '1';
