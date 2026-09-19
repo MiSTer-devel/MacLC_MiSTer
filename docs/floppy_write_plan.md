@@ -2109,6 +2109,39 @@ supersedes the ruling and the TO DO below.
 Until 6D lands, 720K and DOS gating uses RAW images; DC42 is exercised at
 1.44 MB with HFS, where the soak proved it safe.
 
+★★ **720K DOS IN DC42 - GATED ON HARDWARE 2026-09-19, BOTH HALVES.** The
+ruling above was retracted on a READING of Main's source; it is now retracted
+on evidence. 6D's CEIL was gated at 1.44 MB only, so the DD cell - the one this
+section's worked example is about, cluster 714 = sectors 1438-1439 - had never
+been run. Fit `82ab9d68` (the probes-off PR build). Images minted by
+`scripts/mint_720k_dc42.py`: tagless 720K FAT12 in DC42, 737,364 B, each with
+a `.baseline` twin. Deterministic - both images below re-minted byte-identical
+afterwards and reproduced their diffs exactly.
+
+- **Writes land, and disturb nothing** (`P6_DOS720K_nearfull`, 12 low clusters
+  free plus the tail): two files copied in, both **byte-exact against the
+  source volume** (`fat_diff` 2 identical / 0 differ); `FILLER.BIN`'s 700
+  clusters **0 of 1400 sectors changed**; **22 of 1440** sectors changed in
+  total - the two FATs, the root directory and the new files' own clusters,
+  nothing else. DC42 data checksum `8a0dfd80` stored == recomputed.
+- **The PARTIAL FINAL BLOCK IS WRITABLE** (`P6_DOS720K_lastfree`, only cluster
+  714 free): **PC Exchange placed `FINDER.DAT` at cluster 714 at MOUNT**,
+  713/713 clusters allocated, sectors 1438 AND 1439 changed, and the last 84
+  bytes of the payload went **all-zero -> 27 nonzero bytes**. The file did not
+  grow (737,364 B in and out), so Main clipped the write to EOF exactly as 6D
+  predicted. `FILLER.BIN` untouched; 5 payload sectors changed in all (3, 6, 7,
+  1438, 1439). DC42 checksum `4161566f` rewritten and correct.
+
+★★ **METHOD WARNING, and it nearly cost the result.** `lastfree` was built with
+cluster 714 as the ONLY free cluster, so that a copied file would be forced into
+the tail. On hardware the Mac reported the disk COMPLETELY FULL and refused
+every file, which reads like a mis-designed image and was written off as one. It
+was the opposite: **PC Exchange writes DESKTOP / FINDER.DAT / RESOURCE.FRK at
+MOUNT** (3 clusters on the 720K gate, sectors 614-619), so with a single free
+cluster it had nowhere to put `FINDER.DAT` except the tail. The "disk full"
+message WAS the pass. **Pull the image off the card and diff it before judging a
+bench run by what the guest said.**
+
 ##### ~~TO DO — enforce the ruling in RTL~~ SUPERSEDED by Phase 6D (2026-09-18):
 ##### fix the tail, do not lock the disk. Kept for the record; do not build.
 
