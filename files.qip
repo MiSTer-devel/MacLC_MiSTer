@@ -5,7 +5,13 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ncr5380.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg_probes.sv
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
+set_global_assignment -name VERILOG_FILE rtl/floppy_track_decoder.v
+set_global_assignment -name VERILOG_FILE rtl/floppy_write_committer.v
+set_global_assignment -name VERILOG_FILE rtl/floppy_sd_writer.v
+set_global_assignment -name VERILOG_FILE rtl/eth_port_arb.v
 set_global_assignment -name VERILOG_FILE rtl/mfm_track_encoder.v
+set_global_assignment -name VERILOG_FILE rtl/mfm_write_decoder.v
+set_global_assignment -name VERILOG_FILE rtl/ism_write_engine.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/adb.sv

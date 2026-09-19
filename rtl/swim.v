@@ -55,6 +55,13 @@
 */
 
 module swim
+#(
+	// The void write cadence in cep ticks: 259 = 32 us, the DD byte time
+	// (= floppy.v MFM_PERIOD_DD). A parameter only so a bench can shrink it,
+	// exactly as floppy.v's MFM_PERIOD_* are; no synthesised instance
+	// overrides it.
+	parameter [8:0] WR_VOID_PERIOD = 9'd259
+)
 (
 	input clk,
 	input cep,
@@ -72,7 +79,29 @@ module swim
 	input [1:0] insertDisk,
 	output [1:0] diskEject,
 	input [1:0] diskSides,
+	// The MEDIUM's sidedness from the mount-time volume sniff, per drive
+	// (plan Phase 6B). diskSides is the FILE's size; these are not the same
+	// question -- see rtl/floppy.v doubleSidedDisk.
+	input [1:0] mediaSides,
 	input [1:0] diskMFM,    // disk is MFM-format (ISM path): {ext,int}
+	// Committed-sector SDRAM write port, INTERNAL DRIVE ONLY. The external
+	// drive is built with WRITE_SUPPORT=0 (see its instantiation), so it has
+	// no committer to arbitrate with and none of this is per-drive.
+	output [21:0] wrSdAddr,
+	output [15:0] wrSdData,
+	output        wrSdReq,
+	input         wrSdAck,
+	output        wrCommitDone,
+	output [21:0] wrCommitAddr,
+	// Persistence tap, internal drive only — see floppy.v's ports.
+	output  [7:0] wrSdBufAddr,
+	output [15:0] wrSdBufData,
+	output        wrSdBufWr,
+	input [1:0] writeProtect, // 1 = this drive refuses writes: the OSD write
+	                        // enable is off or the slot mounted read-only.
+	                        // The container is NOT a term -- DC42 is writable
+	                        // (MacLC.sv flp_int_wp; the writer does the
+	                        // two-block RMW). Drives WRTPRT.
 	input [1:0] diskHD,     // disk is 1.44MB HD: {ext,int}
 
 	output [1:0] diskMotor,
@@ -85,6 +114,15 @@ module swim
 	input dskReadAckExt,
 	input [7:0] dskReadData,
 
+	// --- ISM MFM write engine (plan stage 2) ---------------------------
+	// One decoded byte per medium byte-time, exactly the stream
+	// rtl/mfm_write_decoder.v parses. mfm_wr_mark marks the A1 sync bytes.
+	// Inert unless (mode & 0x18) == 0x18 with an MFM write datapath.
+	output    [7:0] mfm_wr_byte,
+	output          mfm_wr_mark,
+	output          mfm_wr_stb,     // 1 clk, coincident with the byte-time tick
+	output          mfm_wr_active,  // the engine owns the head
+
 	// --- diagnostic passthroughs (PFLP probes; internal drive only) ---
 	output [31:0] dbg_ism_flpe,  // {5'b0, ism_error, arm_cnt, ovr_cnt, unr_cnt} — JTAG FLPE
 	output [15:0] dbg_flp_byte_cnt,
@@ -96,7 +134,9 @@ module swim
 	output [7:0]  dbg_iwm_latch,     // live IWM read-data latch
 	output        dbg_flp_byte_stb,  // 1-clk delivered-byte strobe (capture ring)
 	output [7:0]  dbg_flp_raw,      // pre-encoder SDRAM fetch latch (internal drive)
-	// {ism_mode_reg, ism_setup, 8'b0, diskEnableInt, driveSel, devsel_int,
+	// {ism_mode_reg, ism_setup,
+	//  wr_active, wr_arm, anchor_ok, anchor_sector[4:0],   <- bits 15:8
+	//  diskEnableInt, driveSel, devsel_int,
 	//  devsel_ext, selonly_int, ism_mode, motor_reg, 1'b0} — what the driver
 	// actually PROGRAMMED. Needed because the 08-04 capture showed _enable
 	// still high after keying it on the ISM drive-select code, i.e. that code
@@ -158,9 +198,26 @@ module swim
 	reg [3:0]  ism_stage_rd, ism_stage_wr;
 	reg [4:0]  ism_stage_cnt;
 	reg [1:0]  iwm_to_ism_counter; // Mode switch sequence detector
+	// The write path's positional anchor: the sector of the last entry the CPU
+	// POPPED out of the FIFO. Valid once anything has been read since the arm;
+	// a fresh read-arm invalidates it, because the sector it names belongs to a
+	// revolution that is over.
+	reg  [4:0] ism_anchor_sector;
+	reg        ism_anchor_ok;
+	reg        ism_write_arm_d;   // for the write-arm rising edge
 
 	// ISM FIFO entry layout: [7:0] data byte, [8] MARK (A1 sync), [9] CRC token
-	// (CPU write-side placeholder), [10] CRC0 (running CRC == 0 at this byte).
+	// (CPU write-side placeholder), [10] CRC0 (running CRC == 0 at this byte),
+	// [15:11] the SECTOR whose field that byte came from, 1-based.
+	//
+	// ★ THE SECTOR RIDES WITH THE BYTE, and that is the whole point (plan
+	// section 6.1). An MFM data field does not name its sector, so a write is
+	// placed by the ID field the driver last READ - and "last read" means the
+	// byte the CPU actually POPPED, not where the head is now. This ring is 16
+	// deep, so those two are up to 16 byte-times apart by design. UK101 hit the
+	// same bug one byte wide and it was fatal to its verify-reread; ours would
+	// be sixteen bytes wide. Bits 15:11 were free; track and side come from the
+	// drive, so five bits of sector number is the whole anchor.
 	localparam FIFO_B_MARK = 8;
 	localparam FIFO_B_CRC  = 9;
 	localparam FIFO_B_CRC0 = 10;
@@ -169,16 +226,47 @@ module swim
 	reg ca0, ca1, ca2, lstrb, selectExternalDrive, q6, q7;
 	reg ca0Next, ca1Next, ca2Next, lstrbNext, selectExternalDriveNext, q6Next, q7Next;
 	wire advanceDriveHead; // prevents overrun when debugging, does not exit on a real Mac!
-	reg [7:0] writeData;
 	reg [7:0] readDataLatch;
 	assign dbg_iwm_latch = readDataLatch;  // PFLP live view
-	wire _iwmBusy, _writeUnderrun;
-	assign _iwmBusy = 1'b1; // for writes, a value of 1 here indicates the IWM write buffer is empty
-	assign _writeUnderrun = 1'b1;
+
+	// IWM write handshake (plan Phase 3). These were hardwired to 1 -- "buffer
+	// always empty, never underran" -- which is why unhardwiring WRTPRT and
+	// implementing the handshake had to be the same commit: the ROM's write
+	// primitive polls this in an UNBOUNDED loop, so a disk that advertised
+	// itself writable against the old stub would HANG the machine, not fail
+	// the write (plan section 2.1).
+	wire writeBusyInt, writeUnderrunInt;
+	wire writeBusyExt, writeUnderrunExt;
+	wire _iwmBusy       = ~(selectExternalDrive ? writeBusyExt : writeBusyInt);
+	wire _writeUnderrun = ~(selectExternalDrive ? writeUnderrunExt : writeUnderrunInt);
+
 
 	// floppy disk drives
 	reg diskEnableExt, diskEnableInt;
 	reg diskEnableExtNext, diskEnableIntNext;
+
+	// ★ This block sits BELOW the diskEnable* declarations because it reads
+	// them. A reg cannot be implicitly declared, so referencing one before
+	// its declaration is not a warning you can ignore -- it is tool-defined
+	// behaviour, and Quartus need not agree with Verilator about it.
+	// The CPU's byte goes to the drive UNREGISTERED. A registered copy would
+	// lag writeReq by a cycle (MacPlus's note on the same line). dataRegWrite is
+	// a LEVEL held across the access, so it produces several cen-qualified
+	// writeReq pulses for one CPU write; floppy.v's !writeBusyReg guard is what
+	// collapses those to one byte. !ism_mode because stage 1 is GCR only -- the
+	// ISM write engine does not exist yet (plan section 2.4).
+	wire dataRegWrite = (_cpuRW == 1'b0) && selectSWIM && (_cpuUDS == 1'b0) &&
+	                    !ism_mode && ({q7Next, q6Next} == 2'b11) &&
+	                    (diskEnableExt | diskEnableInt);
+	wire writeReqInt = cen && dataRegWrite && !selectExternalDriveNext;
+	wire writeReqExt = cen && dataRegWrite &&  selectExternalDriveNext;
+
+	// IWM Q7 = write mode, the drive's bound on a write AS A WHOLE for the GCR
+	// format relay (plan Phase 6A.3). The REGISTERED q7, not q7Next: this is a
+	// level that must stay up for the whole track, not a per-access decode.
+	// !ism_mode for the same reason dataRegWrite carries it -- in ISM mode the
+	// phase lines are ISM register traffic and q7 means nothing.
+	wire iwmWriteMode = q7 && !ism_mode;
 	wire newByteReadyInt;
 	wire [7:0] readDataInt;
 	wire senseInt = readDataInt[7]; // bit 7 doubles as the sense line here
@@ -189,6 +277,7 @@ module swim
 	// MFM (ISM) read stream from each drive: byte+flags registered at each
 	// 16/32 us delivery, with a one-cep-period strobe (sampled here on cen).
 	wire [7:0] mfm_byte_int, mfm_byte_ext;
+	wire [4:0] mfm_sector_int, mfm_sector_ext;
 	wire mfm_mark_int, mfm_mark_ext, mfm_crc0_int, mfm_crc0_ext;
 	wire mfm_stb_int, mfm_stb_ext;
 
@@ -280,12 +369,30 @@ module swim
 		.SEL(effSEL),
 		.lstrb(lstrb),
 		._enable(ism_mode ? ~ism_selonly_int : ~(diskEnableInt & driveSel)),
-		.writeData(writeData),
+		.writeData(dataInLo),          // live bus value, not a register
+		.writeReq(writeReqInt),
+		.writeMode(iwmWriteMode),
+		.writeProtect(writeProtect[0]),
+		.writeBusy(writeBusyInt),
+		.writeUnderrun(writeUnderrunInt),
+		.wrSecValid(),
+		.wrSecNum(),
+		.wrSecAddr(),
+		.wrSdAddr(wrSdAddr),
+		.wrSdData(wrSdData),
+		.wrSdReq(wrSdReq),
+		.wrSdAck(wrSdAck),
+		.wrCommitDone(wrCommitDone),
+		.wrCommitAddr(wrCommitAddr),
+		.wrSdBufAddr(wrSdBufAddr),
+		.wrSdBufData(wrSdBufData),
+		.wrSdBufWr(wrSdBufWr),
 		.readData(readDataInt),
 		.advanceDriveHead(advanceDriveHead),
 		.newByteReady(newByteReadyInt),
 		.insertDisk(insertDisk[0]),
 		.diskSides(diskSides[0]),
+		.mediaSides(mediaSides[0]),
 		.diskEject(diskEject[0]),
 
 		.motor(diskMotor[0]),
@@ -300,6 +407,13 @@ module swim
 		.mfm_disk(diskMFM[0]),
 		.mfm_hd(diskHD[0]),
 		.mfm_byte(mfm_byte_int),
+		.mfm_sector(mfm_sector_int),
+		.mfm_wr_byte(mfm_wr_byte),
+		.mfm_wr_mark(mfm_wr_mark),
+		// only this drive's own write engine may reach it
+		.mfm_wr_stb(mfm_wr_stb && !ism_devsel_ext),
+		.mfm_wr_anchor(ism_anchor_sector),
+		.mfm_wr_anchor_ok(ism_anchor_ok),
 		.mfm_mark(mfm_mark_int),
 		.mfm_crc0(mfm_crc0_int),
 		.mfm_stb(mfm_stb_int),
@@ -323,7 +437,10 @@ module swim
 		.dbg_mfm_stall_cnt(dbg_mfm_stall[7:0])
 	);
 
-	floppy floppyExt
+	// ★ WRITE_SUPPORT(0): the LC has no external floppy port and this drive
+	// never has media, so its write path could never fire. Instantiated it
+	// still cost a decoder -- see the parameter's comment in floppy.v.
+	floppy #(.WRITE_SUPPORT(0)) floppyExt
 	(
 		.clk(clk),
 		.cep(cep),
@@ -336,12 +453,31 @@ module swim
 		.SEL(effSEL),
 		.lstrb(lstrb),
 		._enable(ism_mode ? ~ism_selonly_ext : ~diskEnableExt),
-		.writeData(writeData),
+		.writeData(dataInLo),          // live bus value, not a register
+		.writeReq(writeReqExt),
+		// WRITE_SUPPORT(0): no write path, so nothing consumes this.
+		.writeMode(1'b0),
+		.writeProtect(writeProtect[1]),
+		.writeBusy(writeBusyExt),
+		.writeUnderrun(writeUnderrunExt),
+		.wrSecValid(),
+		.wrSecNum(),
+		.wrSecAddr(),
+		.wrSdAddr(),
+		.wrSdData(),
+		.wrSdReq(),
+		.wrSdAck(1'b0),
+		.wrCommitDone(),
+		.wrCommitAddr(),
+		.wrSdBufAddr(),
+		.wrSdBufData(),
+		.wrSdBufWr(),
 		.readData(readDataExt),
 		.advanceDriveHead(advanceDriveHead),
 		.newByteReady(newByteReadyExt),
 		.insertDisk(insertDisk[1]),
 		.diskSides(diskSides[1]),
+		.mediaSides(mediaSides[1]),
 		.diskEject(diskEject[1]),
 
 		.motor(diskMotor[1]),
@@ -356,6 +492,13 @@ module swim
 		.mfm_disk(diskMFM[1]),
 		.mfm_hd(diskHD[1]),
 		.mfm_byte(mfm_byte_ext),
+		.mfm_sector(mfm_sector_ext),
+		// WRITE_SUPPORT(0) and never any media: the stream is tied off
+		.mfm_wr_byte(8'h00),
+		.mfm_wr_mark(1'b0),
+		.mfm_wr_stb(1'b0),
+		.mfm_wr_anchor(5'd1),
+		.mfm_wr_anchor_ok(1'b0),
 		.mfm_mark(mfm_mark_ext),
 		.mfm_crc0(mfm_crc0_ext),
 		.mfm_stb(mfm_stb_ext)
@@ -371,12 +514,106 @@ module swim
 	wire mfm_mark_sel = ism_devsel_ext ? mfm_mark_ext : mfm_mark_int;
 	wire mfm_crc0_sel = ism_devsel_ext ? mfm_crc0_ext : mfm_crc0_int;
 	wire mfm_stb_sel  = ism_devsel_ext ? mfm_stb_ext  : mfm_stb_int;
+	wire [4:0] mfm_sector_sel = ism_devsel_ext ? mfm_sector_ext : mfm_sector_int;
 	wire ism_sense    = ism_devsel_ext ? senseExt : senseInt;
 	// ISM read armed: (mode & 0x18) == 0x08 (ACTION on, WRITE off) — swim1.cpp.
 	wire ism_arm = ism_mode && ism_mode_reg[3] && !ism_mode_reg[4];
 	// MFM delivery additionally requires the MFM read datapath (Setup bit2=0
 	// selects MFM vs GCR on the READ side — swim1.cpp:377).
 	wire ism_read_active = ism_arm && !ism_setup[2];
+
+	// ── ISM WRITE, the mirror of the above ─────────────────────────────
+	// swim1.cpp ism_write(): write mode is entered when (mode & 0x18) becomes
+	// 0x18 — ACTION *and* WRITE, not WRITE alone — and left when it stops being
+	// 0x18. Setup bit6 is the WRITE-side datapath select (TSM/GCR), the twin
+	// of bit2 on the read side, so an MFM write needs it CLEAR; a GCR write
+	// would be a different engine and is not stage 2.
+	wire ism_write_arm    = ism_mode && ism_mode_reg[3] && ism_mode_reg[4];
+	wire ism_write_active = ism_write_arm && !ism_setup[6];
+	assign mfm_wr_active  = ism_write_active;
+
+	// The medium's byte cadence. Deliberately the SAME tick the read path is
+	// paced by (floppy.v's mfm_timer, 129/259 cep periods = 16/32 us), not a
+	// second timer: the disk turns at one rate whichever direction the data
+	// is going, and one source cannot drift against itself. It keeps ticking
+	// in write mode because floppy.v gates it on spinning, not on read.
+	// mfm_stb is a LEVEL one cep period wide (MEASURED: 4 clk cycles, at
+	// clk8_en_p = busPhase==3), not a 1-clk pulse, so the byte-time tick
+	// edge-detects it. Driving the engine from the level would run it four
+	// times per byte time and write every byte four times over.
+	reg  ism_wr_stb_d;
+	always @(posedge clk) ism_wr_stb_d <= mfm_stb_sel;
+
+	// ★ THE VOID CADENCE (Phase 6 gate 4a, 2026-09-19). floppy.v's byte timer
+	// runs only while `mfm_spinning`, and that term needs `mfm_disk`. An
+	// 819,200-byte image is GCR by size, so when the guest erases it as DOS
+	// 720K the driver arms this engine over a disk whose timer never runs:
+	// no tick, no pop, and the ROM's format loop at $A6F130 polls Handshake
+	// b7 (FIFO SPACE - it tests nothing else) forever against the two gap
+	// bytes it primed. That is a hard hang, seen on hardware (fit c447fbe9).
+	// An underrun is NOT the answer: it clears ACTION but leaves the FIFO
+	// full, so b7 stays 0 and the poll never exits (tb_swim_ism_arm §6 ends
+	// in exactly that state). The engine has to keep POPPING at the byte
+	// cadence with no medium behind it, as a real drive keeps turning under
+	// a write the media does not take: nothing commits, because floppy.v's
+	// wrIsMfm mux only takes MFM sectors for an MFM file, and the ROM's own
+	// 13,500-byte wait-for-index timeout ends the erase with an error - the
+	// mirror of the 720K-erased-as-800K direction, which fails its verify
+	// for the same reason. So: when the SELECTED drive's disk is not MFM, a
+	// local timer at the DD cadence (a GCR disk is DD media) paces the
+	// engine instead. The two sources are exclusive by diskMFM, so an MFM
+	// disk is never double-ticked. Proven by tb_swim_ism_arm §7, which
+	// reproduces the hang against the RTL without this block.
+	wire ism_sel_mfm = ism_devsel_ext ? diskMFM[1] : diskMFM[0];
+	wire ism_void    = ism_write_active && !ism_sel_mfm;
+	reg  [8:0] ism_void_timer;
+	reg        ism_void_tick;
+	always @(posedge clk) begin
+		ism_void_tick <= 1'b0;
+		if (!ism_void)
+			ism_void_timer <= WR_VOID_PERIOD;
+		else if (cep) begin
+			if (ism_void_timer != 9'd0)
+				ism_void_timer <= ism_void_timer - 9'd1;
+			else begin
+				ism_void_timer <= WR_VOID_PERIOD;
+				ism_void_tick  <= 1'b1;
+			end
+		end
+	end
+	wire ism_wr_tick = ism_write_active &&
+	                   ((mfm_stb_sel && !ism_wr_stb_d) || ism_void_tick);
+
+	wire        ism_wr_pop;
+	wire        ism_wr_underrun;
+	// ★ THE ENGINE'S POP AND UNDERRUN ARE 1-CLK PULSES, AND THE BLOCK THAT
+	// ACTS ON THEM RUNS ON cen (one clk in four). They are held here until
+	// that block takes them, so the handshake does not depend on which clk
+	// the pulse happens to land on. Before this latch it worked only because
+	// the tick fires the clk after cep and the engine's registered pulse then
+	// landed exactly on cen - an alignment nothing stated or checked. A mutant
+	// that delayed the pop by ONE more clk lost every pop AND the underrun
+	// that should have stopped the write: tb_swim_ism_arm saw 22,475 bytes
+	// reach the medium for a 528-byte field, nothing committed, ACTION never
+	// cleared (review 2026-09-17). A pulse ON a cen clk is consumed directly
+	// and never held; one between cen clks waits at most three.
+	reg  ism_wr_pop_p, ism_wr_unr_p;
+	always @(posedge clk) begin
+		ism_wr_pop_p <= cen ? 1'b0 : (ism_wr_pop_p | ism_wr_pop);
+		ism_wr_unr_p <= cen ? 1'b0 : (ism_wr_unr_p | ism_wr_underrun);
+	end
+	wire ism_wr_pop_now = ism_wr_pop      | ism_wr_pop_p;
+	wire ism_wr_unr_now = ism_wr_underrun | ism_wr_unr_p;
+	ism_write_engine ism_wr (
+		.clk(clk), .rst(~_reset),
+		.active(ism_write_active),
+		.tick(ism_wr_tick),
+		.q_word(ism_fifo[0]),
+		.q_empty(ism_fifo_pos == 2'd0),
+		.q_pop(ism_wr_pop),
+		.o_byte(mfm_wr_byte), .o_mark(mfm_wr_mark), .o_stb(mfm_wr_stb),
+		.underrun(ism_wr_underrun)
+	);
 
 	always @(posedge clk) begin
 		dbg_err_d <= ism_error;
@@ -569,7 +806,17 @@ module swim
 		end
 	end
 	assign dbg_ism_scan = {scw_run, scw_hunt_ms, scw_par, scw_gap_us};
-	assign dbg_ism_state = {ism_mode_reg, ism_setup, 8'b0,
+	// ★ BITS 15:8 ARE THE MFM WRITE WITNESS (stage 2), in what used to be a
+	// dead 8'b0 field. The ANCHOR is the riskiest signal in the write path -
+	// plan section 6.1's whole argument is that placing a write by the wrong
+	// position fails SILENTLY and, in UK101's case, destructively - and until
+	// now it was observable nowhere on hardware. If a sector lands somewhere
+	// unexpected, these bits say whether the anchor was valid and what it
+	// named, which separates "the anchor was wrong" from "everything
+	// downstream of the anchor was wrong". Read over JTAG as probe PISM.
+	assign dbg_ism_state = {ism_mode_reg, ism_setup,
+	                        ism_write_active, ism_write_arm,
+	                        ism_anchor_ok, ism_anchor_sector,
 	                        diskEnableInt, driveSel, ism_devsel_int, ism_devsel_ext,
 	                        ism_selonly_int, ism_mode, diskEnableExt, 1'b0};
 
@@ -598,11 +845,22 @@ module swim
 	                     acc_addr_l[2:0] == 3'h2);
 	wire ism_gen_push = ism_read_active && mfm_stb_sel &&
 	                    (mfm_synced || mfm_mark_sel);
-	wire [15:0] ism_gen_word = {5'b0, mfm_crc0_sel, 1'b0, mfm_mark_sel, mfm_byte_sel};
+	wire [15:0] ism_gen_word = {mfm_sector_sel, mfm_crc0_sel, 1'b0, mfm_mark_sel, mfm_byte_sel};
 	// staging flow control: push on delivery (unless full), drain into the
 	// 2-entry FIFO on quiet cycles (CPU FIFO events only fire at acc_end)
 	wire stage_push  = ism_gen_push && (ism_stage_cnt != 5'd16);
-	wire stage_drain = (ism_stage_cnt != 5'd0) && (ism_fifo_pos < 2'd2) && !acc_end;
+	// ★ THE RING IS A READ-SIDE STRUCTURE AND MUST STOP AT THE WRITE ARM.
+	// Without the `!ism_write_arm` term, bytes still staged from the read
+	// phase keep refilling the CPU FIFO during a write: the engine then never
+	// sees an empty queue, never underruns, and streams STALE READ DATA onto
+	// the medium behind the bytes the guest pushed. Found by
+	// verilator/tb_swim_ism_arm.v section 5 - 29,801 bytes reached the medium
+	// for a 528-byte field, with zero underruns, and nothing committed.
+	// The ring is also emptied on the arm edge below, so nothing survives the
+	// transition; MAME has no ring at all (its FIFO is the whole buffer, and
+	// the driver clears it with Mode bit0), so this is ours to get right.
+	wire stage_drain = (ism_stage_cnt != 5'd0) && (ism_fifo_pos < 2'd2) &&
+	                   !acc_end && !ism_write_arm;
 	wire [15:0] ism_cpu_word = (acc_addr_l[2:0] == 3'h2) ? 16'h0200 :
 	                           (acc_addr_l[2:0] == 3'h1) ? {7'b0, 1'b1, acc_data_l} :
 	                                                       {8'b0, acc_data_l};
@@ -778,7 +1036,6 @@ module swim
 	always @(posedge clk or negedge _reset) begin
 		if (_reset == 1'b0) begin
 			iwmMode <= 0;
-			writeData <= 0;
 			ism_mode <= 0;
 			ism_mode_reg <= 0;
 			ism_setup <= 0;
@@ -789,6 +1046,9 @@ module swim
 			iwm_to_ism_counter <= 0;
 			ism_fifo[0] <= 0;
 			ism_fifo[1] <= 0;
+			ism_anchor_sector <= 5'd1;
+			ism_anchor_ok     <= 1'b0;
+			ism_write_arm_d   <= 1'b0;
 			// IWM bit registers (merged here to avoid multiple drivers)
 			ca0 <= 0;
 			ca1 <= 0;
@@ -827,9 +1087,10 @@ module swim
 			// it keys on offset-0xF accesses (F1), see below.
 			if (_cpuRW == 0 && selectSWIM == 1'b1 && _cpuUDS == 1'b0 && !ism_mode) begin
 				if ({q7Next,q6Next} == 2'b11) begin
-					if (diskEnableExt | diskEnableInt)
-						writeData <= dataInLo;
-					else
+					// with a drive enabled the byte belongs to the DRIVE, and it
+					// travels there live via dataRegWrite/dataInLo above rather than
+					// through a register here -- nothing ever read that register.
+					if (!(diskEnableExt | diskEnableInt))
 						iwmMode <= dataInLo[4:0];
 				end
 			end
@@ -851,6 +1112,14 @@ module swim
 				// ISM behind the driver's back. Resetting early is harmless: the
 				// deliberate switch sequence is four consecutive 0xF writes.
 				if (!ism_mode && cpuAddrRegHi != 4'hF) iwm_to_ism_counter <= 0;
+			end
+
+			// the engine's underrun: error b0 (MAME's write-side code, and
+			// only if nothing is pending already - `&& !m_ism_error`) and
+			// ACTION off, so the write stops itself as the hardware does
+			if (ism_wr_unr_now) begin
+				if (ism_error == 8'd0) ism_error[0] <= 1'b1;
+				ism_mode_reg[3] <= 1'b0;
 			end
 
 			// ============================================================
@@ -881,13 +1150,34 @@ module swim
 				ism_fifo_pos <= ism_fifo_pos + 2'd1;
 				ism_stage_rd <= ism_stage_rd + 4'd1;
 			end
+			// FIFO movement. The engine pop and a CPU push can land on the
+			// same cycle - the guest refills against Handshake b7 while the
+			// head keeps turning - so they are resolved TOGETHER rather than
+			// as an if/else. Getting that wrong loses the pushed byte and
+			// reports a spurious overrun, which on a write is a torn sector.
 			if (ism_pop_req) begin
 				if (ism_fifo_pos != 0) begin
 					ism_fifo[0]  <= ism_fifo[1];
 					ism_fifo_pos <= ism_fifo_pos - 2'd1;
+					// ★ THE ANCHOR, captured from the entry the guest is
+					// actually taking. Not the live head, not the ring's newest
+					// entry - the byte the driver has in its hand. See the FIFO
+					// layout comment above and plan section 6.1.
+					ism_anchor_sector <= ism_fifo[0][15:11];
+					ism_anchor_ok     <= 1'b1;
 					if (acc_addr_l[2:0] == 3'h0 && ism_fifo[0][FIFO_B_MARK]) ism_error[1] <= 1'b1;
 				end else
 					ism_error[2] <= 1'b1;          // underrun
+			end
+			else if (ism_wr_pop_now && ism_cpu_push) begin
+				// one out, one in: the survivor shifts down and the new word
+				// lands behind it, so the level is unchanged
+				ism_fifo[0] <= ism_fifo[1];
+				ism_fifo[ism_fifo_pos - 2'd1] <= ism_cpu_word;
+			end
+			else if (ism_wr_pop_now) begin
+				ism_fifo[0]  <= ism_fifo[1];
+				ism_fifo_pos <= ism_fifo_pos - 2'd1;
 			end
 			else if (ism_cpu_push) begin
 				if (ism_fifo_pos < 2'd2) begin
@@ -998,6 +1288,30 @@ module swim
 			// the mark hunt and empties the FIFO — the per-field re-arm the
 			// driver performs 18+ times per revolution.
 			ism_arm_d <= ism_arm;
+			// A read-arm restarts the shift register and the hunt, so anything
+			// the anchor named belongs to a revolution that is over.
+			if (ism_arm && !ism_arm_d) ism_anchor_ok <= 1'b0;
+			// Entering WRITE empties the STAGING RING: whatever it still holds
+			// was delivered by the head on the way past and has no business
+			// reaching the medium (see stage_drain).
+			//
+			// ★ THE CPU FIFO IS NOT TOUCHED, and that distinction is the whole
+			// point. The driver PRE-FILLS the FIFO and only then sets WRITE,
+			// because an engine armed against an empty FIFO underruns on its
+			// very next byte-time and stops the write. An earlier version of
+			// this cleared ism_fifo_pos here too and threw away exactly those
+			// primed bytes: the first tick underran, error 0x01, ACTION
+			// cleared, and the guest then polled Handshake b7 forever against
+			// an engine that had already disarmed. Caught by
+			// verilator/tb_swim_ism_arm.v section 5.
+			//
+			// The anchor also SURVIVES - it is what places the write.
+			ism_write_arm_d <= ism_write_arm;
+			if (ism_write_arm && !ism_write_arm_d) begin
+				ism_stage_rd  <= 4'd0;
+				ism_stage_wr  <= 4'd0;
+				ism_stage_cnt <= 5'd0;
+			end
 			if (ism_arm && !ism_arm_d) begin
 				mfm_synced   <= 1'b0;
 				ism_fifo_pos <= 0;

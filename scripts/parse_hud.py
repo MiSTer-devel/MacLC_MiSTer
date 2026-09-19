@@ -144,9 +144,23 @@ def decode(words):
         m = w[9]
         mode, setup = m >> 24, (m >> 16) & 0xFF
         rej = m & 0x1FF
+        wr_active = (m >> 15) & 1
+        anchor_ok = (m >> 14) & 1
+        anchor    = (m >> 9) & 0x1F
         print(f"  w9 MODE={mode:#04x} [motor={mode >> 7} ism={(mode >> 6) & 1} "
               f"hdsel={(mode >> 5) & 1} write={(mode >> 4) & 1} action={(mode >> 3) & 1} "
               f"drvsel={(mode >> 1) & 3:02b} clrfifo={mode & 1}]  SETUP={setup:#04x}")
+        # MFM write witness (stage 2). The ANCHOR is what places every MFM
+        # write: an MFM data field does not name its sector, so the write goes
+        # where the ID field the CPU last POPPED said it should. Wrong anchor =
+        # a well-formed sector written to the wrong place, silently.
+        print(f"     MFM write: engine={'ACTIVE' if wr_active else 'idle'}  "
+              f"anchor={'sector %d' % anchor if anchor_ok else 'INVALID'}")
+        if wr_active and not anchor_ok:
+            print("     ** ENGINE ARMED WITH NO ANCHOR - a data field with no "
+                  "in-stream ID field will be REFUSED, not placed **")
+        if anchor_ok and not (1 <= anchor <= 18):
+            print(f"     ** ANCHOR {anchor} IS OFF THE MEDIUM (1..18 HD / 1..9 DD) **")
         if rej & 0x100:
             print(f"     ** REJECTED STEPS: {rej & 0xFF} "
                   f"(well-formed STEP dropped because _enable was high)")

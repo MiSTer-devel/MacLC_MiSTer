@@ -19,8 +19,86 @@ Checks, in the order the guest File Manager would trip over them:
 Usage: hfs_check.py <image> [--dump-dir DIR]
 Exit 0 = volume is internally consistent.
 """
+import os
 import struct
 import sys
+
+
+class LazySlice:
+    """A bytes-like view onto [base, base+size) of a file, read on demand."""
+
+    def __init__(self, path, base, size):
+        self.f = open(path, 'rb')
+        self.base = base
+        self.size = size
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            a, b, _ = k.indices(self.size)
+            self.f.seek(self.base + a)
+            return self.f.read(max(0, b - a))
+        self.f.seek(self.base + k)
+        return self.f.read(1)[0]
+
+
+def dc42_checksum(b):
+    """DiskCopy 4.2: add each big-endian 16-bit word into a 32-bit
+    accumulator, rotating right by one bit after each add (mk_dc42.py)."""
+    s = 0
+    for i in range(0, len(b) - 1, 2):
+        s = (s + ((b[i] << 8) | b[i + 1])) & 0xFFFFFFFF
+        s = ((s >> 1) | ((s & 1) << 31)) & 0xFFFFFFFF
+    return s
+
+
+def open_volume(path, quiet=False):
+    """Return (bytes-like HFS volume, container name), detecting the container.
+
+    Added 2026-09-18: the MFM soak's DC42 half could not be checked at all
+    because this script read the MDB at a fixed 1024 and a DC42 puts it 84
+    bytes later -- it just reported "not HFS: MDB sig 0x0000". Lives here
+    rather than in hfs_fork_diff.py so both tools share one implementation
+    and the dependency runs one way.
+    """
+    size = os.path.getsize(path)
+    head = open(path, 'rb').read(2048)
+
+    # DiskCopy 4.2 -- the CORE's detection rule (rtl/floppy_loader.v:166-170)
+    if size > 84 and 1 <= head[0] <= 63 and head[82] == 0x01 and head[83] == 0x00:
+        dsz, tsz, dck, tck = struct.unpack('>IIII', head[64:80])
+        if 84 + dsz + tsz == size:
+            payload = LazySlice(path, 84, dsz)
+            if not quiet:
+                got = dc42_checksum(payload[0:dsz])
+                print("DC42 container: payload %d B, tags %d B, data checksum "
+                      "stored %08x / recomputed %08x  %s"
+                      % (dsz, tsz, dck, got,
+                         "OK" if got == dck else "*** MISMATCH ***"))
+            return payload, "DC42"
+
+    # Apple Partition Map (a .vhd) -- first Apple_HFS partition
+    if head[0:2] == b'ER':
+        blk = be16(head, 2) or 512
+        with open(path, 'rb') as f:
+            for i in range(1, 64):
+                f.seek(i * blk)
+                p = f.read(blk)
+                if len(p) < 96 or p[0:2] != b'PM':
+                    break
+                start = be32(p, 8) * blk
+                nblk = be32(p, 12) * blk
+                ptype = p[48:80].split(b'\x00')[0].decode('ascii', 'replace')
+                if ptype == 'Apple_HFS':
+                    if not quiet:
+                        print("Apple Partition Map: Apple_HFS at byte %d, %d B"
+                              % (start, nblk))
+                    return LazySlice(path, start, nblk), "APM"
+        raise SystemExit("partition map has no Apple_HFS partition")
+
+    return LazySlice(path, 0, size), "raw"
 
 
 def be16(b, o):
@@ -193,7 +271,7 @@ class HFS:
 
 def main():
     path = sys.argv[1]
-    img = open(path, 'rb').read()
+    img = open_volume(path)[0]      # raw / DC42 / Apple Partition Map
     v = HFS(img)
     nfiles = 0
     for parent, name, d in v.files() or []:
@@ -238,4 +316,5 @@ def main():
     sys.exit(0)
 
 
-main()
+if __name__ == '__main__':      # importable: scripts/hfs_fork_diff.py reuses HFS
+    main()
