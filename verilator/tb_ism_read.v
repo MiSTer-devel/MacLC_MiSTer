@@ -84,6 +84,7 @@ module tb_ism_read;
 		.insertDisk(2'b01),      // internal drive: disk in
 		.diskEject(),
 		.diskSides(2'b01),
+		.mediaSides(2'b11),   // medium unknown: never lowers the ceiling
 		.diskMFM(2'b01),         // internal disk is MFM
 		.diskHD(2'b01),          // ... and 1.44MB HD
 		.diskMotor(), .diskAct(),

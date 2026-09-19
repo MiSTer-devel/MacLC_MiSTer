@@ -50,7 +50,7 @@ module tb_sense;
 		.selectSWIM(selectSWIM), ._cpuRW(_cpuRW), ._cpuUDS(_cpuUDS),
 		.dataIn(dataIn), .cpuAddrRegHi(cpuAddrRegHi),
 		.SEL(SEL), .driveSel(driveSel), .dataOut(dataOut),
-		.insertDisk(2'b01), .diskEject(), .diskSides(2'b01),
+		.insertDisk(2'b01), .diskEject(), .diskSides(2'b01), .mediaSides(2'b11),
 		.diskMFM(2'b01), .diskHD(2'b01),
 		.diskMotor(), .diskAct(),
 		.dskReadAddrInt(dskReadAddrInt), .dskReadAckInt(dskReadAckInt),

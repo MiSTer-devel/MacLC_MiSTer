@@ -128,6 +128,8 @@ module tb_disk_swap;
 		.newByteReady(),
 		.insertDisk(dsk_int_ins),
 		.diskSides(dsk_int_ds),
+		.mediaSides(1'b1),      // medium unknown: never lowers the ceiling
+		.writeMode(1'b0),       // IWM Q7: no write mode in this bench
 		.diskEject(diskEject[0]),
 		.motor(), .act(),
 		.dskReadAddr(), .dskReadAck(1'b0), .dskReadData(8'h00),

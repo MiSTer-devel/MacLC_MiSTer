@@ -80,8 +80,15 @@ module emu
 	localparam CONF_STR = {
 		"MACLC;UART57600:115200,MIDI;",
 		"-;",
-		"F1,DSKIMG,Mount Pri Floppy;",
-		"F2,DSKIMG,Mount Sec Floppy;",
+		"S6,DSKIMG,Mount Floppy;",
+		// Default OFF, and it must stay that way (plan section 6.4): the ROM's
+		// write primitive polls the IWM handshake in an UNBOUNDED loop, so the
+		// failure mode of a write bug here is a HUNG machine, not a failed write.
+		// Bit clear (0) = first entry = Off. Gated further in flp_int_wp below --
+		// a read-only mount stays write-protected whatever this says. A DC42
+		// does NOT: there is no container term (owner's ruling 2026-09-15,
+		// plan section 6.2) -- see the flp_int_wp comment.
+		"OE,Floppy Write,Off,On;",
 		"-;",
 		"SC0,IMGVHDHDA,Mount SCSI-0;",
 		"SC1,IMGVHDHDA,Mount SCSI-1;",
@@ -208,7 +215,27 @@ module emu
 	localparam VD_TOOLBOX = 3;         // BlueSCSI Toolbox shared folder -> hps_io slot 3
 	localparam VD_CDROM   = 4;         // CD-ROM image (SCSI ID 3) -> hps_io slot 4
 	localparam VD_CD_TOOLBOX = 5;      // BlueSCSI Toolbox CD Changer control -> hps_io slot 5
-	localparam VDNUM      = 6;         // total hps_io block devices
+	// Phase 1 (2026-09-14): floppies became block devices. They take NEW
+	// indices deliberately — every device above keeps the slot it already
+	// had, so a user's saved mounts (config/MacLC.sN) still resolve after the
+	// upgrade. Do not renumber these to "tidy up".
+	localparam VD_FLOPPY_INT = 6;      // floppy image -> hps_io slot 6
+	localparam VDNUM      = 7;         // total hps_io block devices
+
+	// ★ WHY VDNUM STOPS AT 7 — the second floppy was removed 2026-09-15 and
+	// this is the reason not to reach past slot 6 casually. Main notifies a
+	// mount with one word, (1 << slot) | 0x80-if-read-only, and hps_io.sv
+	// decodes it as img_mounted <= io_din[VDNUM-1:0] AND img_readonly <=
+	// io_din[7]. At VDNUM > 7 bit 7 is delivered as BOTH the read-only flag
+	// and slot 7, so every read-only mount anywhere (the CD, the two Toolbox
+	// announces, which fire on EVERY core start) pulses img_mounted[7]. The
+	// first Phase 1 fit put the external floppy there: its loader started on
+	// a slot with no image, Main served zero blocks, the 24-bit write address
+	// wrapped over guest RAM and the ROM, and the machine hung right after
+	// the boot chime. Slot 8 dodges that but needs Main to send the word
+	// 16-bit (fork user_io.cpp / mac.cpp spi_uio_cmd16 — an 8-bit send
+	// truncates 1<<8 to 0, which hps_io maps to slot 0 = SCSI-0). At VDNUM 7
+	// neither hazard exists and the stock Main is enough for floppies.
 
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
@@ -227,6 +254,7 @@ module emu
 	wire                  sd_buff_wr;
 	wire  [VDNUM-1:0] img_mounted;
 	wire           [63:0] img_size;
+	wire                  img_readonly;   // valid only at the active img_mounted bit
 
 	// SCSI side (slots 0,1): separate buses driven by dataController, stitched into
 	// the shared hps_io buses so the PRAM save image (slot 2) can coexist.
@@ -538,6 +566,7 @@ module emu
 		
 		.img_mounted(img_mounted),
 		.img_size(img_size),
+		.img_readonly(img_readonly),
 
 		.ioctl_download(dio_download),
 		.ioctl_index(dio_index),
@@ -1381,10 +1410,10 @@ module emu
 
 	// Forward declarations: assigned with the rest of the disk-mount state
 	// further down; needed here for addrController's flp_present gate.
-	wire dsk_int_ins, dsk_ext_ins;
+	wire dsk_int_ins;
 	addrController_top ac0
 	(
-		.flp_present(dsk_int_ins | dsk_ext_ins),
+		.flp_present(dsk_int_ins),
 		.clk(clk_sys),
 		.clk8(clk8),
 		.clk8_en_p(clk8_en_p),
@@ -1833,9 +1862,13 @@ module emu
 			// cstin_edges[3:0], park1[7:0], park6[7:0]}.
 			hud_w7 <= dbg_flp_media;
 			hud_w8 <= {dbg_mfm_stall_w, hud_e81_cnt};
-			hud_w9 <= {dbg_ism_state[31:16], 7'b0, dbg_flp_rej_step};
+			// [31:16] Mode+Setup as before; the 7 bits that were 0 now carry
+			// the MFM write witness (see the PISM probe comment):
+			// [15] wr_active [14] anchor_ok [13:9] anchor_sector.
+			hud_w9 <= {dbg_ism_state[31:16], dbg_ism_state[15],
+			           dbg_ism_state[13:8], dbg_flp_rej_step};
 			hud_w10 <= hud_e142_pos;
-			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, dsk_ext_ins,
+			hud_w11 <= {dbg_flp_status, 6'b0, dsk_int_ins, 1'b0,
 			             dbg_flp_disk_data, dbg_flp_raw};
 			hud_w12 <= {5'b0, _cpuIPL_dc, hud_lastaddr};
 			hud_w13 <= {8'h00, hud_prevaddr};
@@ -2199,6 +2232,21 @@ module emu
 	// Forward declaration: the floppy fetch byte is assigned further down,
 	// after the SDRAM instantiation that produces sdram_out.
 	wire [15:0] extra_rom_data_demux;
+	// Declared here and ASSIGNED further down, where flp_int_ro/flp_int_raw
+	// exist: used before any declaration, SystemVerilog would implicitly
+	// create a 1-bit net here and the later `wire ... =` would collide.
+	wire flp_int_wp;
+	wire [21:0] wc_addr;      // image BYTE offset from the committer
+	wire [15:0] wc_data;
+	wire        wc_req, wc_done;
+	wire        wc_ack;
+	// Persistence tap (Phase 4): the committer's mirror of the same word
+	// stream, shadowed by floppy_sd_writer below and pushed out to the .dsk.
+	wire [21:0] wc_commit_addr;
+	wire  [7:0] wc_buf_addr;
+	wire [15:0] wc_buf_data;
+	wire        wc_buf_wr;
+
 	dataController_top dataController (
 		.clk32(clk_sys),
 		.clk8_en_p(clk8_en_p),
@@ -2278,10 +2326,23 @@ module emu
 
 
 		// floppy disk interface
-		.insertDisk({dsk_ext_ins, dsk_int_ins}),
-		.diskSides({dsk_ext_ds, dsk_int_ds}),
-		.diskMFM({dsk_ext_mfm, dsk_int_mfm}),
-		.diskHD({dsk_ext_hd, dsk_int_hd}),
+		// Drive 1 (the external port) has no image source since the second
+		// floppy was removed: swim.v still instantiates floppyExt, and it
+		// reports an empty drive exactly as it did with nothing mounted —
+		// the state the Sony driver's benign -65 polling already covers.
+		.insertDisk({1'b0, dsk_int_ins}),
+		.writeProtect({1'b1, flp_int_wp}),   // drive 2 has no media: always locked
+		.wrSdAddr(wc_addr), .wrSdData(wc_data),
+		.wrSdReq(wc_req),   .wrSdAck(wc_ack),
+		.wrCommitDone(wc_done),
+		.wrCommitAddr(wc_commit_addr),
+		.wrSdBufAddr(wc_buf_addr), .wrSdBufData(wc_buf_data), .wrSdBufWr(wc_buf_wr),
+		.diskSides({1'b0, dsk_int_ds}),
+		// The external drive never has media; 1 is "unknown", the term that
+		// never lowers the ceiling.
+		.mediaSides({1'b1, flp_int_media_ds}),
+		.diskMFM({1'b0, dsk_int_mfm}),
+		.diskHD({1'b0, dsk_int_hd}),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -2386,21 +2447,25 @@ module emu
 	wire dio_download;
 	wire [23:0] dio_addr = ioctl_addr[24:1];  // word address from byte address
 	wire  [7:0] dio_index;
-	// MiSTer Main encodes the MATCHED EXTENSION of a multi-extension F entry
-	// in the upper bits of ioctl_index (menu index in the low bits): an F1
-	// pick of a .dsk arrives as 8'h01 but a .img as 8'h41. The mount-flag
-	// latches below compared the FULL byte, so a .img mount downloaded into
-	// SDRAM (the write path already masks [1:0]) yet never presented a disk —
-	// a silent no-op mount, latent since the beginning. Found 2026-08-06
-	// driving the swap gates: Fetch GCR800K.dsk presented and read while
-	// Install7-1 D1/D2.img downloaded and vanished. Compare the MENU index.
-	wire  [5:0] dio_menu = dio_index[5:0];
+	// ── dio_menu is GONE with the block-device conversion (Phase 1) ───────
+	// It existed because MiSTer Main encodes the MATCHED EXTENSION of a
+	// multi-extension F entry in the upper bits of ioctl_index: an F1 pick of
+	// a .dsk arrived as 8'h01 but a .img as 8'h41, and the mount-flag latches
+	// compared the FULL byte — so every .img mount downloaded into SDRAM and
+	// then never presented a disk. A silent no-op, latent from the beginning,
+	// found 2026-08-06 driving the swap gates (Fetch GCR800K.dsk read fine
+	// while Install7-1 D1/D2.img vanished).
+	//
+	// The class cannot recur for floppies: an S mount slot delivers
+	// img_mounted/img_size, with no index to mis-compare. KEEP THIS NOTE — if
+	// an F entry with multiple extensions is ever added back for anything,
+	// compare dio_index[5:0], never the whole byte.
 
 	// good floppy image sizes are 819200 bytes and 409600 bytes
-	reg dsk_int_ds, dsk_ext_ds;
-	reg dsk_int_ss, dsk_ext_ss;  // single sided image inserted
-	reg dsk_int_mfm, dsk_ext_mfm;  // MFM-format image (ISM/SWIM path): 720K or 1.44MB
-	reg dsk_int_hd,  dsk_ext_hd;   // 1.44MB HD (vs 720K DD)
+	reg dsk_int_ds;
+	reg dsk_int_ss;   // single sided image inserted
+	reg dsk_int_mfm;  // MFM-format image (ISM/SWIM path): 720K or 1.44MB
+	reg dsk_int_hd;   // 1.44MB HD (vs 720K DD)
 
 	// DiskCopy 4.2 (.dsk/.image) support: an 84-byte (42-word) header precedes
 	// the raw logical-order sector data (tags trail the data; they land past
@@ -2410,9 +2475,8 @@ module emu
 	// lower, overwriting the header bytes — SDRAM ends up holding pure sector
 	// data exactly like a raw image. Raw images can't false-trigger: byte 0
 	// of a bootable HFS floppy is 'L' (76 > 63) or $00 for blank media.
-	reg dc42_name_ok;
-	reg dc42_skip;
-	reg [7:0] dc42_disk_format;  // DC42 byte 0x50: 0=400K GCR,1=800K GCR,2=720K MFM,3=1440K MFM
+	// (DC42 detection moved into rtl/floppy_loader.v with the block-device
+	// conversion — it has to run on the mounted stream, not on an ioctl one.)
 
 	// ── Disk CHANGE must be presented as a TRANSITION (2026-08-05/06) ──────
 	// The guest learns about media only by polling the drive's CSTIN sense
@@ -2432,44 +2496,259 @@ module emu
 	// disk-switched flag insisted nothing changed, a state no real machine
 	// produces (MAME asserts m_dskchg on every unload).
 	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
-	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	reg [25:0] dsk_int_empty_cy;
 	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
-	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
 
 	// any known type of disk image inserted?
 	assign dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	assign dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 	// at the end of a download latch file size
+	// ── Floppy mounts are BLOCK DEVICES (Phase 1, 2026-09-14) ─────────────
+	// The media-change machinery below used to key off ioctl_download's start
+	// and end edges. Those events no longer exist for floppies, so each has
+	// been re-derived from the block-device equivalent. The TRANSITION
+	// semantics are unchanged and deliberately so — they were expensive to get
+	// right (the 2026-08-06 System 6.0.8 install gate) and tb_disk_swap.v
+	// covers them:
+	//     download START  ->  img_mounted[slot]      (drop media, clear geometry)
+	//     during download ->  loader `loading`       (hold the empty timer at 0)
+	//     download END    ->  loader `done`          (latch the new geometry)
+	//
+	// ★ GEOMETRY: a raw image is decided by SIZE, a DC42 image by its FORMAT
+	// BYTE, and the two are NOT interchangeable. DC42 tags trail the sector
+	// data, so an 800K DC42 image carries 838400 payload bytes rather than
+	// 819200 and matches no size test at all. This is why the loader exports
+	// dc42_fmt; using `size` for both would leave every DC42 mount with no
+	// geometry, i.e. a disk that mounts and is never readable.
+	wire        flp_int_loading, flp_int_done, flp_int_dc42, flp_int_raw, flp_int_ro;
+	// The medium's own sidedness, sniffed from the volume header at mount and
+	// held by the loader until the next one (plan Phase 6B). Used directly
+	// rather than re-latched here: it must survive a REMOUNT, which is the
+	// entire reason it exists, and the geometry regs below are cleared at
+	// every mount pulse.
+	wire        flp_int_media_ds;
+	wire [63:0] flp_int_size;
+	wire  [7:0] flp_int_fmt;
+	// The read (floppy_loader) and write (floppy_sd_writer) halves of this slot
+	// each drive their own sd_lba; one mux below picks between them, because a
+	// shared slot port with two drivers is Quartus Error 10028 (and Verilator
+	// would not have said a word). Same shape as MacPlus.sv:805.
+	wire [31:0] flp_ldr_lba, flp_sdw_lba;
+	wire        flp_ldr_rd;
+	// floppy_loader's header store, read by the writer (DC42 block 0)
+	wire  [5:0] flp_hdr_addr;
+	wire [15:0] flp_hdr_data;
+	// The guest's eject, as a single pulse. This is what triggers the DC42
+	// header's checksum rewrite, and the guest eject is the only moment it can
+	// happen: the file is still mounted in hps_io, so the slot still reaches
+	// it. An OSD unmount has already taken the file away.
+	reg  flp_eject_d;
+	wire flp_eject_pulse = diskEject[0] && !flp_eject_d;
+	always @(posedge clk_sys) flp_eject_d <= diskEject[0];
+	// COMPLETE 512-byte blocks in the FILE, and whether a PARTIAL block
+	// follows them. flp_int_size is the PAYLOAD size (the loader already
+	// subtracted DC42's 84-byte header), so the header goes back on to get the
+	// file's own length. A DC42 file never ends on a block boundary, so
+	// flp_file_tail is 1 for every DC42 mount and 0 for every raw one.
+	// ★ The tail block IS writable (plan Phase 6D): Main clips a write to the
+	// file's real end and never grows an OSD-mounted file, so the writer sends
+	// its full block and only the bytes that exist land. Before 6D this was a
+	// floor with no tail term and the last sector of every tagless DC42 was
+	// unwritable -- and unloadable, the matching floor in floppy_loader.v.
+	wire [63:0] flp_file_bytes  = flp_int_size + (flp_int_dc42 ? 64'd84 : 64'd0);
+	wire [12:0] flp_file_blocks = flp_file_bytes[21:9];
+	wire        flp_file_tail   = |flp_file_bytes[8:0];
+	wire [23:0] flp_int_wr_addr;
+	wire [15:0] flp_int_wr_data;
+	wire        flp_int_wr_req;
+	wire        flp_loading = flp_int_loading;
+
+	floppy_loader floppy_loader_int
+	(
+		.clk_sys(clk_sys), .reset(!pll_locked_s),
+		.img_mounted (img_mounted[VD_FLOPPY_INT]),
+		.img_size    (img_size),
+		.img_readonly(img_readonly),
+		.sd_lba(flp_ldr_lba), .sd_rd(flp_ldr_rd),
+		.sd_ack(sd_ack[VD_FLOPPY_INT]),
+		.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_wr(sd_buff_wr),
+		.base_addr(24'h600000),
+		.wr_addr(flp_int_wr_addr), .wr_data(flp_int_wr_data),
+		.wr_req(flp_int_wr_req),   .wr_ack(flp_int_wr_ack),
+		.loading(flp_int_loading), .done(flp_int_done), .size(flp_int_size),
+		.readonly(flp_int_ro), .raw_img(flp_int_raw),
+		.is_dc42(flp_int_dc42),
+		.media_ds(flp_int_media_ds),
+		.hdr_addr(flp_hdr_addr), .hdr_data(flp_hdr_data),
+		.dc42_fmt(flp_int_fmt)
+	);
+
+	// Write-protect, three terms, any one of which locks the disk:
+	//   - the OSD Floppy Write toggle is Off (default, and the safe state),
+	//   - the slot was mounted read-only (latched at ITS OWN mount pulse), or
+	// DC42 is NOT excluded (owner's ruling 2026-09-15, plan section 6.2): the
+	// load path normalises the container away, so SDRAM holds pure sector data
+	// and a volatile write is container-agnostic. Only Phase 4's write-BACK to
+	// the file has to care which layout it is writing, and raw_img is still
+	// plumbed for exactly that.
+	assign flp_int_wp = ~status[14] || flp_int_ro;
+
+	// ── Phase 4b: committed sectors reach the user's file ──────────────────
+	// Everything upstream of here is volatile: the committer lands a verified
+	// sector in the SDRAM image and the guest's read-after-write verify is
+	// satisfied, but a remount re-downloads the file over it
+	// (floppy_loader.v:6 loads into the SAME SDRAM region), so the write is
+	// gone. This module is what makes it durable.
+	//
+	// write_ok is the single gate on a sector reaching the card, decided HERE
+	// and nowhere else: ~flp_int_wp, i.e. the OSD Floppy Write toggle is On
+	// and the slot did not mount read-only. It is the same condition that
+	// unlocks WRTPRT, so the guest is never told a disk is writable when the
+	// card is not going to take the write. There is no container term: DC42
+	// is writable (owner's ruling 2026-09-15, plan section 6.2).
+	//
+	// The writer keeps NO copy of the data (plan Phase 4b, after the card-
+	// sourced design's 450 KB soak overflowed its shadow queue and corrupted
+	// four sectors): it queues sector numbers and fetches each block from
+	// SDRAM — the same image region the committer wrote — at write time,
+	// through the SDRAM controller's Ethernet-DMA requester shared with
+	// pds_enet by eth_port_arb below. A raw sector is one block; a DC42
+	// sector is blocks N and N+1 assembled from SDRAM (block 0's stripped
+	// header comes from the loader's header store); the header's data
+	// checksum is recomputed from an SDRAM scan on the guest's eject. The
+	// writer never READS the card, so the slot's sd_rd is the loader's alone.
+	// file_blocks is the count of COMPLETE blocks in the FILE (see above); the
+	// writer refuses any block at or past it.
+	wire        flp_int_sdw_busy;
+	wire        flp_sdw_wr;
+	wire [31:0] flp_int_sdw_dbg;
+	wire        flp_mem_req, flp_mem_ack;
+	wire [23:0] flp_mem_addr;
+	wire [15:0] flp_mem_dout;
+	floppy_sd_writer floppy_sd_writer_int
+	(
+		.clk             ( clk_sys ),
+		.reset           ( !pll_locked_s ),
+		.img_mounted     ( img_mounted[VD_FLOPPY_INT] ),
+
+		.commit_done     ( wc_done ),
+		.commit_addr     ( wc_commit_addr ),
+
+		.write_ok        ( ~flp_int_wp ),
+		.loader_busy     ( flp_int_loading ),
+		.dc42            ( flp_int_dc42 ),
+		.flush_req       ( flp_eject_pulse ),
+		.file_blocks     ( flp_file_blocks ),
+		.file_tail       ( flp_file_tail ),
+
+		// the floppy image's SDRAM base, as a WORD address — the same
+		// $600000 floppy_loader is given and wc_word_addr adds below
+		.img_base        ( 24'h600000 ),
+		.hdr_addr        ( flp_hdr_addr ),
+		.hdr_data        ( flp_hdr_data ),
+
+		.mem_req         ( flp_mem_req ),
+		.mem_addr        ( flp_mem_addr ),
+		.mem_ack         ( flp_mem_ack ),
+		.mem_dout        ( flp_mem_dout ),
+
+		.sd_lba          ( flp_sdw_lba ),
+		.sd_wr           ( flp_sdw_wr ),
+		.sd_ack          ( sd_ack[VD_FLOPPY_INT] ),
+		.sd_buff_addr_i  ( sd_buff_addr ),
+		.sd_buff_din     ( sd_buff_din[VD_FLOPPY_INT] ),
+		.busy            ( flp_int_sdw_busy ),
+		.dbg             ( flp_int_sdw_dbg )
+	);
+
+	// The controller's eth port, shared: pds_enet (priority) and the floppy
+	// writer. The arbiter locks the grant through ack-fall and registers the
+	// muxed bundle — see rtl/eth_port_arb.v for both reasons. rtl/sdram.v is
+	// unchanged; it still sees exactly one requester on that port.
+	wire        mem_eth_req, mem_eth_we, mem_eth_ack;
+	wire [23:0] mem_eth_addr;
+	wire [15:0] mem_eth_din, mem_eth_dout;
+	eth_port_arb eth_port_arb_i
+	(
+		.clk    ( clk_sys ),
+		.reset  ( !pll_locked_s ),
+		.a_req  ( pds_eth_req  ), .a_we ( pds_eth_we ), .a_addr ( pds_eth_addr ),
+		.a_din  ( pds_eth_din  ), .a_ack ( pds_eth_ack ), .a_dout ( pds_eth_dout ),
+		.b_req  ( flp_mem_req  ), .b_we ( 1'b0 ),       .b_addr ( flp_mem_addr ),
+		.b_din  ( 16'd0 ),        .b_ack ( flp_mem_ack ), .b_dout ( flp_mem_dout ),
+		.m_req  ( mem_eth_req  ), .m_we ( mem_eth_we ), .m_addr ( mem_eth_addr ),
+		.m_din  ( mem_eth_din  ), .m_ack ( mem_eth_ack ), .m_dout ( mem_eth_dout )
+	);
+
+	// The loader owns the slot while it is streaming an image in. The writer
+	// aborts to idle on the mount pulse and refuses to start while
+	// loader_busy, so the lba mux normally only chooses between idle values —
+	// but sd_wr is masked too, as the belt to that brace: sd_ack is shared
+	// per SLOT, and a writer FSM left running during a mount would be walked
+	// forward by the LOADER's acks (Phase 4 review finding). The abort is the
+	// fix; this mask means a future edit to the writer that reintroduces the
+	// state cannot reach the card from here.
+	assign sd_lba[VD_FLOPPY_INT] = flp_int_loading ? flp_ldr_lba : flp_sdw_lba;
+	assign sd_rd [VD_FLOPPY_INT] = flp_ldr_rd;
+	assign sd_wr [VD_FLOPPY_INT] = flp_int_loading ? 1'b0        : flp_sdw_wr;
+
+`ifdef USE_DBG_OBSERVER
+	// PFSW: floppy_sd_writer witness. [31:24] = queue REFUSALS, i.e. sectors
+	// LOST because 1024 were already pending (the card stalled ~11 s) —
+	// must read 0 after a sustained large-file copy; [23:16] out-of-range
+	// refusals; [15:8] blocks landed; [7:4] flushes; [3:0] pstate. Field
+	// decode at the writer's dbg port; reader: scripts/pfsw_probe.tcl.
+	altsource_probe #(
+		.instance_id ("PFSW"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_pfsw (.probe(flp_int_sdw_dbg), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	// PISM: what the driver PROGRAMMED into the ISM, plus the MFM write
+	// witness. [31:24] Mode register, [23:16] Setup register, then the stage-2
+	// bits that had no hardware witness at all until now:
+	//   [15] write engine ACTIVE   (mode & 0x18 == 0x18, and an MFM datapath)
+	//   [14] write ARM             (mode & 0x18 == 0x18, engine gate aside)
+	//   [13] ANCHOR VALID          0 => a data field would be REFUSED, not placed
+	//   [12:8] ANCHOR SECTOR       1-based; the sector of the ID field the CPU
+	//                              last POPPED - what places every MFM write
+	// then [7:0] the drive-select/enable bits as before.
+	// ★ [13:8] ARE THE FIRST THING TO READ if a written sector lands somewhere
+	// unexpected: they separate "the anchor was wrong" (plan section 6.1's
+	// silent, destructive failure mode) from "everything downstream of it was".
+	altsource_probe #(
+		.instance_id ("PISM"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_pism (.probe(dbg_ism_state), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+`endif
+
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
-		reg old_down;
-		old_down <= dio_download;
-		// Download START = the change event: drop the media immediately and
-		// hold the timer at 0 for the whole upload (SDRAM is being
-		// overwritten, so the old geometry is meaningless the moment the
-		// transfer begins; clearing the regs also means a wrong-sized file
-		// leaves the drive EMPTY instead of re-inserting stale geometry).
-		if(~old_down && dio_download && dio_menu == 6'd1) begin
+		// Mount pulse = the change event: drop the media at once and hold the
+		// timer at 0 for the whole load. SDRAM is being overwritten, so the old
+		// geometry is meaningless the moment streaming begins; clearing the
+		// regs also means a wrong-sized file leaves the drive EMPTY rather than
+		// re-inserting stale geometry.
+		if(img_mounted[VD_FLOPPY_INT]) begin
 			dsk_int_ds  <= 0;
 			dsk_int_ss  <= 0;
 			dsk_int_mfm <= 0;
 			dsk_int_hd  <= 0;
 			dsk_int_empty_cy <= 26'd0;
 		end
-		else if(dio_download && dio_menu == 6'd1)
+		else if(flp_int_loading)
 			dsk_int_empty_cy <= 26'd0;
 		else if(dsk_int_empty_cy != DSK_EMPTY_CY)
 			dsk_int_empty_cy <= dsk_int_empty_cy + 26'd1;
 
-		if(old_down && ~dio_download && dio_menu == 6'd1) begin
-			// GCR (IWM path) — raw word count, or DC42 disk_format byte (rusty-backup
-			// dc42.rs: 0x50 = 0/1/2/3 = 400G/800G/720M/1440M, authoritative + tag-agnostic).
-			dsk_int_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
-			dsk_int_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
-			// MFM (ISM path): 720K DD (368640 words) / 1.44MB HD (737280 words)
-			dsk_int_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
-			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
-			dsk_int_hd  <= (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3);
+		if(flp_int_done) begin
+			// GCR (IWM path). DC42: disk_format byte (rusty-backup dc42.rs,
+			// 0x50 = 0/1/2/3 = 400G/800G/720M/1440M — authoritative and
+			// tag-agnostic). Raw: the payload size.
+			dsk_int_ds  <= flp_int_dc42 ? (flp_int_fmt == 8'd1) : (flp_int_size == 64'd819200);
+			dsk_int_ss  <= flp_int_dc42 ? (flp_int_fmt == 8'd0) : (flp_int_size == 64'd409600);
+			// MFM (ISM path): 720K DD / 1.44MB HD
+			dsk_int_mfm <= flp_int_dc42 ? (flp_int_fmt == 8'd2 || flp_int_fmt == 8'd3)
+			                            : (flp_int_size == 64'd737280 || flp_int_size == 64'd1474560);
+			dsk_int_hd  <= flp_int_dc42 ? (flp_int_fmt == 8'd3) : (flp_int_size == 64'd1474560);
 		end
 
 		if(diskEject[0]) begin
@@ -2478,45 +2757,15 @@ module emu
 			dsk_int_mfm <= 0;
 			dsk_int_hd <= 0;
 		end
-	end	
-
-	always @(posedge clk_sys) begin
-		reg old_down;
-
-		old_down <= dio_download;
-		// see the dsk_int_* block above: a swap must present as leave -> insert
-		if(~old_down && dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds  <= 0;
-			dsk_ext_ss  <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd  <= 0;
-			dsk_ext_empty_cy <= 26'd0;
-		end
-		else if(dio_download && dio_menu == 6'd2)
-			dsk_ext_empty_cy <= 26'd0;
-		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
-			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
-
-		if(old_down && ~dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
-			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
-			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
-			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
-			dsk_ext_hd  <= (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3);
-		end
-
-		if(diskEject[1]) begin
-			dsk_ext_ds <= 0;
-			dsk_ext_ss <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd <= 0;
-		end
 	end
+
 
 	// Download addresses (SDRAM word addresses):
 	//   ROM:      $500000 + offset
 	//   Floppy 1: $600000 + offset
-	//   Floppy 2: $700000 + offset
+	//   ($700000 was Floppy 2, removed 2026-09-15. addrController_top still
+	//    maps the region for floppyExt's read path — that drive now never has
+	//    media, so nothing is fetched from it.)
 	reg [22:0] dio_a;
 	reg [15:0] dio_data;
 
@@ -2526,27 +2775,15 @@ module emu
 	// consumes sdram_dl_ack.
 	wire        sdram_dl_ack;
 
-	// DC42 write offset: active from the word after the magic (word 41)
-	wire [19:0] dio_flp_a = dc42_skip ? (dio_addr[19:0] - 20'd42) : dio_addr[19:0];
-
+	// Phase 1: the ONLY remaining ioctl_download consumer is the ROM. Floppies
+	// are block devices now (floppy_loader below), which is also where DC42
+	// detection and the 84-byte strip moved to — they have to live next to the
+	// data to work on a mount rather than a stream.
 	always @(posedge clk_sys) begin
 		if(ioctl_write) begin
-			if (dio_index[1:0] != 2'b00) begin
-				// DC42 header detection (floppy downloads only)
-				if (dio_addr[19:0] == 20'd0) begin
-					dc42_skip    <= 1'b0;
-					dc42_name_ok <= (ioctl_data[7:0] >= 8'd1) && (ioctl_data[7:0] <= 8'd63);
-				end else if (dio_addr[19:0] == 20'd40)
-					dc42_disk_format <= ioctl_data[7:0];  // byte 0x50 (low byte of word 40)
-				else if (dio_addr[19:0] == 20'd41 && dc42_name_ok && ioctl_data == 16'h0001)
-					dc42_skip <= 1'b1;
-			end
 			dio_data <= {ioctl_data[7:0], ioctl_data[15:8]};
-			case (dio_index[1:0])
-				2'b01:   dio_a <= 23'h600000 + {3'b0, dio_flp_a};  // Floppy 1
-				2'b10:   dio_a <= 23'h700000 + {3'b0, dio_flp_a};  // Floppy 2
-				default: dio_a <= {5'b10100, dio_addr[17:0]};      // ROM at $500000 (must match addrController rom_sdram_word)
-			endcase
+			dio_a    <= {5'b10100, dio_addr[17:0]};   // ROM at $500000 (must match
+			                                          // addrController rom_sdram_word)
 			ioctl_wait <= 1;
 		end
 		// ★ Release the HPS on the SDRAM controller's OWN acknowledgement, not
@@ -2558,8 +2795,73 @@ module emu
 		// so this is a clean two-phase handshake: ioctl_wait 0->1 requests,
 		// dl_ack 0->1 acknowledges, and the word simply waits for the next
 		// window if this one was taken.
-		else if (sdram_dl_ack) ioctl_wait <= 0;
+		else if (sdram_dl_ack && dio_download) ioctl_wait <= 0;
 	end
+
+	// ── SDRAM download-port arbitration (Phase 1) ────────────────────────
+	// Two requesters share the one write port: the ROM download and the floppy
+	// loader. A ROM download outranks the loader — it only happens at core
+	// start with the CPU in reset, and a loader that collides simply stalls
+	// with its request still up, which the LEVEL handshake tolerates.
+	//
+	// ★ THE LOCK IS BACK (Phase 3b, 2026-09-15), because there is a second
+	// non-ROM requester again: the write committer. The comment that stood here
+	// said "restore the lock if a second loader is ever added back", and that is
+	// this. Without it, one requester raising wr_req while the other is mid-word
+	// steals the port and abandons the in-flight word — the class of bug the
+	// dl_* port comment in rtl/sdram.v describes, where a handshake torn down
+	// between RAS and CAS silently drops a word from the image. A dropped word
+	// is one 512-byte sector with two wrong bytes, which the guest's verify
+	// would report as a disk error and which a byte-diff would find much later.
+	//
+	// The loader and the committer are very nearly exclusive in practice (the
+	// loader runs at mount, and a mount resets the write path), but "very nearly"
+	// is not a thing to arbitrate on: a committer mid-drain when a new image is
+	// mounted is exactly the overlap, and it is reachable.
+	//
+	// ★ Reset added this time. The previous arbiter had none — noted as known
+	// sloppiness when it was removed. Cyclone V powers registers up at 0, so it
+	// was probably harmless, but "probably" on the port that writes the disk
+	// image is not worth keeping.
+	localparam DLG_LDR = 1'b0;   // the mount-time loader
+	localparam DLG_WC  = 1'b1;   // the write committer
+	reg  dl_grant;
+	reg  dl_locked;
+	always @(posedge clk_sys) begin
+		if (!pll_locked_s) begin
+			dl_grant  <= DLG_LDR;
+			dl_locked <= 1'b0;
+		end else if (dio_download) begin
+			dl_locked <= 1'b0;          // a ROM download outranks both
+		end else if (dl_locked) begin
+			// hold the grant for as long as the winner keeps its request up
+			if ((dl_grant == DLG_LDR && !flp_int_wr_req) ||
+			    (dl_grant == DLG_WC  && !wc_req))
+				dl_locked <= 1'b0;
+		end else if (flp_int_wr_req) begin
+			dl_grant <= DLG_LDR; dl_locked <= 1'b1;
+		end else if (wc_req) begin
+			dl_grant <= DLG_WC;  dl_locked <= 1'b1;
+		end
+	end
+
+	wire dl_ldr_sel = dl_locked && (dl_grant == DLG_LDR) && !dio_download;
+	wire dl_wc_sel  = dl_locked && (dl_grant == DLG_WC)  && !dio_download;
+
+	// The committer emits an image BYTE offset (the dskReadAddr convention);
+	// the port is word-addressed, so halve it and add the image base here — the
+	// one place that knows where the floppy image lives.
+	wire [23:0] wc_word_addr = 24'h600000 + {3'd0, wc_addr[21:1]};
+
+	wire        dl_req_mux  = dio_download ? ioctl_wait :
+	                          dl_wc_sel    ? wc_req     : flp_int_wr_req;
+	wire [23:0] dl_addr_mux = dio_download ? {1'b0, dio_a[22:0]} :
+	                          dl_wc_sel    ? wc_word_addr        : flp_int_wr_addr;
+	wire [15:0] dl_data_mux = dio_download ? dio_data :
+	                          dl_wc_sel    ? wc_data  : flp_int_wr_data;
+
+	wire flp_int_wr_ack = sdram_dl_ack && dl_ldr_sel;
+	assign wc_ack       = sdram_dl_ack && dl_wc_sel;
 
 	// (Floppy-download acceptance counters removed 2026-07-16 with their PFL1
 	// sel-3 readout — recover from git history with the floppy probes.)
@@ -2700,12 +3002,18 @@ module emu
 		sdram_ds_q       <= sdram_ds;
 		sdram_we_q       <= sdram_we;
 		sdram_oe_q       <= sdram_oe;
-		sdram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download;
-		sdram_flpguard_q <= flp_guard && !dio_download;
-		sdram_dlreq_q    <= ioctl_wait;
+		// ...and while a mount is streaming: SDRAM is being overwritten, so a
+		// read window would serve the previous image. flp_present already goes
+		// low during a load (dsk_*_ins depends on the empty timer, which is
+		// held at 0), so this is belt-and-braces — but the floppy window and
+		// the download slot are the SAME slot, a hazard that has bitten this
+		// core before, so make it structural rather than inferred.
+		sdram_flpwin_q   <= (dskReadAckInt || dskReadAckExt) && !dio_download && !flp_loading;
+		sdram_flpguard_q <= flp_guard && !dio_download && !flp_loading;
+		sdram_dlreq_q    <= dl_req_mux;
 		sdram_dlslot_q   <= dioBusControl;
-		sdram_dladdr_q   <= {1'b0, dio_a[22:0]};
-		sdram_dldin_q    <= dio_data;
+		sdram_dladdr_q   <= dl_addr_mux;
+		sdram_dldin_q    <= dl_data_mux;
 	end
 
 	assign SDRAM_CKE = 1;
@@ -2785,15 +3093,16 @@ module emu
 		.dl_din         ( sdram_dldin_q            ),
 		.dl_ack         ( sdram_dl_ack             ),
 
-		// PDS Ethernet guest-RAM DMA port (rtl/pds/pds_enet.sv, Phase 3).
-		// pds_enet's outputs are already clk_sys registers set before the
+		// Ethernet guest-RAM DMA port (rtl/pds/pds_enet.sv, Phase 3), since
+		// Phase 4b shared with the floppy SD writer through eth_port_arb,
+		// whose outputs are clk_sys registers set one edge before the
 		// request rises — the same settled-value shape as the _q bundle.
-		.eth_req        ( pds_eth_req              ),
-		.eth_we         ( pds_eth_we               ),
-		.eth_addr       ( pds_eth_addr             ),
-		.eth_din        ( pds_eth_din              ),
-		.eth_ack        ( pds_eth_ack              ),
-		.eth_dout       ( pds_eth_dout             ),
+		.eth_req        ( mem_eth_req              ),
+		.eth_we         ( mem_eth_we               ),
+		.eth_addr       ( mem_eth_addr             ),
+		.eth_din        ( mem_eth_din              ),
+		.eth_ack        ( mem_eth_ack              ),
+		.eth_dout       ( mem_eth_dout             ),
 
 		.cpu_done       ( sdram_cpu_done           ),
 		.cpu_dout       ( sdram_cpu_dout           )

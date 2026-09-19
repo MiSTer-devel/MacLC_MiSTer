@@ -74,9 +74,19 @@ module mfm_track_encoder
 	output            oneeds,  // current byte is sector payload (odata = idata):
 	                           // the consumer must not deliver it until the SDRAM
 	                           // fetch for `addr` has landed in idata
-	output            oindex   // physical index "hole": high during gap 4a (80
+	output            oindex,  // physical index "hole": high during gap 4a (80
 	                           // bytes = 1.28ms low pulse on the !idx sense =
 	                           // 0.64% duty, vs 0.70% in the MAME 0.264 capture)
+
+	// The sector whose field is passing under the head RIGHT NOW, 1-based as
+	// the ID field's R byte is. This is the WRITE path's positional anchor
+	// (plan section 6.1): an MFM data field does not name its sector, so the
+	// guest's write is placed by the ID field it last READ, and this is the
+	// only place that knows which one that was. It must be captured ALONGSIDE
+	// the delivered byte and travel with it - swim.v's 16-deep staging ring
+	// separates a delivered byte from this live value by up to 16 byte-times,
+	// which is exactly the one-byte-shift bug UK101 hardened against, scaled up.
+	output      [4:0] osector
 );
 
 	// ---- sector geometry ----------------------------------------------------
@@ -154,6 +164,7 @@ module mfm_track_encoder
 	assign oneeds = (state == S_DATA);
 	assign oindex = (state == S_PRE_GAP);
 	reg [4:0] sector;       // current sector index (0..spt_max)
+	assign osector = sector + 5'd1;   // 1-based, as the ID field's R byte
 	reg [8:0] src_offset;   // byte within the current sector's data (0..511)
 	reg [15:0] crc;
 

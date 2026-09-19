@@ -621,10 +621,10 @@ module emu
 
 	// Forward declarations: assigned with the rest of the disk-mount state
 	// further down; needed here for addrController's flp_present gate.
-	wire dsk_int_ins, dsk_ext_ins;
+	wire dsk_int_ins;
 	addrController_top ac0
 	(
-		.flp_present(dsk_int_ins | dsk_ext_ins),
+		.flp_present(dsk_int_ins),
 		.clk(clk_sys),
 		.clk8(clk8),
 		.clk8_en_p(clk8_en_p),
@@ -958,10 +958,28 @@ module emu
 		.vid_alt(vid_alt),
 
 
-		.insertDisk({dsk_ext_ins, dsk_int_ins}),
-		.diskSides({dsk_ext_ds, dsk_int_ds}),
-		.diskMFM({dsk_ext_mfm, dsk_int_mfm}),
-		.diskHD({dsk_ext_hd, dsk_int_hd}),
+		// second floppy removed 2026-09-15 — drive 1 is permanently empty
+		.insertDisk({1'b0, dsk_int_ins}),
+		.diskSides({1'b0, dsk_int_ds}),
+		// sim.v has no floppy_loader (images arrive by ioctl_download here),
+		// so there is no volume sniff: "unknown", the term that never lowers
+		// the sidedness ceiling. Tracked in docs/verilator_differences.md.
+		.mediaSides(2'b11),
+		.diskMFM({1'b0, dsk_int_mfm}),
+		// sim has no OSD: the floppy is always write-protected here, matching
+		// the core's power-on default. The write path is exercised by its own
+		// bench (tb_floppy_write.v), not through the full-system boot.
+		.writeProtect(2'b11),
+		// The committer has nowhere to go in sim: this top has no download-port
+		// arbiter, and writeProtect above means it can never be handed a sector
+		// anyway. Its own bench (tb_floppy_commit.v) drives it properly.
+		.wrSdAddr(), .wrSdData(), .wrSdReq(), .wrSdAck(1'b0),
+		.wrCommitDone(),
+		// Phase 4's persistence tap likewise has no consumer here: sim.v has no
+		// hps_io block device behind the floppy slot, so there is no .dsk to
+		// write back to. floppy_sd_writer.v is exercised by its own bench.
+		.wrCommitAddr(), .wrSdBufAddr(), .wrSdBufData(), .wrSdBufWr(),
+		.diskHD({1'b0, dsk_int_hd}),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -1025,10 +1043,10 @@ module emu
 	wire [5:0] dio_menu = dio_index[5:0];
 
 	// Floppy disk image tracking
-	reg dsk_int_ds, dsk_ext_ds;
-	reg dsk_int_ss, dsk_ext_ss;
-	reg dsk_int_mfm, dsk_ext_mfm;  // MFM-format image (ISM path): 720K or 1.44MB
-	reg dsk_int_hd,  dsk_ext_hd;   // 1.44MB HD (vs 720K DD)
+	reg dsk_int_ds;
+	reg dsk_int_ss;
+	reg dsk_int_mfm;  // MFM-format image (ISM path): 720K or 1.44MB
+	reg dsk_int_hd;   // 1.44MB HD (vs 720K DD)
 	// DiskCopy 4.2 header skip — mirror of MacLC.sv (rationale there).
 	reg dc42_name_ok;
 	reg dc42_skip;
@@ -1039,11 +1057,9 @@ module emu
 	// so this only delays that mount; it is here to keep the two tops from
 	// diverging (docs/verilator_differences.md).
 	localparam [25:0] DSK_EMPTY_CY = 26'h3FFFFFF;
-	reg [25:0] dsk_int_empty_cy, dsk_ext_empty_cy;
+	reg [25:0] dsk_int_empty_cy;
 	wire dsk_int_empty = (dsk_int_empty_cy != DSK_EMPTY_CY);
-	wire dsk_ext_empty = (dsk_ext_empty_cy != DSK_EMPTY_CY);
 	assign dsk_int_ins = !dsk_int_empty && (dsk_int_ds || dsk_int_ss || dsk_int_mfm);
-	assign dsk_ext_ins = !dsk_ext_empty && (dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm);
 
 	always @(posedge clk_sys) begin
 		reg old_down;
@@ -1084,43 +1100,11 @@ module emu
 		end
 	end
 
-	always @(posedge clk_sys) begin
-		reg old_down;
-		old_down <= dio_download;
-		if(~old_down && dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds  <= 0;
-			dsk_ext_ss  <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd  <= 0;
-			dsk_ext_empty_cy <= 26'd0;
-		end
-		else if(dio_download && dio_menu == 6'd2)
-			dsk_ext_empty_cy <= 26'd0;
-		else if(dsk_ext_empty_cy != DSK_EMPTY_CY)
-			dsk_ext_empty_cy <= dsk_ext_empty_cy + 26'd1;
-
-		if(old_down && ~dio_download && dio_menu == 6'd2) begin
-			dsk_ext_ds <= (dio_addr == 409600) ||
-			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
-			dsk_ext_ss <= (dio_addr == 204800) ||
-			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
-			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
-			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
-			dsk_ext_hd  <= (dio_addr == 737280) ||
-			               (dc42_skip && dc42_disk_format == 8'd3);
-		end
-		if(diskEject[1]) begin
-			dsk_ext_ds <= 0;
-			dsk_ext_ss <= 0;
-			dsk_ext_mfm <= 0;
-			dsk_ext_hd <= 0;
-		end
-	end
-
 	// Download addresses (SDRAM word addresses):
 	//   ROM:      $500000 + offset
 	//   Floppy 1: $600000 + offset
-	//   Floppy 2: $700000 + offset
+	//   ($700000 was Floppy 2, removed 2026-09-15; addrController still maps
+	//    the region for floppyExt's read path, which never has media now)
 	reg [22:0] dio_a;
 	reg [15:0] dio_data;
 
@@ -1151,7 +1135,6 @@ module emu
 			dio_data <= ioctl_dout;
 			case (dio_index[1:0])
 				2'b01:   dio_a <= 23'h600000 + {3'b0, dio_flp_a};  // Floppy 1
-				2'b10:   dio_a <= 23'h700000 + {3'b0, dio_flp_a};  // Floppy 2
 				default: dio_a <= {5'b10100, dio_addr[17:0]};      // ROM at $500000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
