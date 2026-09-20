@@ -297,6 +297,18 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   `verilator/tb_mfm_idcensus.v` (full-disk ID census), `tb_ism_sony +postgap=N`.
   ★ `USE_DBG_HUD` is currently OFF (commented out) in `MacLC.qsf` — flip it
   on for debug fits only; it must be OFF in release fits.
+- **SCSI sector buffers vs CD audio — FIXED 2026-09-20 (port of MacPlus
+  54289d5).** `sd_buff_wr` is one strobe broadcast to every hps_io slot;
+  `rtl/ncr5380.sv` gated the disk targets' copy on SCSI BSY instead of the
+  slot's own ack, so a CD-audio frame fetched while the CD was bus-idle
+  landed in a busy disk's buffer — during a write flush the image received
+  the last 512 bytes of the 2352-byte frame (seam at byte 304). That
+  fingerprint was found in HFS catalog node 279 of an 80 MB image after a
+  Finder hang (the "hang after erase+copy" was this, not the floppy path).
+  Any disk I/O during CD playback could corrupt on earlier builds. Bench:
+  `verilator/tb_ncr5380_slot_ack.v` on branch `scsi-strobe-ack-gate` (kept
+  out of the PR per the maintainer's no-new-benches request; 6 checks, 3
+  fail on the old gate; Verilator runs in WSL Ubuntu).
 - SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
   (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO

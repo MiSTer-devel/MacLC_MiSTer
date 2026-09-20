@@ -858,7 +858,12 @@ module ncr5380
 				.sd_buff_addr_hi( 5'd0 ),   // whole-frame bursts are CD-only
 				.sd_buff_dout( sd_buff_dout ),
 				.sd_buff_din( sd_buff_din[i] ),
-				.sd_buff_wr( sd_buff_wr & target_bsy[i] ),
+				// Framed by this slot's ack, not by BSY: sd_buff_wr is shared
+				// by every slot, and the CD-audio engine streams frames while
+				// bus-idle, so a BSY gate let them land in a busy disk's
+				// buffer (audio written into the disk image). io_ack keeps
+				// its BSY term: it blanks a late ack after the target left.
+				.sd_buff_wr( sd_buff_wr & io_ack[i] ),
 
 				// Toolbox transport: only target 0 (ID 0) is wired to the slot.
 				.tb_mounted ( (i == 0) ? tb_mounted : 1'b0 ),
