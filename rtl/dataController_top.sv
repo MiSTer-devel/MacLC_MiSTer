@@ -117,7 +117,19 @@ module dataController_top(
 	// misc
 	input [1:0] insertDisk,
 	input [1:0] diskSides,
+	input [1:0] mediaSides, // the medium's own sidedness (plan Phase 6B)
 	input [1:0] diskMFM,    // disk is MFM-format (ISM path): {ext,int}
+	input [1:0] writeProtect, // 1 = this drive refuses writes: {ext,int}
+	// committed-sector SDRAM write port (internal drive only)
+	output [21:0] wrSdAddr,
+	output [15:0] wrSdData,
+	output        wrSdReq,
+	input         wrSdAck,
+	output        wrCommitDone,
+	output [21:0] wrCommitAddr,
+	output  [7:0] wrSdBufAddr,
+	output [15:0] wrSdBufData,
+	output        wrSdBufWr,
 	input [1:0] diskHD,     // disk is 1.44MB HD (vs 720K DD): {ext,int}
 	output [1:0] diskEject,
 	output [1:0] diskMotor,
@@ -1041,7 +1053,16 @@ module dataController_top(
 		.dataOut(swimDataOut),
 		.insertDisk(insertDisk),
 		.diskSides(diskSides),
+		.mediaSides(mediaSides),
 		.diskMFM(diskMFM),
+		.writeProtect(writeProtect),
+		.wrSdAddr(wrSdAddr), .wrSdData(wrSdData),
+		.wrSdReq(wrSdReq),   .wrSdAck(wrSdAck),
+		.wrCommitDone(wrCommitDone),
+		.wrCommitAddr(wrCommitAddr),
+		.wrSdBufAddr(wrSdBufAddr),
+		.wrSdBufData(wrSdBufData),
+		.wrSdBufWr(wrSdBufWr),
 		.diskHD(diskHD),
 		.diskEject(diskEject),
 		.diskMotor(diskMotor),
