@@ -7,7 +7,7 @@
 	
 */
 
-/* Disk register (read):	
+/* Disk register (read):
 	    State-control lines       Register
   CA2    CA1    CA0    SEL    addressed    Information in register
 
@@ -61,6 +61,24 @@
 `define DRIVE_REG_DRVIN		15 /* R: 400K/800k: drive present (0=yes, 1=no), Superdrive: disk capacity (0=HD, 1=DD) */
 
 module floppy
+#(
+	// 0 strips the ENTIRE write path: engine, decoder, committer, anchors. The
+	// external drive never has media and has writeProtect tied high, so its
+	// write path can do nothing, but instantiated it still costs a decoder
+	// (about 1 M10K). Nothing drive-visible changes: it answers every register
+	// exactly as before and simply cannot accept a byte.
+	parameter WRITE_SUPPORT = 1,
+
+	// MFM byte cadence, in cep ticks: 129 = 16us (HD), 259 = 32us (DD) at
+	// 8.125 MHz. Parameterised ONLY so a bench can shrink a revolution from
+	// ~4.3 M clocks to something that runs in seconds -- one MFM sector is 682
+	// byte-times, so at the real cadence an Icarus bench that has to watch the
+	// head cross a sector boundary runs for a quarter of an hour. No
+	// synthesised instance overrides these; same technique as
+	// floppy_sd.v's ACK_TIMEOUT_BITS.
+	parameter [8:0] MFM_PERIOD_HD = 9'd129,
+	parameter [8:0] MFM_PERIOD_DD = 9'd259
+)
 (
 	input clk,
 	input cep,
@@ -75,11 +93,63 @@ module floppy
 	input _enable, 			
 	input [7:0] writeData,		
 	output [7:0] readData,
+
+	// --- GCR write path -----------------------------------
+	// writeData above is the CPU's byte; it is LIVE from Phase 3 on, having
+	// been declared and never referenced before it. swim.v
+	// hands over the UNREGISTERED bus value so it cannot lag writeReq by a
+	// cycle -- the same reason MacPlus passes dataInLo directly.
+	input        writeReq,       // LEVEL, not a pulse, while the CPU writes the
+	                             // IWM data register for this drive. One CPU
+	                             // access spans several cen ticks; the
+	                             // !writeBusyReg guard below is what makes that
+	                             // one byte. MacPlus's hardware-proven shape.
+	input        writeProtect,   // 1 = refuse writes (OSD off / img_readonly /
+	                             // a DC42 mount). Also drives WRTPRT.
+	// IWM Q7: the CPU has put the drive in WRITE MODE. It bounds the write as
+	// a whole for the encoder's format relay, and nothing
+	// else consumes it. ★ writeBusyReg alone is NOT a substitute: it drops at
+	// the end of every 128-cep byte, so a busy-derived wrEnd would pulse
+	// between every byte of a track -- the relay would fire after the first
+	// address field, restart the layout mid-format, and disarm.
+	input        writeMode,
+	output       writeBusy,      // 1 = buffer full, the CPU must wait
+	                             // (swim.v inverts it for _iwmBusy)
+	output       writeUnderrun,  // 1 = a byte in flight was abandoned
+	// The Phase 2 contract tuple, as a witness. The committer consumes it
+	// internally; these exist so the cone has a load and so a HUD can see it.
+	output        wrSecValid,
+	output [4:0]  wrSecNum,
+	output [21:0] wrSecAddr,
+	// SDRAM write port for committed sectors. Same LEVEL protocol as
+	// floppy_sd.v's. wrSdAddr is an image BYTE offset, matching dskReadAddr
+	// on the read side; the caller adds the image base and halves it for the
+	// word-addressed download port, so only one place knows where images live.
+	output [21:0] wrSdAddr,
+	output [15:0] wrSdData,
+	output        wrSdReq,
+	input         wrSdAck,
+	output        wrCommitDone,   // 1-clk pulse: a sector reached SDRAM
+	output [21:0] wrCommitAddr,   // image BYTE offset of that sector's byte 0
+	// Persistence tap for rtl/floppy_sd.v — a mirror of the
+	// word stream the committer is writing to SDRAM, so the SD writer can
+	// shadow the sector and push it out to the user's .dsk. Pure pass-through
+	// of floppy_sd.v's sd_buf_* outputs; see its header for why
+	// the tap is taken from the registered SDRAM word rather than re-read.
+	output  [7:0] wrSdBufAddr,
+	output [15:0] wrSdBufData,
+	output        wrSdBufWr,
 	
 	input advanceDriveHead,  // prevents overrun when debugging, does not exist on a real Mac!
 	output reg newByteReady,
 	input insertDisk,
+	// The mounted FILE is 819,200 bytes rather than 409,600 (MacPlus calls this
+	// img800k). A ceiling on sidedness, not the answer to it -- see
+	// doubleSidedDisk below.
 	input diskSides,
+	// The MEDIUM's own sidedness, from floppy_sd.v's mount-time volume
+	// sniff. 1 = double-sided, or unknown.
+	input mediaSides,
 	output diskEject,
 
 	output motor,
@@ -104,6 +174,21 @@ module floppy
 	output reg       mfm_mark,   // delivered byte is an address-mark (A1)
 	output reg       mfm_crc0,   // delivered byte completes a valid CRC field
 	output reg       mfm_stb,    // 1-cep-period delivery strobe
+	// The sector whose field was passing under the head when THIS byte was
+	// delivered, 1-based - the write path's positional anchor (plan section
+	// 6.1). Latched with the byte, not sampled later: swim.v's staging ring
+	// puts up to 16 byte-times between a delivered byte and the live head.
+	output reg [4:0] mfm_sector,
+
+	// --- ISM MFM write stream, from swim.v's ism_write_engine -------------
+	input      [7:0] mfm_wr_byte,
+	input            mfm_wr_mark,
+	input            mfm_wr_stb,   // 1 clk per written byte
+	// The anchor swim.v recovered from the staging-ring entry the CPU last
+	// POPPED - i.e. the sector of the ID field the driver itself read before
+	// deciding to write here. Never the live head position.
+	input      [4:0] mfm_wr_anchor,
+	input            mfm_wr_anchor_ok,
 
 	// --- diagnostic ports (PFLP probes; safe to leave dangling when unused) ---
 	// Ported from lbmactwo_MiSTer ac44312 (the debug deck that root-caused its
@@ -123,12 +208,8 @@ module floppy
 	                                         // cleared on this edge — sample it now)
 	output wire [7:0]  dbg_raw_byte,         // pre-encoder SDRAM fetch latch (idata)
 	output wire [21:0] dbg_gcr_addr,         // live GCR encoder fetch address
-	// Media-change witness (2026-08-06, the disk-swap mission). One packed
-	// word for the HUD so a failed swap on hardware is attributable at a
-	// glance: live media/flag state in the top byte, saturating event
-	// counters below, and wrapping counters of the guest's sense polls of
-	// the two registers the Sony driver reads in pairs (NoDiskInPl=our reg 1,
-	// DiskChg=our reg 6 — findings_mame_floppy_groundtruth §2).
+	// Media-change witness: one packed word for the HUD, so a failed swap on
+	// hardware is attributable at a glance.
 	//   [31] CSTIN reg (1 = no disk)   [30] disk_switched (1 = changed)
 	//   [29] insertDisk                [28] ism_active
 	//   [27:24] ejects ACCEPTED (sat)  [23:20] DskchgClear strobes (sat)
@@ -136,14 +217,11 @@ module floppy
 	//   [15:8] entries into "parked on sense reg 1, enabled" (wrap)
 	//   [7:0]  entries into "parked on sense reg 6, enabled" (wrap)
 	output reg  [31:0] dbg_media,
-	// Phase-strobe forensics (2026-08-04): dbg_step_cnt reading 0 on hardware
-	// during a whole ISM/MFM session cannot distinguish "the driver never
-	// strobed a step" from "our decode rejected the strobe" — both leave the
-	// counter at 0. These record EVERY lstrb falling edge unconditionally,
-	// with the address pattern presented at that edge, so the two cases
-	// separate: strb_cnt==0 => the driver never strobes; strb_cnt>0 with
-	// step_cnt==0 => we are rejecting the pattern it does send (and
-	// strb_last shows exactly which qualifier fails).
+	// Phase-strobe forensics: dbg_step_cnt at 0 cannot distinguish "the driver
+	// never strobed a step" from "our decode rejected it". These record EVERY
+	// lstrb falling edge with the address pattern presented at that edge, so
+	// strb_cnt==0 means the driver never strobes, and strb_cnt>0 with
+	// step_cnt==0 means we are rejecting what it sends.
 	output reg  [15:0] dbg_strb_cnt,         // ALL lstrb falling edges seen
 	output reg  [15:0] dbg_strb_en_cnt,      // ...of those, with _enable low
 	output reg  [23:0] dbg_strb_last,        // last 4 edges, 6 bits each, newest low:
@@ -160,16 +238,11 @@ module floppy
 	// drive-select fix let register writes land, MOTORON writes land too and
 	// can stop the disk — mfm_spinning = mfm_disk && (motor||ism_sel) && !CSTIN.)
 	output wire [7:0]  dbg_status,
-	// MFM delivery-stall witness (2026-08-05 pm, the -81 hunt). A payload byte
-	// whose SDRAM fetch has not landed stalls the byte-cell timer at zero (the
-	// `!mfm_needs_data || mfm_fresh` gate in the delivery block below). A real
-	// drive never stalls — data flies under the head regardless — so any stall
-	// here is emulation artifact stretching the rotation. dbg_byte_cnt/miss_cnt
-	// above are GCR-path-only (they count on diskDataByteTimer), so before this
-	// the MFM fetch path was entirely uninstrumented and "miss_cnt=0" said
-	// nothing about it. Max single stall (~us units, saturating) + number of
-	// deliveries that stalled at all: settles the "SDRAM contention at track
-	// boundaries" suspect with numbers.
+	// MFM delivery-stall witness: a payload byte whose SDRAM fetch has not
+	// landed stalls the byte-cell timer at zero. A real drive never stalls, so
+	// any stall here is emulation artifact stretching the rotation. The GCR
+	// counters above cannot see it - they count on diskDataByteTimer. Max
+	// single stall (saturating) plus the number of deliveries that stalled.
 	output reg  [15:0] dbg_mfm_stall_us,
 	output reg  [7:0]  dbg_mfm_stall_cnt
 );
@@ -235,10 +308,10 @@ module floppy
 		disk_switched, // SWITCHED ($6 here = MAME reg 0x3 DiskChg): 1 = media changed.
 		          // Was hardwired 0 — so a host-side swap presented "the disk left
 		          // and came back but nothing changed", a state no real machine
-		          // produces. See the disk_switched block below (2026-08-06).
+		          // produces. See the disk_switched block below.
 		~(driveTrack == 7'h00), // TK0: track 0 indicator
 		driveRegs[`DRIVE_REG_MOTORON], // motor on
-		1'b0, // WRTPRT = locked
+		~writeProtect, // WRTPRT: 0 = locked, 1 = write enabled
 		1'b1, // STEP = complete
 		driveRegs[`DRIVE_REG_CSTIN], // disk in drive
 		driveRegs[`DRIVE_REG_DIRTN] // step direction
@@ -261,24 +334,15 @@ module floppy
 	end
 
 	// SWITCHED / DiskChg flag (sense reg 6 = MAME mac_floppy reg 0x3, which
-	// returns !m_dskchg). MAME 0.264 floppy.cpp ground truth — mac drives have
-	// m_dskchg_writable=true, so:
-	//   - device_start forces "no change" even with an empty drive -> reset 0;
-	//   - call_unload() ASSERTS it (guest eject and host-side image withdrawal
-	//     both end there) and call_load() does NOT touch it, so it stays
-	//     asserted across the next insert;
-	//   - only the DskchgClear strobe (cmd {SEL,ca2,ca1,ca0}=0xC) clears it
-	//     (the PC-style step auto-clear is !m_dskchg_writable drives only).
-	// Runtime-verified 2026-08-06 (tap_swapB): the 6.0.8 Sony driver polls
-	// NoDiskInPl+DiskChg as a PAIR every ~0.8 s (in ISM through Handshake b3,
-	// phases parked F0/F3), and on reading DiskChg=1 it strobes DskchgClear
-	// (Phases F4->FC->F4, PA5=1) in the same poll before handling the change.
-	// Presenting a CSTIN transition with this flag stuck 0 gave the driver a
-	// state no real machine produces — the prime suspect for the ebbdac6-
-	// reverted fix crashing the mount. Media removal is detected here as the
-	// FALL of insertDisk: a guest eject (MacLC.sv clears the mount flags while
-	// diskEject is asserted) and a host swap (flags cleared at download start)
-	// both route through it.
+	// returns !m_dskchg). Mac drives have m_dskchg_writable, so:
+	//   - reset is 0, "no change", even with an empty drive;
+	//   - call_unload ASSERTS it (guest eject and host withdrawal both end
+	//     there) and call_load does not touch it, so it survives the insert;
+	//   - only the DskchgClear strobe ({SEL,ca2,ca1,ca0}=0xC) clears it.
+	// The Sony driver polls NoDiskInPl+DiskChg as a PAIR and strobes the
+	// clear itself; a CSTIN transition with this flag stuck 0 is a state no
+	// real machine produces. Media removal is the FALL of insertDisk, which
+	// a guest eject and a host swap both route through.
 	reg disk_switched;
 	reg insertDisk_d;
 	always @(posedge clk or negedge _reset) begin
@@ -318,6 +382,14 @@ module floppy
 	reg old_newByteReady;
 	always @(posedge clk) old_newByteReady <= newByteReady;
 
+	// Format-relay nets. Declared at module level because the
+	// encoder below needs them while the write path that drives them lives
+	// inside the WRITE_SUPPORT generate; the no_wrpath branch ties them off.
+	wire       wrRelayByte;
+	wire       wrRelayMark;
+	wire [3:0] wrRelayMarkSector;
+	wire       wrRelayEnd;
+
 	// GCR (IWM-mode) track encoder — 400K/800K
 	floppy_track_encoder enc
 	(
@@ -333,7 +405,13 @@ module floppy
 
 		.addr    ( gcrReadAddr ),
 		.idata   ( dskReadDataLatch ),
-		.odata   ( dskReadDataEnc )
+		.odata   ( dskReadDataEnc ),
+
+		// format relay: the write stream as the decoder consumed it
+		.wr_byte        ( wrRelayByte ),
+		.wr_mark        ( wrRelayMark ),
+		.wr_mark_sector ( wrRelayMarkSector ),
+		.wr_end         ( wrRelayEnd )
 	);
 
 	// MFM (ISM-mode) track encoder — 720K/1.44MB. Free-runs at the byte-cell
@@ -341,6 +419,7 @@ module floppy
 	// position (driveTrack/driveSide) as the GCR path.
 	wire [7:0] mfm_odata;
 	wire       mfm_omark, mfm_ocrc0, mfm_needs_data, mfm_index;
+	wire [4:0] mfm_osector;
 	reg        mfm_ready_pulse;
 
 	mfm_track_encoder menc
@@ -355,6 +434,7 @@ module floppy
 		.idata  ( dskReadDataLatch ),
 		.odata  ( mfm_odata ),
 		.omark  ( mfm_omark ),
+		.osector( mfm_osector ),
 		.ocrc0  ( mfm_ocrc0 ),
 		.oneeds ( mfm_needs_data ),
 		.oindex ( mfm_index )
@@ -375,7 +455,12 @@ module floppy
 	// filled, Handshake b7 never set, and the driver saw an empty disk.
 	wire       mfm_spinning = mfm_disk && (motor || ism_sel) &&
 	                          ~driveRegs[`DRIVE_REG_CSTIN];
-	wire [8:0] mfm_period   = mfm_hd ? 9'd129 : 9'd259;
+	// Byte cadence in cep ticks: 129 = 16us (HD), 259 = 32us (DD) at 8.125MHz.
+	// Parameterised ONLY so a bench can shrink a revolution from ~4.3M clocks
+	// to something it can run in seconds; the defaults are the real medium and
+	// no synthesised instance overrides them. Same technique as
+	// floppy_sd.v's ACK_TIMEOUT_BITS.
+	wire [8:0] mfm_period   = mfm_hd ? MFM_PERIOD_HD : MFM_PERIOD_DD;
 	reg  [8:0] mfm_timer;
 	reg        mfm_fresh;
 	reg        mfm_ack_skip;
@@ -388,6 +473,7 @@ module floppy
 			mfm_stb         <= 1'b0;
 			mfm_byte        <= 8'h00;
 			mfm_mark        <= 1'b0;
+			mfm_sector      <= 5'd1;
 			mfm_crc0        <= 1'b0;
 		end else begin
 			mfm_ready_pulse <= 1'b0;   // 1-clk advance pulse to the encoder
@@ -409,6 +495,7 @@ module floppy
 					mfm_byte        <= mfm_odata;
 					mfm_mark        <= mfm_omark;
 					mfm_crc0        <= mfm_ocrc0;
+					mfm_sector      <= mfm_osector;
 					mfm_stb         <= 1'b1;
 					mfm_ready_pulse <= 1'b1;
 					mfm_fresh       <= 1'b0;
@@ -527,8 +614,22 @@ module floppy
 	// reads as a permanent "no index" 1).
 	wire mfm_idx_sense = mfm_spinning ? ~mfm_index : 1'b1;
 	
-	// TODO: auto-detect doubleSidedDisk from image file size
-	wire doubleSidedDisk = diskSides;
+	// Double-sided = drive mechanism AND file size AND the medium. Ported from
+	// MacPlus floppy.v; the drive term is a constant here, as the LC has a
+	// SuperDrive and nothing else. Three ceilings, each load-bearing:
+	//   - the file must be big enough to hold two sides (diskSides);
+	//   - WITHIN a session the format byte of the last address field the
+	//     write path decoded wins, since a One-Sided erase has just made the
+	//     disk single-sided and no remount has happened;
+	//   - ACROSS a remount the medium's own volume header decides
+	//     (mediaSides), because fmtSeen is gone and the file is still its
+	//     original size.
+	// Without the last term a One-Sided erase of an 800K image comes back
+	// advertised double-sided and the driver builds an 800K volume over a
+	// side that was never formatted.
+	// DECLARED HERE, DRIVEN BELOW: the encoder above needs this net, but the
+	// format-byte latch that feeds it needs signals declared further down.
+	wire doubleSidedDisk;
 	
 	wire [3:0] driveReadAddr = {ca2,ca1,ca0,SEL};
 	
@@ -554,7 +655,7 @@ module floppy
 				newByteReady <= 1;
 				diskDataByteTimer <= 1;  // make timer run again
 
-				// clear diskImageData after it's used, so we can tell when we get a new one from the disk	
+				// clear diskImageData after it's used, so we can tell when we get a new one from the disk
 				diskImageData <= 0;
 
 				// for debugging, don't advance the head until the IWM says it's ready
@@ -570,7 +671,7 @@ module floppy
 				newByteReady <= 1'b0;
 
 				if (dskReadAck) begin
-					// whenever ACK is received, store the data from the current diskImageAddr 
+					// whenever ACK is received, store the data from the current diskImageAddr
 					diskImageData <= dskReadDataEnc;  // xyz
  				end
 
@@ -579,22 +680,16 @@ module floppy
 				end
 			end
 
-			// Head (side) select — the RDDATA0/RDDATA1 sense address.
-			// IWM/GCR: latch continuously while the address is parked there
-			// (Plus Too lineage; the phase lines are dedicated to the sense
-			// address during GCR reads, so any parked value is authoritative).
-			// ISM: the SAME lines double as drive-command strobes and SEL
-			// doubles as the strobe-bank selector, so transient combinations
-			// lie about the head. The Welcome-time re-init raises SEL for the
-			// MFMModeOn strobe while the phases still park on F4 (RdData0)
-			// from the previous field — {F4,SEL=1} reads as RdData1 and
-			// silently flipped the head to side 1; every later read served
-			// wrong-side bytes and System 6.0.8's floppy boot looped at
-			// "Welcome to Macintosh" retrying forever (HW 2026-08-03; MAME
-			// F623 ground truth + tb_ism_reinit fetch trace addr 9368 =
-			// side 1 byte 152). In ISM, sample the head only while ACTION is
-			// set: the driver parks F4/SEL BEFORE arming and never touches
-			// them mid-read, so the armed window is the authoritative one.
+			// Head (side) select - the RDDATA0/RDDATA1 sense address.
+			// IWM/GCR: latch continuously while the address is parked there,
+			// since the phase lines are dedicated to the sense address during
+			// GCR reads. ISM: the SAME lines double as drive-command strobes
+			// and SEL doubles as the strobe-bank selector, so transient
+			// combinations lie about the head - a re-init that raises SEL for a
+			// strobe while the phases still park on F4 reads as RdData1 and
+			// flips the head to side 1. In ISM, sample the head only while
+			// ACTION is set: the driver parks F4/SEL before arming and never
+			// touches them mid-read.
 			if (ism_active ? ism_action : 1'b1) begin
 				if (driveReadAddr == `DRIVE_REG_RDDATA0 && lstrb == 1'b0) begin
 `ifdef SIMULATION
@@ -720,6 +815,333 @@ module floppy
 		
 	// write drive registers
 	wire [2:0] driveWriteAddr = {ca1,ca0,SEL};
+
+	generate
+	if (WRITE_SUPPORT) begin : wrpath
+
+	// ================================================================
+	// GCR write path. Ported from MacPlus_MiSTer rtl/floppy.v; the LC-specific
+	// parts are marked below. It lives here, below driveWriteAddr/lstrbEdge,
+	// because it reads them.
+	//
+	// The CPU hands over one byte at a time through the IWM data register. We
+	// pace those bytes at the SAME 128-cep byte time the read side uses
+	// (diskDataByteTimer, further up), then present each one to
+	// floppy_track_decoder. A checksum-valid sector appears on the contract
+	// tuple (wrSecValid / wrSecNum / wrSecAddr).
+	//
+	// writeUnderrun is raised ONLY for a byte abandoned by deselect. It is not
+	// a general error flag: reporting an underrun the ROM did not cause is a
+	// good way to make it retry forever.
+	reg        writeBusyReg;
+	reg [6:0]  writeByteTimer;
+	reg [7:0]  pendingWriteByte;
+	reg        writeUnderrunReg;
+	reg        decReady;
+
+	assign writeBusy     = writeBusyReg;
+	assign writeUnderrun = writeUnderrunReg;
+
+	// Any disk change resets the write path, so a half-decoded field cannot
+	// complete using the NEXT image's bytes and commit itself to the wrong
+	// disk. insertDisk is a level; both
+	// its edges matter -- it drops at img_mounted and rises at the loader's
+	// done. Reset to a constant 1: a non-constant async-reset value makes
+	// Quartus infer a latch.
+	reg insertDiskPrev;
+	always @(posedge clk or negedge _reset)
+		if (!_reset)   insertDiskPrev <= 1'b1;
+		else if (cep)  insertDiskPrev <= insertDisk;
+	wire insertDiskEdge = insertDisk && !insertDiskPrev;
+	wire insertDiskFall = !insertDisk && insertDiskPrev;
+
+	// ★ LC-SPECIFIC: the eject condition carries the (!ism_active || ism_sel)
+	// qualifier that the media-change work landed on 2026-08-06. Without it the
+	// ROM's register walks -- which run with Mode b7 clear -- look like ejects.
+	// Keep this in step with the real eject block further down.
+	wire ejectPulse = cep && _enable == 1'b0 && (!ism_active || ism_sel) &&
+	                  lstrbEdge == 1'b1 &&
+	                  driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1;
+
+	wire writePathReset = ejectPulse || (cep && (insertDiskEdge || insertDiskFall));
+
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			writeBusyReg     <= 1'b0;
+			writeByteTimer   <= 7'd0;
+			pendingWriteByte <= 8'd0;
+			writeUnderrunReg <= 1'b0;
+			decReady         <= 1'b0;
+		end else if (writePathReset) begin
+			// abandon any in-flight write byte
+			writeBusyReg     <= 1'b0;
+			writeByteTimer   <= 7'd0;
+			decReady         <= 1'b0;
+		end else begin
+			decReady <= 1'b0; // default; pulsed for exactly one cep below
+
+			// byte pacing runs on the same clk8 cadence as diskDataByteTimer
+			if (cep && writeBusyReg) begin
+				if (_enable == 1'b1) begin
+					// drive deselected mid-byte: it never reached the media
+					writeBusyReg     <= 1'b0;
+					writeUnderrunReg <= 1'b1;
+				end else if (writeByteTimer == 7'd127) begin
+					writeBusyReg <= 1'b0;
+					decReady     <= 1'b1; // hand this byte to the decoder now
+				end else begin
+					writeByteTimer <= writeByteTimer + 1'b1;
+				end
+			end
+
+			// A byte is accepted when the IWM registers one for this drive. cen
+			// and cep never coincide, so this cannot race the pacing above.
+			// CSTIN as well as insertDisk: CSTIN is set by an OS eject and is
+			// NOT cleared by a remount, so it is the guest's view of "no disk".
+			if (writeReq && _enable == 1'b0 && !writeProtect && !writeBusyReg &&
+			    !driveRegs[`DRIVE_REG_CSTIN] && insertDisk) begin
+				pendingWriteByte <= writeData;
+				writeBusyReg     <= 1'b1;
+				writeByteTimer   <= 7'd0;
+				writeUnderrunReg <= 1'b0;
+			end
+		end
+	end
+
+	// ── the write as a whole, for the encoder's format relay ──
+	// Ported verbatim from MacPlus floppy.v:280-294. wrEnd is delayed TWO
+	// clocks so the encoder has seen the last address mark of the format
+	// before the end arrives; that delay is part of the donor, not slack.
+	reg  wrBusyPrev, wrEndD1;
+	reg  wrEnd;
+	wire wrBusy = (writeMode && _enable == 1'b0) || writeBusyReg;
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			wrBusyPrev <= 1'b0;
+			wrEndD1    <= 1'b0;
+			wrEnd      <= 1'b0;
+		end else begin
+			if (cep) wrBusyPrev <= wrBusy;
+			wrEndD1 <= (cep && wrBusyPrev && !wrBusy) || writePathReset;
+			wrEnd   <= wrEndD1;
+		end
+	end
+
+	wire wrSecAmark, wrSecFmtMark, wrSecFmtDs;
+	wire [3:0] wrSecAmarkSector;
+	wire [8:0] wrBufAddr;          // driven by the committer below
+
+	// The relay's view of the write, published to the encoder outside this
+	// generate. decReady is the byte the decoder consumed; the marks are the
+	// GCR decoder's report of the address field that byte completed.
+	assign wrRelayByte       = decReady;
+	assign wrRelayMark       = wrSecAmark;
+	assign wrRelayMarkSector = wrSecAmarkSector;
+	assign wrRelayEnd        = wrEnd;
+
+	// The sidedness ceiling declared above.
+	reg fmtSeen;  // an address field's format byte has been seen since the mount
+	reg fmtDs;
+	always @(posedge clk) begin
+		// cleared on the same eject/mount events as the decoder
+		if (!_reset || writePathReset) begin
+			fmtSeen <= 1'b0;
+			fmtDs   <= 1'b0;
+		end
+		else if (wrSecFmtMark) begin
+			fmtSeen <= 1'b1;
+			fmtDs   <= wrSecFmtDs;
+		end
+	end
+
+	assign doubleSidedDisk = diskSides && (fmtSeen ? fmtDs : mediaSides);
+
+	// ── TWO DECODERS, ONE COMMITTER ───────────────────────────────
+	// A drive's medium is GCR or MFM, never both at once, so the two decoders
+	// are muxed into the single committer rather than duplicated. That the
+	// committer is format-neutral is the Phase 3 carve-out paying off: it sees
+	// a 22-bit image byte offset and a 512-byte read port and never learns
+	// which encoding produced them.
+	wire        gcrSecValid, mfmSecValid;
+	wire  [3:0] gcrSecNum;
+	wire  [4:0] mfmSecNum;
+	wire [21:0] gcrSecAddr,  mfmSecAddr;
+	wire  [7:0] gcrBufData,  mfmBufData;
+	wire        gcrSecReject, mfmSecReject;
+
+	wire        wrIsMfm   = mfm_disk;
+	wire        wrSecValidMux = wrIsMfm ? mfmSecValid : gcrSecValid;
+	wire [21:0] wrSecAddrMux  = wrIsMfm ? mfmSecAddr  : gcrSecAddr;
+	wire  [7:0] wrBufData     = wrIsMfm ? mfmBufData  : gcrBufData;
+
+	assign wrSecValid = wrSecValidMux;
+	assign wrSecAddr  = wrSecAddrMux;
+	assign wrSecNum   = wrIsMfm ? mfmSecNum : {1'b0, gcrSecNum};
+	wire        wrSecReject   = wrIsMfm ? mfmSecReject : gcrSecReject;
+
+	// ── the MFM write decoder ───────────────────────
+	// Fed by swim.v's ism_write_engine. `track`/`side` are the PHYSICAL head
+	// position and are what build the address; only the sector number comes
+	// from the stream's own ID field or, failing that, the anchor.
+	mfm_write_decoder mdec
+	(
+		.clk           ( clk ),
+		.rst           ( !_reset || writePathReset ),
+
+		.ready         ( mfm_wr_stb ),
+		.idata         ( mfm_wr_byte ),
+		.imark         ( mfm_wr_mark ),
+
+		.side          ( driveSide ),
+		.track         ( driveTrack ),
+		.hd            ( mfm_hd ),
+
+		.anchor_sector ( mfm_wr_anchor ),
+		.anchor_valid  ( mfm_wr_anchor_ok ),
+
+		.sector_valid  ( mfmSecValid ),
+		.sector        ( mfmSecNum ),
+		.addr          ( mfmSecAddr ),
+		.reject        ( mfmSecReject ),
+
+		.amark         (  ),
+		.amark_sector  (  ),
+		.amark_cyl     (  ),
+		.amark_head    (  ),
+
+		.buf_addr      ( wrBufAddr ),
+		.buf_data      ( mfmBufData )
+	);
+
+	floppy_track_decoder dec
+	(
+		.clk          ( clk ),
+		.ready        ( decReady ),
+		.rst          ( !_reset || writePathReset ),
+
+		.side         ( driveSide ),
+		.sides        ( doubleSidedDisk ),
+		.track        ( driveTrack ),
+
+		.idata        ( pendingWriteByte ),
+
+		.sector_valid ( gcrSecValid ),
+		.sector       ( gcrSecNum ),
+		.addr         ( gcrSecAddr ),
+		.reject       ( gcrSecReject ),
+		.amark        ( wrSecAmark ),
+		.amark_sector ( wrSecAmarkSector ),
+		.fmt_mark     ( wrSecFmtMark ),
+		.fmt_ds       ( wrSecFmtDs ),
+
+		.buf_addr     ( wrBufAddr ),
+		.buf_data     ( gcrBufData )
+	);
+
+	// Declared before the instance that reads them. Style, not a fix -- see the
+	// correction above the write path: a forward reference to a net declared
+	// later in the same module resolves correctly.
+	wire        wrCommitBusy;
+
+	// ── Commit a verified sector to the SDRAM image ──────────────
+	// Volatile ONLY: this reaches SDRAM, never the SD card. The guest's own
+	// read-after-write verify is what makes that useful -- and it is also the
+	// gate, because a Finder copy completes only if every sector decoded
+	// byte-exactly (sector number, address, and all 512 payload bytes).
+	floppy_write_committer wc
+	(
+		.clk            ( clk ),
+		.rst            ( !_reset || writePathReset ),
+
+		.sector_valid   ( wrSecValidMux ),
+		.sector_addr    ( wrSecAddrMux ),
+		.buf_addr       ( wrBufAddr ),
+		.buf_data       ( wrBufData ),
+
+		.wr_addr        ( wrSdAddr ),
+		.wr_data        ( wrSdData ),
+		.wr_req         ( wrSdReq ),
+		.wr_ack         ( wrSdAck ),
+
+		.busy           ( wrCommitBusy ),
+		.done           ( wrCommitDone ),
+		.committed_addr ( wrCommitAddr ),
+
+		.sd_buf_addr    ( wrSdBufAddr ),
+		.sd_buf_data    ( wrSdBufData ),
+		.sd_buf_wr      ( wrSdBufWr )
+	);
+
+	// ── Write-path cone anchor ──────────────────────────────────────────────
+	// Probes-off fits of this netlist have corrupted the floppy path on
+	// hardware while STA passed, and the fix was to keep the cone loaded in
+	// every build; the same applies to the write cone. Never remove, ifdef
+	// or XOR-fold these - a reduction lets synthesis restructure the very
+	// cone the anchor exists to pin.
+	reg [7:0] wr_sec_cnt, wr_rej_cnt;
+	always @(posedge clk or negedge _reset) begin
+		if (!_reset) begin
+			wr_sec_cnt <= 8'd0;
+			wr_rej_cnt <= 8'd0;
+		end else begin
+			if (wrSecValid)    wr_sec_cnt <= wr_sec_cnt + 8'd1;
+			if (wrSecReject)   wr_rej_cnt <= wr_rej_cnt + 8'd1;
+		end
+	end
+
+	// Widths are spelled out per field so a later edit cannot silently truncate
+	// one: each word must total exactly 32.
+	(* preserve, noprune *) reg [31:0] wr_anchor0, wr_anchor1, wr_anchor2;
+	always @(posedge clk) begin
+		// ★ wrSecNum WIDENED 4 -> 5 for MFM (sectors 1..18; GCR needs only
+		// 0..11), so a bit had to come from somewhere or this word would be
+		// 33 bits and Quartus would drop the TOP one - silently corrupting
+		// wr_sec_cnt in the JTAG probe. The reject counter gives it up: it is
+		// a saturating-ish witness read for "is this nonzero and climbing",
+		// not an exact total, so 7 bits (0..127) says the same thing. Caught
+		// by Warning 10230 and by this block's own rule, one line above.
+		//  8 + 7 + 5 + 1+1+1+1 + 1 + 7 = 32
+		wr_anchor0 <= {wr_sec_cnt, wr_rej_cnt[6:0], wrSecNum,
+		               writeBusyReg, writeUnderrunReg, writeProtect, insertDisk,
+		               driveSide, driveTrack[6:0]};
+		//  2 + 1+1+1+1 + 4 + 22 = 32
+		wr_anchor1 <= {2'b0, wrSecValid, wrSecAmark, wrSecFmtMark, wrSecFmtDs,
+		               wrSecAmarkSector, wrSecAddr};
+		// the committer's own cone: its drain state and where it last landed.
+		//  1 + 1 + 8 + 22 = 32
+		wr_anchor2 <= {wrCommitBusy, wrCommitDone, wrBufData, wrCommitAddr};
+	end
+
+	end else begin : no_wrpath
+		// Everything above is absent. The drive still answers every
+		// register identically -- WRTPRT reads locked because
+		// writeProtect is tied high for this instance -- it simply has
+		// no machinery to accept a byte it could never accept anyway.
+		assign writeBusy     = 1'b0;   // -> _iwmBusy reads 1, "buffer empty"
+		assign writeUnderrun = 1'b0;   // -> _writeUnderrun reads 1, "no underrun"
+		assign wrSecValid    = 1'b0;
+		assign wrSecNum      = 4'd0;
+		assign wrSecAddr     = 22'd0;
+		assign wrSdAddr      = 22'd0;
+		assign wrSdData      = 16'd0;
+		assign wrSdReq       = 1'b0;
+		assign wrCommitDone  = 1'b0;
+		assign wrCommitAddr  = 22'd0;
+		assign wrSdBufAddr   = 8'd0;
+		assign wrSdBufData   = 16'd0;
+		assign wrSdBufWr     = 1'b0;
+		// The sidedness ceiling minus its format-byte term: with no write path
+		// no address field can ever be decoded here, so this is exactly what
+		// the other branch computes with fmtSeen low.
+		assign doubleSidedDisk = diskSides && mediaSides;
+		// ...and no write means nothing for the encoder's format relay.
+		assign wrRelayByte       = 1'b0;
+		assign wrRelayMark       = 1'b0;
+		assign wrRelayMarkSector = 4'd0;
+		assign wrRelayEnd        = 1'b0;
+	end
+	endgenerate
+
 	
 	// DRIVE_REG_DIRTN		0  /* R/W: step direction (0=toward track 79, 1=toward track 0) */
 	always @(posedge clk or negedge _reset) begin
@@ -745,21 +1167,16 @@ module floppy
 		end
 		else if(cep) begin
 			// EJECT decode. In IWM mode this is the classic soft-switch strobe.
-			// In ISM mode the Phases register drives the SAME ca0-2/LSTRB lines,
-			// and the ROM's register walks pass through $FF = {LSTRB,ca2,ca1,
-			// ca0}=1111, whose falling edge decodes here as EJECT+ca2 — on
-			// 2026-08-03 that silently ejected the image on every mount, which
-			// is why eject was then gated off with a blanket !ism_active. That
-			// gate made the guest structurally UNABLE to eject an MFM disk
-			// (the 6.0.8 installer's disk-2 swap needs exactly that), so it is
-			// now qualified the way MAME forwards phase strobes to a drive at
-			// all: only when the ISM has this drive devsel'd (ism_sel = Mode
-			// b7 + select code — swim1.cpp update_phases only reaches m_floppy
-			// when selected). Ground truth 2026-08-06 (tap_swapB F4803): every
-			// real ISM-era drive command arrives inside a ModeSet-82 ...
-			// ModeClr-80 bracket, i.e. with ism_sel HIGH, while the ROM/driver
-			// register walks run with Mode b7 CLEAR — so this qualifier passes
-			// genuine ejects and still blocks every walk that burned us.
+			// In ISM mode the Phases register drives the SAME ca0-2/LSTRB lines
+			// and the ROM's register walks pass through $FF, whose falling edge
+			// would decode here as EJECT+ca2 and eject the image on every mount.
+			// A blanket !ism_active gate fixed that but made the guest
+			// structurally unable to eject an MFM disk, which an installer's
+			// disk swap needs. It is now qualified the way MAME forwards phase
+			// strobes to a drive at all: only when the ISM has this drive
+			// devsel'd. Real drive commands arrive with ism_sel HIGH while the
+			// register walks run with Mode b7 CLEAR, so genuine ejects pass and
+			// every walk is still blocked.
 			if (_enable == 1'b0 && (!ism_active || ism_sel) && lstrbEdge == 1'b1 && driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1) begin
 				// eject the disk
 				driveRegs[`DRIVE_REG_CSTIN] <= 1'b1;
@@ -770,22 +1187,15 @@ module floppy
 `endif
 			end
 			else begin
-				// CSTIN simply REPORTS what the host has mounted (78804c1,
-				// re-landed 2026-08-06 together with disk_switched above —
-				// landing it alone was the reverted ebbdac6 regression). It
-				// used to be `else if (insertDisk) CSTIN <= 0;` with no else:
-				// an insert LATCHED the line low and only a guest EJECT strobe
-				// could raise it again, so when the host withdrew the media
-				// (image swapped, wrong-size mount, or the guest's own eject
-				// clearing the flags) the drive kept claiming a disk was
-				// present, the guest never ran its unmount machinery, and it
-				// kept the previous volume's VCB over different SDRAM contents
-				// -> "…cannot be found" on every call with zero disk I/O.
-				// Eject still works: the strobe branch forces the line high
-				// and MacLC.sv clears the mount flags while diskEject is
-				// asserted, so insertDisk is low within a couple of clk_sys
-				// edges — before the next cep evaluates this branch — and the
-				// line stays high.
+				// CSTIN simply REPORTS what the host has mounted. It used to be
+				// `else if (insertDisk) CSTIN <= 0;` with no else, so an insert
+				// LATCHED the line low and only a guest EJECT strobe could raise
+				// it: when the host withdrew the media the drive kept claiming a
+				// disk was present, the guest never ran its unmount machinery,
+				// and it held the previous volume's VCB over different SDRAM.
+				// Eject still works - the strobe branch forces the line high and
+				// MacLC.sv clears the mount flags while diskEject is asserted, so
+				// insertDisk is low before the next cep evaluates this.
 				driveRegs[`DRIVE_REG_CSTIN] <= ~insertDisk;
 				if (ejectIndicatorTimer != 0)
 					ejectIndicatorTimer <= ejectIndicatorTimer - 1'b1;
@@ -896,3 +1306,4 @@ module floppy
 		end
 	end	
 endmodule
+

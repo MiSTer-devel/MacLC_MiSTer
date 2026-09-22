@@ -115,6 +115,7 @@ module tb_gcr_read;
 		.dataOut(dataOut),
 		.insertDisk(2'b01),      // internal drive: disk in
 		.diskEject(),
+		.mediaSides(2'b11),         // medium unknown: never lowers the ceiling
 		.diskSides({1'b0, tb_ds}),  // 1 = double-sided 800K, 0 = 400K (+ds=0)
 		.diskMFM(2'b00),         // GCR disk -> IWM path
 		.diskHD(2'b00),

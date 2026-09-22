@@ -188,10 +188,27 @@ Re-verify boot (the screenshot check above) after ANY SR change.
 
 ## Known Limitations
 
-- Floppy disks are read-only (**no write datapath exists** in `rtl/floppy.v`;
-  the drive reports `WRTPRT=0` = write-protected so the OS never tries. That
-  is load-bearing: the ROM's write primitive polls handshake b7 in an
-  UNBOUNDED loop, so an attempted write would hang the machine, not fail.)
+- **Floppies are WRITABLE as of 2026-09-19** — GCR 400K/800K and MFM
+  720K/1.44MB, raw and DC42, including guest formatting (Mac 800K and 1.44MB,
+  DOS 720K and 1.44MB, 400K MFS). Writes commit back to the user's file and
+  survive eject, remount and a power cycle.
+  ★ **The `OE` Floppy Write OSD option DEFAULTS TO OFF AND MUST STAY THAT
+  WAY.** The ROM's write primitive polls the IWM handshake b7 in an UNBOUNDED
+  loop, so the failure mode of a write bug is a HUNG MACHINE, not a failed
+  write. That is the same fact the old "read-only" bullet here called
+  load-bearing — it did not go away, it became the reason for the default.
+  `flp_int_wp` gates further: an image mounted read-only from the SD card
+  stays write-protected whatever the OSD says; a DC42 container does not.
+  **Floppies are BLOCK DEVICES now** — slot `S6`, loaded by
+  `rtl/floppy_sd.v` at mount — not ioctl downloads, and that is what gives
+  a write a path back to the user's file at all.
+  **There is ONE drive.** The LC has no external floppy port, so the core was
+  mounting the internal one twice; removing the phantom drops VDNUM from 9 to
+  7, which matters beyond tidiness. Main notifies a mount as one word,
+  `(1 << slot) | 0x80`-if-read-only, and hps_io takes `img_mounted` from
+  `io_din[VDNUM-1:0]` and `img_readonly` from `io_din[7]`, so past slot 6 bit
+  7 is both the read-only flag and a slot. At VDNUM 7 neither hazard exists
+  and the stock Main is enough.
 - **BOOTING FROM FLOPPY WORKS** (user-confirmed on hardware 2026-08-05,
   bench build `78a46cf2`). The old "Welcome to Macintosh" retry loop and the
   ~39 KB-then-UNDERRUN freeze are gone. Several fixes contributed and no
@@ -280,6 +297,18 @@ Re-verify boot (the screenshot check above) after ANY SR change.
   `verilator/tb_mfm_idcensus.v` (full-disk ID census), `tb_ism_sony +postgap=N`.
   ★ `USE_DBG_HUD` is currently OFF (commented out) in `MacLC.qsf` — flip it
   on for debug fits only; it must be OFF in release fits.
+- **SCSI sector buffers vs CD audio — FIXED 2026-09-20 (port of MacPlus
+  54289d5).** `sd_buff_wr` is one strobe broadcast to every hps_io slot;
+  `rtl/ncr5380.sv` gated the disk targets' copy on SCSI BSY instead of the
+  slot's own ack, so a CD-audio frame fetched while the CD was bus-idle
+  landed in a busy disk's buffer — during a write flush the image received
+  the last 512 bytes of the 2352-byte frame (seam at byte 304). That
+  fingerprint was found in HFS catalog node 279 of an 80 MB image after a
+  Finder hang (the "hang after erase+copy" was this, not the floppy path).
+  Any disk I/O during CD playback could corrupt on earlier builds. Bench:
+  `verilator/tb_ncr5380_slot_ack.v` on branch `scsi-strobe-ack-gate` (kept
+  out of the PR per the maintainer's no-new-benches request; 6 checks, 3
+  fail on the old gate; Verilator runs in WSL Ubuntu).
 - SCSI writes validated 2026-07-29 (word-pairing fix f38c06f/ceaec45; 14.5 MB
   in-guest duplicate byte-identical). SCSI/CD reads validated same day
   (look-ahead boundary fix 082dcc4; CD copies byte-identical to ISO

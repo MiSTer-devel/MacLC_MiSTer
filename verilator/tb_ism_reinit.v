@@ -99,6 +99,7 @@ module tb_ism_reinit;
 		.dataOut(dataOut),
 		.insertDisk(2'b01),
 		.diskSides(2'b01),
+		.mediaSides(2'b11),   // medium unknown: never lowers the ceiling
 		.diskMFM(2'b01),
 		.diskHD(2'b01),
 		.diskEject(),
