@@ -53,7 +53,7 @@ module emu
 	assign HDMI_BLACKOUT = 0;
 	assign HDMI_BOB_DEINT = 0;
 
-	wire [1:0] ar = status[8:7];
+	wire [1:0] ar = cfg[8:7];
 	video_freak video_freak
 	(
 		.*,
@@ -73,57 +73,51 @@ module emu
 		.ARY((!ar) ? 12'd3 : 12'd0),
 		.CROP_SIZE(0),
 		.CROP_OFF(0),
-		.SCALE(status[13:12])
+		.SCALE(cfg[13:12])
 	);
 	
 	`include "build_id.v"
 	localparam CONF_STR = {
 		"MACLC;UART57600:115200,MIDI;",
 		"-;",
-		"S6,DSKIMG,Mount Floppy;",
-		// Default OFF, and it must stay that way: the ROM's write primitive
-		// polls the IWM handshake in an UNBOUNDED loop, so the failure mode of
-		// a write bug is a HUNG machine, not a failed write. Gated further in
-		// flp_int_wp below - a read-only mount stays write-protected whatever
-		// this says; a DC42 container does not.
-		"OE,Floppy Write,Off,On;",
-		"-;",
-		"SC0,IMGVHDHDA,Mount SCSI-0;",
-		"SC1,IMGVHDHDA,Mount SCSI-1;",
-		"SC2,NVR,Mount PRAM;",
-		"-;",
-		// CD-ROM (SCSI ID 3). ISO/TOAST (TO* matches .toast) are raw
-		// 2048-byte images and work today; CUE/BIN/CHD are listed for the
-		// Main_MiSTer translation layer (docs/plan_scsi_cdrom.md Phase 2) —
-		// on a stock Main a 2048-byte-sector .bin also works mounted directly.
-		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
-		"OI,CD-ROM Drive,Enabled,Disabled;",
-		// Default OFF for distribution (2026-08-24): the ethernet card needs
-		// the paired Main (releases/MiSTer) — with an older ethernet Main a
-		// card-ON boot hangs, so users opt in via the OSD after installing
-		// the Main. Bit clear (0) = first entry = Off; ena_osd below is the
-		// matching un-inverted status[19].
-		"OJ,Ethernet,Off,On;",
-		"o45,Net interface,eth0,tap0,macvlan,eth1;",
-		"o03,MAC suffix,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F;",
-		"-;",
-		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
-		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
-		"OA,Monitor @Reset,640x480 VGA,512x384 12in;",
+		"SC0,IMGVHDHDA,Pri. disk (ID 0);",
+		"SC1,IMGVHDHDA,Disk (ID 1);",
+		"SC4,ISOTO*CUEBINCHD,CD-ROM (ID 3);",
+		"S6,DSKIMG,Floppy disk;",
+		"F0,ROM,Load ROM;",
 		"-;",
 		"O4,Memory,2MB,10MB;",
+		"OJ,Ethernet,Off,On;",
+		"o45,Network interface,eth0,tap0,macvlan,eth1;",
 		"-;",
-		"R5,Interrupt (NMI / MacsBug);",
-		"R6,WIPE PRAM (erases settings!);",
-		"R0,Reset & Apply CPU+Memory;",
+		"P1,Machine;",
+		"P2,Video;",
+		"P4,Audio;",
+		"P5,Advanced;",
 		"-;",
-		"P1,MT32-pi;",
+		"h0-,Changes pending;",
+		"R0,Apply and reset;",
+
+		"P1R5,Interrupt (NMI);",
 		"P1-;",
-		"P1OO,Use MT32-pi,Yes,No;",
-		"P1OQ,Synth,Munt,FluidSynth;",
-		"P1ORS,Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
-		"P1OTV,SoundFont,0,1,2,3,4,5,6,7;",
-		"P1OMN,Show Info,No,Yes,LCD-On,LCD-Auto;",
+		"P1R6,Clear PRAM and reset;",
+
+		"P2OA,Monitor,640x480 VGA,512x384 12in;",
+		"P2O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+		"P2OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
+
+		"P4OO,Use MT32-pi,Yes,No;",
+		"P4OQ,Synth,Munt,FluidSynth;",
+		"P4ORS,Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
+		"P4OTV,SoundFont,0,1,2,3,4,5,6,7;",
+		"P4OMN,Show Info,No,Yes,LCD-On,LCD-Auto;",
+
+		"P5SC2,NVR,PRAM image;",
+		"P5-;",
+		// Floppy writes remain opt-in.
+		"P5OE,Floppy writes,Off,On;",
+		"P5OI,CD-ROM drive,Enabled,Disabled;",
+		"P5o03,MAC suffix,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F;",
 		"I,",
 		"MT32-pi: SoundFont #0,",
 		"MT32-pi: SoundFont #1,",
@@ -171,7 +165,6 @@ module emu
 	reg rom_loaded = 1'b0;
 	always @(posedge clk_sys) if (dio_download && dio_index == 0) rom_loaded <= 1'b1;
 
-	reg       status_mem = 1'b1;
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
@@ -198,7 +191,6 @@ module emu
 			end
 			else if(rst_cnt) begin
 				rst_cnt    <= rst_cnt - 1'd1;
-				status_mem <= status[4];
 			end
 			else begin
 				n_reset <= 1;
@@ -207,6 +199,12 @@ module emu
 	end
 
 	///////////////////////////////////////////////////
+
+	// Apply machine and video settings only while reset is asserted.
+	reg [31:0] cfg = 0;
+	always @(posedge clk_sys) if (~n_reset) cfg <= status;
+	localparam [31:0] CFG_MASK = 32'h000C7590;
+	wire osd_pending = |((status ^ cfg) & CFG_MASK);
 
 	localparam SCSI_DEVS = 2;          // SCSI block devices -> hps_io slots 0,1
 	localparam VD_PRAM    = 2;         // PRAM NVRAM save image -> hps_io slot 2
@@ -303,7 +301,7 @@ module emu
 	// OSD "CD-ROM Drive" option (OI / status[18], 0 = Enabled). Disabling
 	// makes ID 3 vanish from the bus entirely — the pre-CD baseline, kept as
 	// a hardware A/B lever given the SCSI wedge history.
-	wire        cd_enable  = ~status[18];
+	wire        cd_enable  = ~cfg[18];
 	wire        ioctl_write;
 	reg         ioctl_wait = 0;
 	wire [10:0] ps2_key;
@@ -541,6 +539,7 @@ module emu
 
 		.buttons(buttons),
 		.status(status),
+		.status_menumask({15'd0, osd_pending}),
 
 		// MT32-pi "Show Info = Yes" OSD popup (CONF_STR "I," strings, 1-based)
 		.info_req(mt32_info_req),
@@ -777,7 +776,7 @@ module emu
 	//   10MB = $E4  (2MB board + 4MB + 4MB SIMMs => 8MB bank A)
 	// NOTE: currently only the 2MB config is validated against MAME (-ramsize 2M).
 	// The 10MB path is not yet verified — see docs and addrController_top.v.
-	wire [7:0] configRAMSize = status[4] ? 8'hE4 : 8'h24; // 1=10MB (2MB board + 4MB+4MB SIMM), 0=2MB (board only)
+	wire [7:0] configRAMSize = cfg[4] ? 8'hE4 : 8'h24; // 1=10MB (2MB board + 4MB+4MB SIMM), 0=2MB (board only)
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
 	wire       pvia_ram_configured;   // ROM has programmed V8 RAM config ($0 mirror enable)
 				  
@@ -1128,7 +1127,7 @@ module emu
 		.eth_din   (pds_eth_din),
 		.eth_ack   (pds_eth_ack),
 		.eth_dout  (pds_eth_dout),
-		.ena_osd   (status[19]),   // OJ list is Off,On -> bit SET = On (default Off)
+		.ena_osd   (cfg[19]),
 		.cpuAddr   (cpuAddr),
 		.cpuDataIn (cpuDataOut),
 		._cpuAS    (_cpuAS),
@@ -2558,7 +2557,7 @@ module emu
 	// DC42 is NOT excluded: the load path normalises the container away, so
 	// SDRAM holds pure sector data and a volatile write is container-agnostic.
 	// Only the write-BACK has to care which layout it is writing.
-	assign flp_int_wp = ~status[14] || flp_int_ro;
+	assign flp_int_wp = ~cfg[14] || flp_int_ro;
 
 	// -- Committed sectors reach the user's file ---------------------------
 	// Everything upstream is volatile: the committer lands a verified sector
