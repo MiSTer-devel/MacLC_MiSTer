@@ -1762,6 +1762,7 @@ static int run_toolbox_get() {
 	// so a serve displaced by ANY 512-multiple is detectable).
 	const size_t FSZ = 262144;
 	tbx.files.clear();
+	tbx.files.reserve(8);              // part C appends; fdat must not move
 	tbx.files.push_back({ "rt.bin", {} });
 	auto& fdat = tbx.files.back().data;
 	fdat.resize(FSZ);
@@ -1831,6 +1832,59 @@ static int run_toolbox_get() {
 			bfails++;
 		}
 		fails += bfails;
+	}
+
+	// ---- Part C: files shorter than one sector ----
+	// The official client asks for 16 blocks whatever the file size, so a
+	// small file is a DataIn far shorter than the request, and an empty one
+	// is no DataIn at all. Each must end in a clean status, and the bus must
+	// still serve the next command afterwards.
+	{
+		static const int sizes[] = { 60, 1, 511, 513, 0 };
+		int cfails = 0;
+		csr_patience = saved_patience;     // a wedge must fail fast here
+		for (int sz : sizes) {
+			char nm[32];
+			snprintf(nm, sizeof(nm), "tiny%d.txt", sz);
+			tbx.files.push_back({ nm, {} });
+			auto& tdat = tbx.files.back().data;
+			tdat.resize((size_t)sz);
+			for (int i = 0; i < sz; i++) tdat[i] = ramp(0x5C000 + sz * 7 + i);
+			int idx = (int)tbx.files.size() - 1;
+
+			uint8_t cdb[10] = { 0xD1, (uint8_t)idx, 0, 0, 0, 0, 16, 0, 0, 0 };
+			int st = tb_cmd(cdb, nullptr, 0, buf.data(), sz, nm);
+			if (st != 0x00) {
+				printf("toolboxget: %s status %02x (want 00)\n", nm, st);
+				cfails++;
+				continue;
+			}
+			int bad = 0;
+			for (int i = 0; i < sz; i++) if (buf[i] != tdat[i]) bad++;
+			if (bad) {
+				printf("toolboxget: %s %d/%d bytes wrong\n", nm, bad, sz);
+				cfails++;
+			}
+			// the client's end-of-file probe: the next block returns nothing
+			uint8_t eof[10] = { 0xD1, (uint8_t)idx, 0, 0, 0, 1, 16, 0, 0, 0 };
+			st = tb_cmd(eof, nullptr, 0, buf.data(), 0, "EOF probe");
+			// an empty file already closed on its first GET, so a second
+			// probe is a CHECK by design
+			if (st != (sz ? 0x00 : 0x02)) {
+				printf("toolboxget: %s EOF probe status %02x (want 00)\n", nm, st);
+				cfails++;
+			}
+			// and the bus must take an ordinary chunk straight after
+			if (!get_chunk(1, 0, "C-after")) {
+				printf("toolboxget: bus unusable after %s\n", nm);
+				cfails++;
+				break;
+			}
+			printf("toolboxget: %s OK\n", nm);
+		}
+		printf("toolboxget: part C %s (sub-sector and empty files)\n",
+		       cfails ? "FAIL" : "OK");
+		fails += cfails;
 	}
 
 	csr_patience = saved_patience;
