@@ -79,7 +79,6 @@ module emu
 	`include "build_id.v"
 	localparam CONF_STR = {
 		"MACLC;UART57600:115200,MIDI;",
-		"-;",
 		// Layout follows the computer-core OSD standard (danifunker/
 		// hp9000-715_MiSTer docs/osd-standard.md). Status bits are unchanged
 		// from the flat layout, so saved .CFG files still apply.
