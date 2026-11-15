@@ -66,3 +66,9 @@ __pycache__/
 /local
 /software
 /tests/iie
+
+# AI agent instructions and settings (kept locally, not in the repo)
+CLAUDE.md
+AGENTS.md
+.claude/
+.codex/
