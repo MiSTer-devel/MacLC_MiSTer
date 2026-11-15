@@ -184,6 +184,7 @@ module emu
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // PRAM clear -> system reset pulse
+	reg       pram_mount_deferred = 1'b0; // OSD PRAM mount waits for Apply
 	wire      egret_reset_680x0_w;      // Egret HC05 holding 68k in reset (#3 probe)
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 	always @(posedge clk_sys) begin
@@ -222,7 +223,9 @@ module emu
 	always @(posedge clk_sys) if (~n_reset) cfg <= status;
 	// Settings that wait for reset; excludes unused bits and momentary actions.
 	localparam [31:0] CFG_MASK = 32'hFDCC4410;
-	wire osd_pending = |((status ^ cfg) & CFG_MASK);
+	// A PRAM image mounted from the OSD while the guest runs also waits for
+	// reset (see pram_mount_deferred in the PRAM block).
+	wire osd_pending = |((status ^ cfg) & CFG_MASK) | pram_mount_deferred;
 
 	///////////////////////////////////////////////////
 
@@ -365,6 +368,7 @@ module emu
 	reg        pram_rst_after;                  // pulse reset after the current save
 	reg        pram_load_pending, pram_flush_pending, pram_clr_pending;
 	reg [26:0] pram_settle;          // eager-flush settle timer (restarts on each PRAM write)
+	reg [24:0] osd_recent;           // >0 while the OSD is open and ~1 s after it closes
 	reg        old_pack, old_osd, old_mnt2, old_rstpram;
 	reg        pram_ready;        // -> Egret: pram[] loaded (or no image / timed out)
 	reg [31:0] pram_rdy_cnt;      // ready backstop so a missing image never hangs boot
@@ -387,6 +391,7 @@ module emu
 		if (~pll_locked_s) begin
 			pst <= P_IDLE; pram_rd <= 0; pram_wr_req <= 0; pram_load_wr <= 0;
 			pram_ena <= 0; pram_dirty <= 0; pram_force_reset <= 0; pram_rst_after <= 0;
+			pram_mount_deferred <= 0; osd_recent <= 0;
 			pram_load_pending <= 0; pram_flush_pending <= 0; pram_clr_pending <= 0;
 			pram_settle <= 0;
 			old_pack <= 0; old_osd <= 0; old_mnt2 <= 0; old_rstpram <= 0; rst_hold <= 0;
@@ -409,10 +414,45 @@ module emu
 			if (pram_wr_stb) pram_dirty <= 1'b1;
 
 			// event latches
+			// A mount made from the OSD while the guest is running (pram_ready
+			// already up) is a machine setting like Memory or Monitor: it waits
+			// for Apply and reset instead of restarting the Mac on the spot.
+			// The LOAD waits too, not just the restart: after the boot-copy the
+			// Egret mirrors every guest PRAM write into pram[], so a loaded
+			// image would pick up the old session's writes (and the eager
+			// flush would save them into the new file) before Apply. pram_ena
+			// stays low meanwhile so nothing is flushed into the new file.
+			// Main hides the OSD BEFORE it mounts the picked image (menu.cpp
+			// MENU_GENERIC_IMAGE_SELECTED: MenuHide, then the mount), so an OSD
+			// pick shows up with OSD_STATUS already low. osd_recent bridges
+			// that: it holds for ~1 s (32.5 MHz clk_sys) after the OSD closes.
+			// Core-start autoloads arrive with the OSD long closed and keep the
+			// old path (load now; a late one restarts via
+			// pram_restart_after_load).
+			if (OSD_STATUS)          osd_recent <= 25'd32_500_000;
+			else if (osd_recent != 0) osd_recent <= osd_recent - 1'b1;
+
 			if (img_mounted[VD_PRAM] && !old_mnt2) begin
-				pram_ena <= (img_size != 0);
-				if (img_size != 0) pram_load_pending <= 1'b1;  // load runs -> P_LD_CPY sets pram_ready
-				else               pram_ready        <= 1'b1;  // no image: release the boot-copy now
+				pram_mount_deferred <= 1'b0;
+				if (img_size != 0 && pram_ready && (OSD_STATUS || osd_recent != 0)) begin
+					pram_ena <= 1'b0;
+					pram_mount_deferred <= 1'b1;
+				end else begin
+					pram_ena <= (img_size != 0);
+					if (img_size != 0) pram_load_pending <= 1'b1;  // load runs -> P_LD_CPY sets pram_ready
+					else               pram_ready        <= 1'b1;  // no image: release the boot-copy now
+				end
+			end
+			// Apply (or any reset): run the deferred load while the 68k is held.
+			// Dropping pram_ready makes the Egret's boot-copy wait for it, and
+			// since the load then lands before the CPU runs, P_LD_DAT sees
+			// pram_ready low and does not add a second restart.
+			else if (pram_mount_deferred && !n_reset) begin
+				pram_mount_deferred <= 1'b0;
+				pram_ena <= 1'b1;
+				pram_ready <= 1'b0;
+				pram_rdy_cnt <= 0;
+				pram_load_pending <= 1'b1;
 			end
 			if (OSD_STATUS && !old_osd && pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
 			// ── EAGER NVRAM PERSISTENCE (2026-08-19 user directive) ─────────
