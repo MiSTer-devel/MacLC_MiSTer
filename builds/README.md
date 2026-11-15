@@ -3,7 +3,7 @@
 Bit-exact, hash-named (`MacLC_<md5-first-8>.rbf`) copies of builds that
 passed the hardware gate but are deliberately **not** in `releases/` yet
 (more work planned before cutting a release). Promotion = `git mv` into
-`releases/` alongside a dated copy, per the provenance law in CLAUDE.md.
+`releases/` alongside a dated copy.
 Quartus is deterministic (same netlist + same seed ⇒ same md5), so the
 recorded commit is the ultimate provenance — the file here is convenience.
 

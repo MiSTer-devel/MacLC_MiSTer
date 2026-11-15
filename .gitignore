@@ -63,3 +63,12 @@ verilator/sim_stdout.log
 # python tooling artifacts
 __pycache__/
 *.pyc
+/local
+/software
+/tests/iie
+
+# AI agent instructions and settings (kept locally, not in the repo)
+CLAUDE.md
+AGENTS.md
+.claude/
+.codex/

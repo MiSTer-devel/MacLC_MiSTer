@@ -358,7 +358,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret/egret_wrapper.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret/m68hc05_alu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/egret/m68hc05_core.sv
 set_global_assignment -name SYSTEMVERILOG_FILE MacLC.sv
-set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/adb_device.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/v8_clocks.sv
 
@@ -387,3 +386,4 @@ set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to *dv_de1*
 
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/pds/pds_enet.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/fetch_cache.sv
+set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top

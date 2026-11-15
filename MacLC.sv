@@ -79,51 +79,60 @@ module emu
 	`include "build_id.v"
 	localparam CONF_STR = {
 		"MACLC;UART57600:115200,MIDI;",
+		// Layout follows the computer-core OSD standard (danifunker/
+		// hp9000-715_MiSTer docs/osd-standard.md). Status bits are unchanged
+		// from the flat layout, so saved .CFG files still apply.
+		// CD-ROM (SCSI ID 3): ISO/TOAST are raw 2048-byte images; CUE/BIN/CHD
+		// go through Main's translation layer.
+		"SC0,IMGVHDHDA,Pri. disk (ID 0);",
+		"SC1,IMGVHDHDA,Disk (ID 1);",
+		"SC4,ISOTO*CUEBINCHD,CD-ROM (ID 3);",
+		"S6,DSKIMG,Floppy;",
+		"F0,ROM,Load ROM;",
 		"-;",
-		"S6,DSKIMG,Mount Floppy;",
-		// Default OFF, and it must stay that way: the ROM's write primitive
-		// polls the IWM handshake in an UNBOUNDED loop, so the failure mode of
-		// a write bug is a HUNG machine, not a failed write. Gated further in
-		// flp_int_wp below - a read-only mount stays write-protected whatever
-		// this says; a DC42 container does not.
-		"OE,Floppy Write,Off,On;",
+		"O4,Memory,2 MB,10 MB;",
+		"o45,Network interface,eth0,tap0,macvlan,eth1;",
 		"-;",
-		"SC0,IMGVHDHDA,Mount SCSI-0;",
-		"SC1,IMGVHDHDA,Mount SCSI-1;",
-		"SC2,NVR,Mount PRAM;",
+		"P1,Machine;",
+		"P2,Video;",
+		"P4,Audio;",
+		"P5,Advanced;",
 		"-;",
-		// CD-ROM (SCSI ID 3). ISO/TOAST (TO* matches .toast) are raw
-		// 2048-byte images and work today; CUE/BIN/CHD are listed for the
-		// Main_MiSTer translation layer (docs/plan_scsi_cdrom.md Phase 2) —
-		// on a stock Main a 2048-byte-sector .bin also works mounted directly.
-		"SC4,ISOTO*CUEBINCHD,Mount CD-ROM;",
-		"OI,CD-ROM Drive,Enabled,Disabled;",
-		// Default OFF for distribution (2026-08-24): the ethernet card needs
-		// the paired Main (releases/MiSTer) — with an older ethernet Main a
-		// card-ON boot hangs, so users opt in via the OSD after installing
-		// the Main. Bit clear (0) = first entry = Off; ena_osd below is the
-		// matching un-inverted status[19].
-		"OJ,Ethernet,Off,On;",
-		"o45,Net interface,eth0,tap0,macvlan,eth1;",
-		"o03,MAC suffix,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F;",
-		"-;",
-		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
-		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
-		"OA,Monitor @Reset,640x480 VGA,512x384 12in;",
-		"-;",
-		"O4,Memory,2MB,10MB;",
-		"-;",
-		"R5,Interrupt (NMI / MacsBug);",
-		"R6,WIPE PRAM (erases settings!);",
-		"R0,Reset & Apply CPU+Memory;",
-		"-;",
-		"P1,MT32-pi;",
+		"h0-,Changes pending;",
+		"R0,Apply and reset;",
+
+		"P1R5,Interrupt (NMI);",
 		"P1-;",
-		"P1OO,Use MT32-pi,Yes,No;",
-		"P1OQ,Synth,Munt,FluidSynth;",
-		"P1ORS,Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
-		"P1OTV,SoundFont,0,1,2,3,4,5,6,7;",
-		"P1OMN,Show Info,No,Yes,LCD-On,LCD-Auto;",
+		"P1R6,Clear PRAM and reset;",
+
+		// Aspect ratio and scale only steer the scaler, so they act at once.
+		"P2OA,Monitor,640x480 VGA,512x384 12in;",
+		"P2O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+		"P2OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
+
+		"P4-,MT32-pi;",
+		"P4OO,Use MT32-pi,Yes,No;",
+		"H1P4OQ,Synthesizer,Munt,FluidSynth;",
+		"h1P4-;",
+		"H2P4ORS,Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
+		"H3P4OTV,SoundFont,0,1,2,3,4,5,6,7;",
+		"h1P4-;",
+		"H1P4OMN,Show info,No,Yes,LCD-On,LCD-Auto;",
+		"h1P4-;",
+
+		"P5SC2,NVR,PRAM image;",
+		"P5-;",
+		// Floppy writes default OFF and must stay that way: the ROM's write
+		// primitive polls the IWM handshake in an UNBOUNDED loop, so a write
+		// bug hangs the machine. A read-only mount stays write-protected
+		// whatever this says (flp_int_wp below).
+		"P5OE,Floppy writes,Off,On;",
+		"P5OI,CD-ROM drive,Enabled,Disabled;",
+		"P5-;",
+		// Ethernet defaults OFF: with an older ethernet Main a card-ON boot
+		// hangs. ena_osd below is the matching un-inverted cfg[19].
+		"P5OJ,Ethernet,Off,On;",
+		"P5o03,MAC suffix,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F;",
 		"I,",
 		"MT32-pi: SoundFont #0,",
 		"MT32-pi: SoundFont #1,",
@@ -171,10 +180,10 @@ module emu
 	reg rom_loaded = 1'b0;
 	always @(posedge clk_sys) if (dio_download && dio_index == 0) rom_loaded <= 1'b1;
 
-	reg       status_mem = 1'b1;
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
-	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
+	reg       pram_force_reset = 1'b0;  // PRAM clear -> system reset pulse
+	reg       pram_mount_deferred = 1'b0; // OSD PRAM mount waits for Apply
 	wire      egret_reset_680x0_w;      // Egret HC05 holding 68k in reset (#3 probe)
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 	always @(posedge clk_sys) begin
@@ -198,13 +207,24 @@ module emu
 			end
 			else if(rst_cnt) begin
 				rst_cnt    <= rst_cnt - 1'd1;
-				status_mem <= status[4];
 			end
 			else begin
 				n_reset <= 1;
 			end
 		end
 	end
+
+	// Machine settings apply only while reset is asserted (OSD standard).
+	// Saved configs still apply on first load: the HPS delivers status while
+	// n_reset is held. Aspect ratio and scale (bits 7-8, 12-13) stay live on
+	// status, since they only steer the scaler, so they are not in the mask.
+	reg [31:0] cfg = 0;
+	always @(posedge clk_sys) if (~n_reset) cfg <= status;
+	// Settings that wait for reset; excludes unused bits and momentary actions.
+	localparam [31:0] CFG_MASK = 32'hFDCC4410;
+	// A PRAM image mounted from the OSD while the guest runs also waits for
+	// reset (see pram_mount_deferred in the PRAM block).
+	wire osd_pending = |((status ^ cfg) & CFG_MASK) | pram_mount_deferred;
 
 	///////////////////////////////////////////////////
 
@@ -300,10 +320,10 @@ module emu
 	assign sd_buff_din[VD_CDROM] = cd_buff_din;
 	wire        cd_ack     = sd_ack[VD_CDROM];
 	wire        cd_mounted = img_mounted[VD_CDROM];
-	// OSD "CD-ROM Drive" option (OI / status[18], 0 = Enabled). Disabling
-	// makes ID 3 vanish from the bus entirely — the pre-CD baseline, kept as
-	// a hardware A/B lever given the SCSI wedge history.
-	wire        cd_enable  = ~status[18];
+	// OSD "CD-ROM drive" option (OI / bit 18, 0 = Enabled). Disabling makes
+	// ID 3 vanish from the bus entirely at the next reset — the pre-CD
+	// baseline, kept as a hardware A/B lever given the SCSI wedge history.
+	wire        cd_enable  = ~cfg[18];
 	wire        ioctl_write;
 	reg         ioctl_wait = 0;
 	wire [10:0] ps2_key;
@@ -347,6 +367,7 @@ module emu
 	reg        pram_rst_after;                  // pulse reset after the current save
 	reg        pram_load_pending, pram_flush_pending, pram_clr_pending;
 	reg [26:0] pram_settle;          // eager-flush settle timer (restarts on each PRAM write)
+	reg [24:0] osd_recent;           // >0 while the OSD is open and ~1 s after it closes
 	reg        old_pack, old_osd, old_mnt2, old_rstpram;
 	reg        pram_ready;        // -> Egret: pram[] loaded (or no image / timed out)
 	reg [31:0] pram_rdy_cnt;      // ready backstop so a missing image never hangs boot
@@ -369,6 +390,7 @@ module emu
 		if (~pll_locked_s) begin
 			pst <= P_IDLE; pram_rd <= 0; pram_wr_req <= 0; pram_load_wr <= 0;
 			pram_ena <= 0; pram_dirty <= 0; pram_force_reset <= 0; pram_rst_after <= 0;
+			pram_mount_deferred <= 0; osd_recent <= 0;
 			pram_load_pending <= 0; pram_flush_pending <= 0; pram_clr_pending <= 0;
 			pram_settle <= 0;
 			old_pack <= 0; old_osd <= 0; old_mnt2 <= 0; old_rstpram <= 0; rst_hold <= 0;
@@ -391,10 +413,45 @@ module emu
 			if (pram_wr_stb) pram_dirty <= 1'b1;
 
 			// event latches
+			// A mount made from the OSD while the guest is running (pram_ready
+			// already up) is a machine setting like Memory or Monitor: it waits
+			// for Apply and reset instead of restarting the Mac on the spot.
+			// The LOAD waits too, not just the restart: after the boot-copy the
+			// Egret mirrors every guest PRAM write into pram[], so a loaded
+			// image would pick up the old session's writes (and the eager
+			// flush would save them into the new file) before Apply. pram_ena
+			// stays low meanwhile so nothing is flushed into the new file.
+			// Main hides the OSD BEFORE it mounts the picked image (menu.cpp
+			// MENU_GENERIC_IMAGE_SELECTED: MenuHide, then the mount), so an OSD
+			// pick shows up with OSD_STATUS already low. osd_recent bridges
+			// that: it holds for ~1 s (32.5 MHz clk_sys) after the OSD closes.
+			// Core-start autoloads arrive with the OSD long closed and keep the
+			// old path (load now; a late one restarts via
+			// pram_restart_after_load).
+			if (OSD_STATUS)          osd_recent <= 25'd32_500_000;
+			else if (osd_recent != 0) osd_recent <= osd_recent - 1'b1;
+
 			if (img_mounted[VD_PRAM] && !old_mnt2) begin
-				pram_ena <= (img_size != 0);
-				if (img_size != 0) pram_load_pending <= 1'b1;  // load runs -> P_LD_CPY sets pram_ready
-				else               pram_ready        <= 1'b1;  // no image: release the boot-copy now
+				pram_mount_deferred <= 1'b0;
+				if (img_size != 0 && pram_ready && (OSD_STATUS || osd_recent != 0)) begin
+					pram_ena <= 1'b0;
+					pram_mount_deferred <= 1'b1;
+				end else begin
+					pram_ena <= (img_size != 0);
+					if (img_size != 0) pram_load_pending <= 1'b1;  // load runs -> P_LD_CPY sets pram_ready
+					else               pram_ready        <= 1'b1;  // no image: release the boot-copy now
+				end
+			end
+			// Apply (or any reset): run the deferred load while the 68k is held.
+			// Dropping pram_ready makes the Egret's boot-copy wait for it, and
+			// since the load then lands before the CPU runs, P_LD_DAT sees
+			// pram_ready low and does not add a second restart.
+			else if (pram_mount_deferred && !n_reset) begin
+				pram_mount_deferred <= 1'b0;
+				pram_ena <= 1'b1;
+				pram_ready <= 1'b0;
+				pram_rdy_cnt <= 0;
+				pram_load_pending <= 1'b1;
 			end
 			if (OSD_STATUS && !old_osd && pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
 			// ── EAGER NVRAM PERSISTENCE (2026-08-19 user directive) ─────────
@@ -541,6 +598,9 @@ module emu
 
 		.buttons(buttons),
 		.status(status),
+		// Menumask: 0 = no pending changes; 1 = MT32-pi off; 2 = Munt ROM
+		// hidden (off or FluidSynth); 3 = SoundFont hidden (off or Munt).
+		.status_menumask({12'd0, status[24] | ~status[26], status[24] | status[26], status[24], osd_pending}),
 
 		// MT32-pi "Show Info = Yes" OSD popup (CONF_STR "I," strings, 1-based)
 		.info_req(mt32_info_req),
@@ -777,7 +837,7 @@ module emu
 	//   10MB = $E4  (2MB board + 4MB + 4MB SIMMs => 8MB bank A)
 	// NOTE: currently only the 2MB config is validated against MAME (-ramsize 2M).
 	// The 10MB path is not yet verified — see docs and addrController_top.v.
-	wire [7:0] configRAMSize = status[4] ? 8'hE4 : 8'h24; // 1=10MB (2MB board + 4MB+4MB SIMM), 0=2MB (board only)
+	wire [7:0] configRAMSize = cfg[4] ? 8'hE4 : 8'h24; // 1=10MB (2MB board + 4MB+4MB SIMM), 0=2MB (board only)
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
 	wire       pvia_ram_configured;   // ROM has programmed V8 RAM config ($0 mirror enable)
 				  
@@ -840,16 +900,16 @@ module emu
 	// path runs in the fixed 24.576 MHz CLK_AUDIO domain; the LCD-overlay
 	// raster tracker runs on clk_vid (live video inputs below) and its box is
 	// composited into the final VGA_R/G/B at the video output above.
-	// Mode/ROM/SoundFont are chosen from the OSD "MT32-pi" page (CONF_STR P1,
-	// status[31:24]); "Show Info" (status[23:22]) selects the readout:
-	// 1=Yes → framework OSD info popup, 2/3=LCD-On/LCD-Auto → LCD overlay.
+	// Audio page settings (cfg[31:24]) apply on reset. "Show info"
+	// (cfg[23:22]) selects the readout: 1=Yes → framework OSD info popup,
+	// 2/3=LCD-On/LCD-Auto → LCD overlay.
 	wire [15:0] mt32_i2s_l, mt32_i2s_r;
 	wire        mt32_available;
 	wire        mt32_midi_rx;
-	wire        mt32_disable = status[24];                 // "Use MT32-pi" = No
+	wire        mt32_disable = cfg[24];                    // "Use MT32-pi" = No
 	wire        mt32_mute    = mt32_available & mt32_disable;
 	wire        mt32_use     = mt32_available & ~mt32_disable;
-	wire  [1:0] mt32_info    = status[23:22];              // Show Info: No/Yes/LCD-On/LCD-Auto
+	wire  [1:0] mt32_info    = cfg[23:22];                 // Show info: No/Yes/LCD-On/LCD-Auto
 	wire  [7:0] mt32_mode, mt32_rom, mt32_sf;
 	wire        mt32_newmode;
 	wire        mt32_lcd_en, mt32_lcd_pix, mt32_lcd_update;
@@ -868,9 +928,9 @@ module emu
 		.mt32_i2s_r(mt32_i2s_r),
 		.mt32_i2s_l(mt32_i2s_l),
 		.mt32_available(mt32_available),
-		.mt32_mode_req(status[26]),          // Synth: 0=Munt, 1=FluidSynth
-		.mt32_rom_req(status[28:27]),        // Munt ROM: MT-32 v1/v2/CM-32L
-		.mt32_sf_req({5'd0, status[31:29]}), // SoundFont 0-7
+		.mt32_mode_req(cfg[26]),             // Synth: 0=Munt, 1=FluidSynth
+		.mt32_rom_req(cfg[28:27]),           // Munt ROM: MT-32 v1/v2/CM-32L
+		.mt32_sf_req({5'd0, cfg[31:29]}),    // SoundFont 0-7
 		.mt32_mode(mt32_mode),
 		.mt32_rom(mt32_rom),
 		.mt32_sf(mt32_sf),
@@ -1128,7 +1188,7 @@ module emu
 		.eth_din   (pds_eth_din),
 		.eth_ack   (pds_eth_ack),
 		.eth_dout  (pds_eth_dout),
-		.ena_osd   (status[19]),   // OJ list is Off,On -> bit SET = On (default Off)
+		.ena_osd   (cfg[19]),      // OJ list is Off,On -> bit SET = On (default Off)
 		.cpuAddr   (cpuAddr),
 		.cpuDataIn (cpuDataOut),
 		._cpuAS    (_cpuAS),
@@ -1491,7 +1551,7 @@ module emu
 	// system, and the OS lays out QuickDraw for the boot geometry. The old
 	// live status[10] wire retargeted the pixel PLL mid-session (guest-
 	// hostile, and the source of the out-of-range class pix_quiet guards).
-	// The OSD choice now applies at the next reset — R0 "Reset & Apply",
+	// The OSD choice now applies at the next reset — R0 "Apply and reset",
 	// R6, or core reload — the same pattern as the Memory option. Saved
 	// configs still apply on first load: the HPS delivers status while
 	// n_reset is held, so the latch captures it before first release.
@@ -2553,12 +2613,12 @@ module emu
 	);
 
 	// Write-protect, three terms, any one of which locks the disk:
-	//   - the OSD Floppy Write toggle is Off (default, and the safe state),
+	//   - the OSD Floppy writes toggle is Off (default, and the safe state),
 	//   - the slot was mounted read-only (latched at ITS OWN mount pulse), or
 	// DC42 is NOT excluded: the load path normalises the container away, so
 	// SDRAM holds pure sector data and a volatile write is container-agnostic.
 	// Only the write-BACK has to care which layout it is writing.
-	assign flp_int_wp = ~status[14] || flp_int_ro;
+	assign flp_int_wp = ~cfg[14] || flp_int_ro;
 
 	// -- Committed sectors reach the user's file ---------------------------
 	// Everything upstream is volatile: the committer lands a verified sector

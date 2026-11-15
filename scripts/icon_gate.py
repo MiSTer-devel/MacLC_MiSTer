@@ -6,7 +6,7 @@ Usage:
 Exit 0 = every frame PASSES; 1 = any FAIL; frames must be fresh captures
 (use scripts/grab_fresh.sh — a stale frame invalidates the verdict).
 
-CLAUDE.md law: gate EVERY new fit in the FINDER on colour icons, then soak
+Gate EVERY new fit in the FINDER on colour icons, then soak
 >=2 further Finder boots (the historic error-11 hits boot 2). MacAtrium is
 NOT a gate. Boot lands in MacAtrium (auto-start); reach the Finder via
 Application menu > Hide MacAtrium, and PARK THE CURSOR TOP-LEFT (12x

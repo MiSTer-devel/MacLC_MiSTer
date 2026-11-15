@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # regen_tg68k.sh - regenerate rtl/tg68k/TG68KdotC_Kernel.v from the VHDL source
 # via ghdl, using the EXACT generics the core is built with (mirrors
-# how-to-convert-cpu.txt and the #(2,2,2,2,2,2,2,1) wrapper instantiation).
+# docs/how-to-convert-cpu.txt and the #(2,2,2,2,2,2,2,1) wrapper instantiation).
 #
 # Run this after editing any rtl/tg68k/*.vhd, then rebuild verilator/Quartus.
 # The FPGA (Quartus) and Verilator both compile the generated .v, NOT the .vhd,

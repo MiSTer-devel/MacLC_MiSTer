@@ -863,7 +863,11 @@ module ncr5380
 				// bus-idle, so a BSY gate let them land in a busy disk's
 				// buffer (audio written into the disk image). io_ack keeps
 				// its BSY term: it blanks a late ack after the target left.
-				.sd_buff_wr( sd_buff_wr & io_ack[i] ),
+				// Target 0 also takes fills framed by the Toolbox slot's ack
+				// (tb_hps_wr = sd_buff_wr & tb_ack inside scsi.v), the same
+				// way the CD target ORs in cdtb_ack. Without it every Toolbox
+				// fill strobe was blanked (Toolbox broken since 20260920).
+				.sd_buff_wr( sd_buff_wr & (io_ack[i] | ((i == 0) ? tb_ack : 1'b0)) ),
 
 				// Toolbox transport: only target 0 (ID 0) is wired to the slot.
 				.tb_mounted ( (i == 0) ? tb_mounted : 1'b0 ),

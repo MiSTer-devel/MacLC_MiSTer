@@ -21,6 +21,8 @@
 //        ... --mode word --ds 0 --gap 2 --detail   single run, per-read log
 //        ... --sectors 4 --hps 6000                transfer size / HPS latency
 //        ... --id 6                                target SCSI ID (slot 0 = 6 @HEAD)
+//        ... --mode stray                          write flush flooded with
+//                                                  unacked sd_buff_wr strobes
 
 #include <cstdio>
 #include <cstdint>
@@ -272,6 +274,17 @@ struct Hps {
 	// late and stale, the way HW appears to behave.
 	int tb_ack_hold = 0;   // 0 = drop tb_ack promptly (original model)
 
+	// Stray-strobe injection (the 2026-09-20 CD-audio data-loss class).
+	// sd_buff_wr is one strobe broadcast to every hps_io slot; the CD-audio
+	// engine keeps streaming frames on it while its target is bus-idle, so a
+	// disk target sitting in a write flush sees strobes it does not own. With
+	// stray set, every WWAIT cycle (core raised io_wr, buffer holds the Mac's
+	// sector, no slot ack up) pulses sd_buff_wr with garbage across all 256
+	// buffer words. A target that gates its buffer on anything but its own
+	// slot ack lets the garbage into the flushed image.
+	bool stray = false;
+	uint64_t strays = 0;
+
 	void reset() {
 		st = IDLE; t = wi = tgt = 0; was_write = false; fetches = flushes = 0; written.clear();
 		tb_reads = 0; cur_tb_latency = latency; tb_defers = 0;
@@ -346,7 +359,21 @@ struct Hps {
 			t++;
 			break;
 		case WWAIT:
-			if (++t >= latency) { top->io_ack = 1 << tgt; st = WCAP; wi = 0; t = 0; }
+			if (stray) {
+				// Foreign frame on the shared strobe; no slot ack is raised.
+				if ((t & 1) == 0) {
+					top->sd_buff_addr = (t >> 1) & 0xff;
+					top->sd_buff_dout = 0xDEAD;
+					top->sd_buff_wr = 1;
+					strays++;
+				} else {
+					top->sd_buff_wr = 0;
+				}
+			}
+			if (++t >= latency) {
+				top->sd_buff_wr = 0;
+				top->io_ack = 1 << tgt; st = WCAP; wi = 0; t = 0;
+			}
 			break;
 		case WCAP:
 			// address on even sub-cycle, dpram q registered -> capture 2 later
@@ -1735,6 +1762,7 @@ static int run_toolbox_get() {
 	// so a serve displaced by ANY 512-multiple is detectable).
 	const size_t FSZ = 262144;
 	tbx.files.clear();
+	tbx.files.reserve(8);              // part C appends; fdat must not move
 	tbx.files.push_back({ "rt.bin", {} });
 	auto& fdat = tbx.files.back().data;
 	fdat.resize(FSZ);
@@ -1804,6 +1832,59 @@ static int run_toolbox_get() {
 			bfails++;
 		}
 		fails += bfails;
+	}
+
+	// ---- Part C: files shorter than one sector ----
+	// The official client asks for 16 blocks whatever the file size, so a
+	// small file is a DataIn far shorter than the request, and an empty one
+	// is no DataIn at all. Each must end in a clean status, and the bus must
+	// still serve the next command afterwards.
+	{
+		static const int sizes[] = { 60, 1, 511, 513, 0 };
+		int cfails = 0;
+		csr_patience = saved_patience;     // a wedge must fail fast here
+		for (int sz : sizes) {
+			char nm[32];
+			snprintf(nm, sizeof(nm), "tiny%d.txt", sz);
+			tbx.files.push_back({ nm, {} });
+			auto& tdat = tbx.files.back().data;
+			tdat.resize((size_t)sz);
+			for (int i = 0; i < sz; i++) tdat[i] = ramp(0x5C000 + sz * 7 + i);
+			int idx = (int)tbx.files.size() - 1;
+
+			uint8_t cdb[10] = { 0xD1, (uint8_t)idx, 0, 0, 0, 0, 16, 0, 0, 0 };
+			int st = tb_cmd(cdb, nullptr, 0, buf.data(), sz, nm);
+			if (st != 0x00) {
+				printf("toolboxget: %s status %02x (want 00)\n", nm, st);
+				cfails++;
+				continue;
+			}
+			int bad = 0;
+			for (int i = 0; i < sz; i++) if (buf[i] != tdat[i]) bad++;
+			if (bad) {
+				printf("toolboxget: %s %d/%d bytes wrong\n", nm, bad, sz);
+				cfails++;
+			}
+			// the client's end-of-file probe: the next block returns nothing
+			uint8_t eof[10] = { 0xD1, (uint8_t)idx, 0, 0, 0, 1, 16, 0, 0, 0 };
+			st = tb_cmd(eof, nullptr, 0, buf.data(), 0, "EOF probe");
+			// an empty file already closed on its first GET, so a second
+			// probe is a CHECK by design
+			if (st != (sz ? 0x00 : 0x02)) {
+				printf("toolboxget: %s EOF probe status %02x (want 00)\n", nm, st);
+				cfails++;
+			}
+			// and the bus must take an ordinary chunk straight after
+			if (!get_chunk(1, 0, "C-after")) {
+				printf("toolboxget: bus unusable after %s\n", nm);
+				cfails++;
+				break;
+			}
+			printf("toolboxget: %s OK\n", nm);
+		}
+		printf("toolboxget: part C %s (sub-sector and empty files)\n",
+		       cfails ? "FAIL" : "OK");
+		fails += cfails;
 	}
 
 	csr_patience = saved_patience;
@@ -2040,6 +2121,29 @@ int main(int argc, char** argv) {
 		if (tfp) tfp->close();
 #endif
 		return rc;
+	}
+
+	// Stray-strobe write test: a word-mode write whose flush window is
+	// flooded with strobes no slot ack frames (see Hps::stray). The flushed
+	// image must still be the Mac's data, byte for byte. Fails on the old
+	// BSY-gated sd_buff_wr; passes on the slot-ack gate.
+	if (one_mode && !strcmp(one_mode, "stray")) {
+		int gap = one_gap >= 0 ? one_gap : 3;
+		int lat = hps_lat > 1024 ? hps_lat : 1024;   // >= 2 strobes per word
+		hps.stray = true; hps.strays = 0;
+		// Slot n is SCSI ID n in this core (the --id default of 6 predates it).
+		RunResult r = run_write(true, sectors, gap, lat, id_slot, id_slot, true);
+		hps.stray = false;
+		bool ok = r.completion_ok && !r.dreq_timeout && !r.mismatches
+		          && hps.strays > 0;
+		printf("stray: %s (sectors=%d flushes=%llu stray strobes=%llu "
+		       "mismatches=%d first_bad=%d)\n", ok ? "PASS" : "FAIL", sectors,
+		       (unsigned long long)hps.flushes, (unsigned long long)hps.strays,
+		       r.mismatches, r.first_bad);
+#if VM_TRACE
+		if (tfp) tfp->close();
+#endif
+		return ok ? 0 : 1;
 	}
 
 	// write-mode single runs (separate path: verifies the flushed image)
